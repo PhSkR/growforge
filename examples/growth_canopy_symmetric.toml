@@ -1,0 +1,126 @@
+# growforge example: the grown table canopy, made four-fold symmetric.
+#
+# Units everywhere: millimetres, newtons, MPa (N/mm^2), N*mm for torque,
+# g/cm^3 for mass density and mm/s^2 for gravity.
+#
+# The same problem as growth_canopy.toml - a 200 x 200 mm tabletop carrying
+# 600 N spread over its whole surface, standing on four small feet, with a 60 mm
+# service column through the middle - grown with [growth.symmetry] on.
+#
+# Space colonization is stochastic, so the plain example grows four *different*
+# legs: all sound, none of them the same. Here the engine grows **one quarter**
+# of the domain - the corner x <= 100, y <= 100, which holds one foot and a
+# quarter of the tabletop - and mirrors what it grew across both planes through
+# the domain centre. The four legs come out identical, and every strut that
+# reaches a plane meets its own reflection there.
+#
+# Read the growth section of the README before changing the planes: symmetry
+# replicates geometry, not loads. The problem itself has to be symmetric for the
+# result to mean anything, and growforge warns if the load and support regions
+# say otherwise. The stress report at the end runs on the whole replicated part
+# with the real loads either way, and it is the number to read before printing.
+#
+#   growforge check examples/growth_canopy_symmetric.toml
+#   growforge run   examples/growth_canopy_symmetric.toml
+#   growforge run   examples/growth_canopy_symmetric.toml --view
+
+[project]
+name = "growth_canopy_symmetric"
+engine = "growth"
+
+[resolution]
+# 4 mm voxels give a 50 x 50 x 30 element grid.
+voxel_size_mm = 4.0
+
+[material]
+preset = "petg"
+
+[optimization]
+# mass_fraction is measured over the *whole* replicated structure, exactly as it
+# is for an asymmetric run: the quarter that is grown is normalized until all
+# four quarters together hit the target.
+mass_fraction = 0.12
+min_feature_mm = 12.0
+
+[growth]
+seed = 20260728                      # any u64; the same seed regrows the same STL
+attractor_per_cm3 = 5.0              # per cm3 of the fundamental domain, so the
+                                     # canopy comes out at the same density as
+                                     # an asymmetric run of the same problem
+murray_exponent = 2.6                # r_parent^n = sum(r_child^n)
+max_radius_mm = 27.0                 # cap on a single strut radius
+max_steps = 400                      # cap on space colonization iterations
+prune = true                         # branches that end on nothing are removed
+
+  # Four-fold: two mirror planes through the centre of the domain's bounding
+  # box, named by their normals. "x" is the plane x = 100, "y" is y = 100, and
+  # the quarter that is grown is the one below both of them.
+  [growth.symmetry]
+  kind = "mirror"
+  planes = ["x", "y"]
+
+[output]
+# Relative paths resolve against the directory holding this file.
+stl_path = "growth_canopy_symmetric.stl"
+iso_level = 0.5
+smoothing_iterations = 8
+# Seal anything the branches happen to enclose, so the result is printable
+# without trapped support.
+voids = "fill"
+# Machine readable copy of the von Mises table printed at the end of the run.
+stress_json = "growth_canopy_symmetric_stress.json"
+
+# Design domain: everything under and including the tabletop.
+[[domain]]
+op = "add"
+shape = "box"
+min = [0.0, 0.0, 0.0]
+max = [200.0, 200.0, 120.0]
+
+# The tabletop itself: forced solid, so the distributed load always has a surface
+# to push on and the branches have something to grow into.
+[[keepin]]
+shape = "box"
+min = [0.0, 0.0, 111.0]
+max = [200.0, 200.0, 120.0]
+
+# A service column through the middle of the table. It is centred on the domain,
+# so it is symmetric under both planes: the quarter that is grown sees a quarter
+# of it.
+[[keepout]]
+shape = "cylinder"
+p1 = [100.0, 100.0, -5.0]
+p2 = [100.0, 100.0, 108.0]
+radius = 30.0
+
+# Four feet on the floor, one at each corner. Only the first one lies in the
+# quarter that is grown; the other three are the mirror images of it, and the
+# run says so if they are not.
+[[supports]]
+region = { shape = "box", min = [-1.0, -1.0, -1.0], max = [26.0, 26.0, 1.0] }
+
+[[supports]]
+region = { shape = "box", min = [174.0, -1.0, -1.0], max = [201.0, 26.0, 1.0] }
+
+[[supports]]
+region = { shape = "box", min = [-1.0, 174.0, -1.0], max = [26.0, 201.0, 1.0] }
+
+[[supports]]
+region = { shape = "box", min = [174.0, 174.0, -1.0], max = [201.0, 201.0, 1.0] }
+
+[[loadcases]]
+name = "tabletop"
+weight = 1.0
+
+  # 600 N spread evenly over the whole top surface. Its centre is the centre of
+  # the domain, so it lies on both planes and belongs to the grown quarter.
+  [[loadcases.loads]]
+  type = "force"
+  region = { shape = "box", min = [-1.0, -1.0, 118.0], max = [201.0, 201.0, 121.0] }
+  vector = [0.0, 0.0, -600.0]
+
+  # The table's own weight, in the same load case as the tabletop load.
+  [[loadcases.loads]]
+  type = "gravity"
+  direction = [0.0, 0.0, -1.0]
+  g_mm_s2 = 9810.0

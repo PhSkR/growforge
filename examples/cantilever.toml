@@ -1,0 +1,68 @@
+# growforge example: end-loaded cantilever.
+#
+# Units everywhere: millimetres, newtons, MPa (N/mm^2), N*mm for torque and
+# g/cm^3 for mass density.
+#
+# A 120 x 40 x 40 mm block is fully clamped on its left face and carries a
+# 50 N downward load on a solid pad at the free end. SIMP keeps 30 % of the
+# design cells.
+#
+#   growforge check examples/cantilever.toml
+#   growforge run   examples/cantilever.toml
+
+[project]
+name = "cantilever"
+
+# Optimization engine; "simp" is the default and currently the only one.
+engine = "simp"
+
+[resolution]
+# 2 mm voxels give a 60 x 20 x 20 element grid.
+voxel_size_mm = 2.0
+# target_cells = 2000000   # alternative: derive the voxel size from the domain
+
+[material]
+preset = "pla"
+
+[optimization]
+# Fraction of the design cells kept, in the open interval (0, 1).
+mass_fraction = 0.3
+# Smallest structural feature to resolve; the filter radius is half of this.
+min_feature_mm = 8.0
+max_iterations = 150
+convergence_tol = 0.01
+
+[output]
+# Relative paths resolve against the directory holding this file.
+stl_path = "cantilever.stl"
+iso_level = 0.5
+smoothing_iterations = 10
+
+# Design domain: a plain rectangular block.
+[[domain]]
+op = "add"
+shape = "box"
+min = [0.0, 0.0, 0.0]
+max = [120.0, 40.0, 40.0]
+
+# Forced solid load pad at the free end, so the point load has something to
+# push against and is never optimized away.
+[[keepin]]
+shape = "box"
+min = [110.0, 15.0, 15.0]
+max = [120.0, 25.0, 25.0]
+
+# Fully clamped left face.
+[[supports]]
+region = { shape = "box", min = [-0.5, -0.5, -0.5], max = [0.5, 40.5, 40.5] }
+directions = ["x", "y", "z"]
+
+[[loadcases]]
+name = "tip-down"
+weight = 1.0
+
+  [[loadcases.loads]]
+  type = "force"
+  region = { shape = "sphere", center = [115.0, 20.0, 20.0], radius = 4.0 }
+  # Total force in newtons, spread evenly over the selected nodes.
+  vector = [0.0, 0.0, -50.0]

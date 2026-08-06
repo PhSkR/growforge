@@ -1,0 +1,870 @@
+//! Projection of the exported surface's vertices back onto the analytic
+//! boundaries the configuration described.
+//!
+//! Everything upstream of the export works on a voxel field. A cell is
+//! classified by its **centre** ([`crate::grid::Grid::classify`]), so a cell
+//! whose centre lies a hair outside a keepout is material for its whole width
+//! and the modelled solid reaches up to half a voxel into the forbidden region;
+//! marching cubes then puts vertices on the node lattice, which is half a voxel
+//! further out again, and Taubin smoothing moves them once more. The exported
+//! STL therefore cuts a fraction of a voxel into a keepout and bulges the same
+//! distance out of the domain. On a pin bore that is not a cosmetic error: a
+//! 2.75 mm bore meshed on a 1.5 mm grid comes out under diameter and the pin
+//! does not fit.
+//!
+//! **Supersampling does not fix it.** The refined lattice is the trilinear
+//! interpolant of the same coarse node field ([`crate::mesh::ScalarField::refined`]);
+//! it describes the same encroaching surface with more triangles.
+//!
+//! What fixes it is knowing where the boundary really is, which is what
+//! [`crate::geometry::Boundaries`] carries on the problem. Under the default
+//! `[output] boundaries = "exact"` this pass takes every exported vertex that
+//! violates one - inside a keepout, or outside the domain - and moves it onto
+//! the analytic surface it violates, plus
+//! [`constants::BOUNDARY_CLAMP_EPS_MM`] on the legal side so a containment test
+//! agrees. Where the part meets a bore, the bore becomes the cylinder that was
+//! asked for.
+//!
+//! Three things bound it, because a projection that is allowed to do anything is
+//! a projection that can wreck a surface:
+//!
+//! * **Member by member.** A vertex is pushed out of the keepout it is deepest
+//!   inside, onto *that member's* own surface - closed form for the box, the
+//!   sphere, the capped cylinder and the tube, bounded Newton steps for the
+//!   ellipsoid, which has no closed form (see
+//!   [`crate::geometry::Shape::nearest_surface_point`]). The corrected position
+//!   is then tested again, because overlapping keepouts can hand a vertex to one
+//!   another and because leaving one can leave the domain. At most
+//!   [`constants::BOUNDARY_CLAMP_MAX_PASSES`] rounds.
+//! * **A displacement cap.** The encroachment this exists for is sub-voxel by
+//!   construction, so a vertex that would have to move further than
+//!   [`constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS`] voxels is not this
+//!   defect and is left alone.
+//! * **An honest give-up.** A vertex that is still illegal when the budget runs
+//!   out, or whose correction is past the cap, keeps the position it had and is
+//!   counted in [`ClampReport::gave_up`]. Nothing here loops forever and nothing
+//!   here claims a surface is clean when it is not.
+//!
+//! The pass runs **after** the island cull, so no work is spent on fragments
+//! that are about to be discarded and the culling verdicts see exactly the
+//! geometry they always did, and **before** validation, so what the validator
+//! accepts is the file that ships. Collapsing two vertices onto one point is the
+//! real risk of moving them, and [`constants::MIN_TRIANGLE_AREA_MM2`] stays the
+//! arbiter of that: a clamp that produces a degenerate triangle fails the export
+//! rather than shipping one.
+//!
+//! The live preview never reaches here - `viewer::scene::preview_surface` runs
+//! marching cubes alone, skipping smoothing, culling and validation - so a
+//! preview is unclamped by construction and needs no guard. (Written as a plain
+//! name rather than a link: the viewer is behind a feature gate and this module
+//! is not.)
+
+use rayon::prelude::*;
+
+use crate::constants;
+use crate::geometry::{Boundaries, Csg, Shape, Vec3, difference, length, scale, sum};
+use crate::mesh::Mesh;
+
+/// What the boundary clamp found and did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClampReport {
+    /// Vertices that were moved onto a boundary.
+    pub vertices_moved: usize,
+    /// The furthest any one of them travelled, in millimetres. Zero when none
+    /// moved.
+    pub max_displacement_mm: f64,
+    /// Vertices left where they were because no legal position was reached
+    /// inside the pass budget, or because the one that was lay past the
+    /// displacement cap. The exported surface still crosses a boundary at each
+    /// of them.
+    pub gave_up: usize,
+}
+
+impl ClampReport {
+    /// What the run says about this pass, on the console and in the editor's
+    /// panel alike.
+    ///
+    /// One line per sentence, an outcome that needs saying loudly opening with
+    /// the word "warning", so a caller can print them straight or lay them out
+    /// in a panel without parsing anything back out - the same contract
+    /// [`crate::trim::TrimReport::notes`] keeps.
+    pub fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.vertices_moved == 0 {
+            notes.push(
+                "every exported vertex was already inside the domain and clear of the keepouts"
+                    .to_string(),
+            );
+        } else {
+            notes.push(format!(
+                "clamped {} vertices onto the analytic surfaces, moving them {:.4} mm at most",
+                self.vertices_moved, self.max_displacement_mm
+            ));
+        }
+        if self.gave_up > 0 {
+            let left = if self.gave_up == 1 {
+                "1 vertex was".to_string()
+            } else {
+                format!("{} vertices were", self.gave_up)
+            };
+            notes.push(format!(
+                "warning: {left} left unmoved and the surface still crosses a boundary there: no \
+                 legal position was reached in {} passes, or the correction needed was further \
+                 than the {} voxel a sampling artefact can be",
+                constants::BOUNDARY_CLAMP_MAX_PASSES,
+                constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS
+            ));
+        }
+        notes
+    }
+}
+
+/// What the clamp decided about one vertex.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Correction {
+    /// Inside the domain and clear of every keepout already.
+    Legal,
+    /// Illegal, and this is where it belongs.
+    Moved(Vec3),
+    /// Illegal, and left where it is; see [`ClampReport::gave_up`].
+    GaveUp,
+}
+
+/// Move every vertex of `mesh` that violates `boundaries` onto the surface it
+/// violates. `voxel_mm` is the grid spacing the field was sampled on, which is
+/// what the displacement cap is measured in.
+pub fn resolve(mesh: &mut Mesh, boundaries: &Boundaries, voxel_mm: f64) -> ClampReport {
+    let cap = constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS * voxel_mm;
+    // Decided in parallel and applied in order, so the report counts the same
+    // vertices in the same order however many threads ran.
+    let corrections: Vec<Correction> = mesh
+        .vertices
+        .par_iter()
+        .map(|vertex| corrected(*vertex, boundaries, cap))
+        .collect();
+
+    let mut report = ClampReport {
+        vertices_moved: 0,
+        max_displacement_mm: 0.0,
+        gave_up: 0,
+    };
+    for (vertex, correction) in mesh.vertices.iter_mut().zip(corrections) {
+        match correction {
+            Correction::Legal => {}
+            Correction::Moved(to) => {
+                report.vertices_moved += 1;
+                report.max_displacement_mm = report
+                    .max_displacement_mm
+                    .max(length(difference(to, *vertex)));
+                *vertex = to;
+            }
+            Correction::GaveUp => report.gave_up += 1,
+        }
+    }
+    report
+}
+
+/// True when `p` is inside the domain and outside every keepout.
+///
+/// An empty half of `boundaries` constrains nothing: a caller with no keepouts,
+/// or none that carried a domain in, is asking about the other one alone.
+fn legal(p: Vec3, boundaries: &Boundaries) -> bool {
+    if !boundaries.keepout.is_empty() && boundaries.keepout.signed_distance(p) < 0.0 {
+        return false;
+    }
+    if !boundaries.domain.is_empty() && boundaries.domain.signed_distance(p) > 0.0 {
+        return false;
+    }
+    true
+}
+
+/// Where one vertex belongs, or that it has to be left alone.
+fn corrected(vertex: Vec3, boundaries: &Boundaries, cap: f64) -> Correction {
+    if legal(vertex, boundaries) {
+        return Correction::Legal;
+    }
+    let mut at = vertex;
+    for _ in 0..constants::BOUNDARY_CLAMP_MAX_PASSES {
+        let Some(next) = one_pass(at, boundaries) else {
+            return Correction::GaveUp;
+        };
+        at = next;
+        if legal(at, boundaries) {
+            let displacement = length(difference(at, vertex));
+            if !displacement.is_finite() || displacement > cap {
+                return Correction::GaveUp;
+            }
+            return Correction::Moved(at);
+        }
+    }
+    Correction::GaveUp
+}
+
+/// One correction: out of the keepout the point is deepest inside, or - when it
+/// is clear of them all - back inside the domain.
+///
+/// Deepest first because that is the correction with the furthest to go, and
+/// every other member is re-examined against the position it produces rather
+/// than against the one it started from.
+fn one_pass(at: Vec3, boundaries: &Boundaries) -> Option<Vec3> {
+    let mut deepest: Option<(f64, &Shape)> = None;
+    for shape in boundaries.keepout.shapes() {
+        let distance = shape.signed_distance(at);
+        if distance < 0.0 && deepest.is_none_or(|(best, _)| distance < best) {
+            deepest = Some((distance, shape));
+        }
+    }
+    if let Some((_, shape)) = deepest {
+        return push_out(at, shape);
+    }
+    if !boundaries.domain.is_empty() && boundaries.domain.signed_distance(at) > 0.0 {
+        return pull_in(at, &boundaries.domain);
+    }
+    Some(at)
+}
+
+/// The point on `shape`'s surface that `at` belongs on, a hair further out.
+///
+/// The offset is along the direction the projection travelled, which for a point
+/// inside the shape is its outward normal, so the result clears the surface by
+/// [`constants::BOUNDARY_CLAMP_EPS_MM`] whatever the shape.
+fn push_out(at: Vec3, shape: &Shape) -> Option<Vec3> {
+    let surface = shape.nearest_surface_point(at)?;
+    let outward = difference(surface, at);
+    let reach = length(outward);
+    if reach <= 0.0 || !reach.is_finite() {
+        return None;
+    }
+    Some(sum(
+        surface,
+        scale(outward, constants::BOUNDARY_CLAMP_EPS_MM / reach),
+    ))
+}
+
+/// The point just inside the domain that `at` belongs on.
+///
+/// The domain is an ordered CSG tree, whose field is a composition of minima and
+/// maxima with non-differentiable seams and no nearest-point formula, so this is
+/// a bounded descent onto the level set rather than a projection.
+fn pull_in(at: Vec3, domain: &Csg) -> Option<Vec3> {
+    descend(at, -constants::BOUNDARY_CLAMP_EPS_MM, |p| {
+        domain.signed_distance(p)
+    })
+}
+
+/// Move `start` onto the level set `field == target` by bounded steps along the
+/// field's own gradient, read by central differences.
+///
+/// The step is the residual carried along the **unit** gradient direction, which
+/// is Newton's own step for a field whose gradient is a unit vector - what a
+/// signed distance is, wherever it is differentiable - and which cannot blow up
+/// at a seam where two branches meet and the difference quotient collapses
+/// towards zero. `None` is a descent that did not arrive inside
+/// [`constants::BOUNDARY_CLAMP_MAX_STEPS`], or one that found no direction to
+/// move in at all.
+fn descend(start: Vec3, target: f64, field: impl Fn(Vec3) -> f64) -> Option<Vec3> {
+    let half_step = constants::BOUNDARY_CLAMP_GRADIENT_STEP_MM;
+    let mut at = start;
+    for _ in 0..constants::BOUNDARY_CLAMP_MAX_STEPS {
+        let residual = field(at) - target;
+        if !residual.is_finite() {
+            return None;
+        }
+        if residual.abs() <= constants::BOUNDARY_CLAMP_TOLERANCE_MM {
+            return Some(at);
+        }
+        let gradient: Vec3 = std::array::from_fn(|d| {
+            let mut low = at;
+            let mut high = at;
+            low[d] -= half_step;
+            high[d] += half_step;
+            (field(high) - field(low)) / (2.0 * half_step)
+        });
+        let slope = length(gradient);
+        if slope <= 0.0 || !slope.is_finite() {
+            return None;
+        }
+        at = difference(at, scale(gradient, residual / slope));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::ShapeUnion;
+
+    /// A mesh of loose vertices: this pass reads no triangle, so a fixture does
+    /// not need to be a surface to exercise it.
+    fn loose(vertices: Vec<Vec3>) -> Mesh {
+        Mesh {
+            vertices,
+            triangles: Vec::new(),
+        }
+    }
+
+    /// Boundaries made of keepouts alone.
+    fn forbidden(shapes: Vec<Shape>) -> Boundaries {
+        Boundaries {
+            domain: Csg::default(),
+            keepout: ShapeUnion::new(shapes),
+        }
+    }
+
+    /// The one voxel size the unit fixtures are measured against; large enough
+    /// that the displacement cap is never what a projection test is asserting.
+    const VOXEL_MM: f64 = 10.0;
+
+    /// The four shapes whose nearest surface point is a closed form, each with a
+    /// point inside it that lands exactly on the surface it names.
+    #[test]
+    fn a_point_inside_a_closed_form_shape_is_projected_onto_its_surface() {
+        let cases: Vec<(&str, Shape, Vec3)> = vec![
+            (
+                "box",
+                Shape::axis_aligned_box([0.0, 0.0, 0.0], [10.0, 20.0, 30.0]),
+                [9.5, 12.0, 17.0],
+            ),
+            (
+                "turned box",
+                Shape::Box {
+                    min: [0.0, 0.0, 0.0],
+                    max: [10.0, 20.0, 30.0],
+                    rotation_deg: [0.0, 0.0, 30.0],
+                },
+                [9.5, 12.0, 17.0],
+            ),
+            (
+                "sphere",
+                Shape::Sphere {
+                    center: [1.0, 2.0, 3.0],
+                    radius: 5.0,
+                },
+                [1.0, 2.0, 7.6],
+            ),
+            (
+                "cylinder wall",
+                Shape::Cylinder {
+                    p1: [0.0, 0.0, 0.0],
+                    p2: [0.0, 0.0, 20.0],
+                    radius: 4.0,
+                },
+                [3.7, 0.4, 10.0],
+            ),
+            (
+                "cylinder cap",
+                Shape::Cylinder {
+                    p1: [0.0, 0.0, 0.0],
+                    p2: [0.0, 0.0, 20.0],
+                    radius: 4.0,
+                },
+                [1.0, 0.5, 0.2],
+            ),
+            (
+                "tube",
+                Shape::Tube {
+                    p1: [0.0, 0.0, 0.0],
+                    p2: [20.0, 0.0, 0.0],
+                    bend: None,
+                    radius: 3.0,
+                },
+                [10.0, 2.6, 0.4],
+            ),
+            (
+                "bent tube",
+                Shape::Tube {
+                    p1: [0.0, 0.0, 0.0],
+                    p2: [20.0, 0.0, 0.0],
+                    bend: Some([10.0, 8.0, 0.0]),
+                    radius: 3.0,
+                },
+                [10.0, 6.5, 0.7],
+            ),
+        ];
+
+        for (what, shape, inside) in cases {
+            assert!(
+                shape.signed_distance(inside) < 0.0,
+                "{what}: the fixture point is not inside it"
+            );
+            let surface = shape
+                .nearest_surface_point(inside)
+                .unwrap_or_else(|| panic!("{what}: no projection"));
+            assert!(
+                shape.signed_distance(surface).abs() < 1e-9,
+                "{what}: the projection landed at {} off the surface",
+                shape.signed_distance(surface)
+            );
+            // And it is the *nearest* point: no closer one exists, so the step
+            // it took is the depth the field reported.
+            let travelled = length(difference(surface, inside));
+            assert!(
+                (travelled + shape.signed_distance(inside)).abs() < 1e-9,
+                "{what}: moved {travelled} for a depth of {}",
+                -shape.signed_distance(inside)
+            );
+
+            // Through the pass itself: the vertex comes out legal, and clear of
+            // the surface rather than on it.
+            let mut mesh = loose(vec![inside]);
+            let report = resolve(&mut mesh, &forbidden(vec![shape]), VOXEL_MM);
+            assert_eq!(report.vertices_moved, 1, "{what}");
+            assert_eq!(report.gave_up, 0, "{what}");
+            assert!(
+                shape.signed_distance(mesh.vertices[0]) > 0.0,
+                "{what}: the clamped vertex is still inside"
+            );
+            assert!(
+                shape.signed_distance(mesh.vertices[0]) < 2.0 * constants::BOUNDARY_CLAMP_EPS_MM,
+                "{what}: the clamp overshot the surface"
+            );
+        }
+    }
+
+    /// A point already outside a shape is never touched, whichever shape it is.
+    #[test]
+    fn a_vertex_that_violates_nothing_is_left_alone() {
+        let shape = Shape::Sphere {
+            center: [0.0; 3],
+            radius: 4.0,
+        };
+        let outside = [9.0, 1.0, -2.0];
+        let mut mesh = loose(vec![outside]);
+        let report = resolve(&mut mesh, &forbidden(vec![shape]), VOXEL_MM);
+        assert_eq!(report.vertices_moved, 0);
+        assert_eq!(report.gave_up, 0);
+        assert_eq!(report.max_displacement_mm, 0.0);
+        assert_eq!(mesh.vertices[0], outside);
+        assert_eq!(
+            report.notes(),
+            vec![
+                "every exported vertex was already inside the domain and clear of the keepouts"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The ellipsoid has no closed form, so its projection is iterated - and it
+    /// has to arrive, on the turned shape as well as the plain one.
+    ///
+    /// The interior points are written in the ellipsoid's **own** coordinates
+    /// and carried through the rotation, so the same offsets are the same
+    /// fractions of the same semi-axes whichever way the shape is turned.
+    #[test]
+    fn an_ellipsoid_projection_converges_inside_its_budget() {
+        use crate::geometry::{rotate, rotation_matrix};
+
+        let center = [1.0, -2.0, 4.0];
+        let radii = [6.0, 3.0, 2.0];
+        for rotation in [[0.0; 3], [0.0, 0.0, 30.0], [15.0, -35.0, 62.0]] {
+            let shape = Shape::Ellipsoid {
+                center,
+                radii,
+                rotation_deg: rotation,
+            };
+            let matrix = rotation_matrix(rotation);
+            // Points all over the interior: a hair inside the surface on each
+            // axis, an oblique one, and one a hair off the centre.
+            for local in [
+                [5.9, 0.0, 0.0],
+                [0.0, 2.9, 0.0],
+                [0.0, 0.0, 1.9],
+                [2.0, -1.0, 1.0],
+                [-4.5, 0.5, -0.5],
+                [1e-6, 0.0, 0.0],
+            ] {
+                let inside = sum(center, rotate(&matrix, local));
+                assert!(
+                    shape.signed_distance(inside) < 0.0,
+                    "{rotation:?} {local:?} is not inside the fixture"
+                );
+                let surface = shape
+                    .nearest_surface_point(inside)
+                    .unwrap_or_else(|| panic!("{rotation:?} {local:?}: no projection"));
+                // Arrived, to the tolerance the budget promises.
+                assert!(
+                    shape.signed_distance(surface).abs()
+                        <= constants::BOUNDARY_CLAMP_TOLERANCE_MM + 1e-12,
+                    "{rotation:?} {local:?}: landed {} off the surface",
+                    shape.signed_distance(surface)
+                );
+                // And it left along the outward normal rather than wandering:
+                // the step it took is no shorter than the shape's own field
+                // says the surface is, which is that field's Lipschitz bound.
+                let travelled = length(difference(surface, inside));
+                assert!(
+                    travelled >= -shape.signed_distance(inside) - 1e-9,
+                    "{rotation:?} {local:?}: moved {travelled} for a depth bound of {}",
+                    -shape.signed_distance(inside)
+                );
+            }
+            // The centre has no single nearest point, and says so rather than
+            // inventing one.
+            assert_eq!(shape.nearest_surface_point(center), None);
+
+            // Through the pass, from a vertex a fraction of a voxel inside.
+            let just_inside = sum(center, rotate(&matrix, [0.0, 2.99, 0.0]));
+            let mut mesh = loose(vec![just_inside]);
+            let report = resolve(&mut mesh, &forbidden(vec![shape]), VOXEL_MM);
+            assert_eq!(report.vertices_moved, 1, "{rotation:?}");
+            assert_eq!(report.gave_up, 0, "{rotation:?}");
+            assert!(
+                shape.signed_distance(mesh.vertices[0]) > 0.0,
+                "{rotation:?}: the clamped vertex is still inside"
+            );
+        }
+    }
+
+    /// Two overlapping keepouts: leaving one puts the vertex inside the other,
+    /// so a single projection is not enough and the pass has to go round again.
+    #[test]
+    fn overlapping_keepouts_are_left_by_more_than_one_projection() {
+        let first = Shape::Sphere {
+            center: [0.0, 0.0, 0.0],
+            radius: 5.0,
+        };
+        let second = Shape::Sphere {
+            center: [6.0, 0.0, 0.0],
+            radius: 5.0,
+        };
+        let boundaries = forbidden(vec![first, second]);
+        // Deep inside the first and inside the lens the two share, so the first
+        // projection - out of the deeper one - lands inside the second.
+        let start = [2.0, 0.5, 0.0];
+        assert!(first.signed_distance(start) < 0.0 && second.signed_distance(start) < 0.0);
+        let once = push_out(start, &first).expect("a projection");
+        assert!(
+            second.signed_distance(once) < 0.0,
+            "the fixture no longer needs a second pass"
+        );
+
+        let mut mesh = loose(vec![start]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.gave_up, 0, "{report:?}");
+        assert_eq!(report.vertices_moved, 1);
+        let at = mesh.vertices[0];
+        assert!(
+            first.signed_distance(at) > 0.0 && second.signed_distance(at) > 0.0,
+            "the vertex is still inside one of them: {at:?}"
+        );
+    }
+
+    /// A tube thicker than the bend it follows overlaps itself, and the offset
+    /// construction that is exact for every other tube is not a projection
+    /// there: a radius out from the nearest centre-line point crosses the arc's
+    /// own centre and lands back **inside** the solid.
+    ///
+    /// The half circle below has a centre line of radius 2.6 mm. At a tube
+    /// radius of 3.0 the shape is self-intersecting and the projection is
+    /// refused; at 0.99 of the arc radius it is not, and the projection is exact.
+    /// The refusal is what lets the clamp reach its honest give-up on the
+    /// **first** pass rather than spending its whole budget rediscovering the
+    /// same illegal point, which is asserted directly on `one_pass`: `corrected`
+    /// returns `GaveUp` the moment that answers `None`.
+    #[test]
+    fn a_self_intersecting_tube_refuses_to_name_a_surface_point() {
+        use crate::geometry::{tube_closest_point, tube_self_intersects};
+
+        let arc_radius = 2.6;
+        let (p1, bend, p2) = (
+            [arc_radius, 0.0, 0.0],
+            [0.0, arc_radius, 0.0],
+            [-arc_radius, 0.0, 0.0],
+        );
+        let tube = |radius| Shape::Tube {
+            p1,
+            p2,
+            bend: Some(bend),
+            radius,
+        };
+
+        // The point the assertions below are made at: near the arc's first end,
+        // where the outward ray sweeps right across the disc.
+        let inside = [2.2, 0.2, 0.0];
+
+        // Just under the threshold: an ordinary tube, projected exactly - even
+        // here, where the projection passes within a hair of the arc's own
+        // centre. Below the threshold it cannot pass *through* it, which is what
+        // keeps the nearest point of the curve the same point and the
+        // construction exact.
+        let sound = tube(0.99 * arc_radius);
+        assert!(!sound.self_intersects());
+        assert!(!tube_self_intersects(p1, p2, Some(bend), 0.99 * arc_radius));
+        assert!(sound.signed_distance(inside) < 0.0);
+        let surface = sound.nearest_surface_point(inside).expect("a projection");
+        assert!(
+            sound.signed_distance(surface).abs() < 1e-9,
+            "landed {} off the surface",
+            sound.signed_distance(surface)
+        );
+
+        // Past it: refused rather than answered wrongly. The threshold itself is
+        // probed from either side rather than exactly on it - the circumcircle
+        // is solved in floating point, so "radius exactly the arc radius" is not
+        // a case a test can name.
+        let overlapping = tube(3.0);
+        assert!(overlapping.self_intersects());
+        assert!(tube_self_intersects(p1, p2, Some(bend), 3.0));
+        assert!(tube_self_intersects(p1, p2, Some(bend), 1.001 * arc_radius));
+        assert!(overlapping.signed_distance(inside) < 0.0);
+        assert_eq!(overlapping.nearest_surface_point(inside), None);
+
+        // And this is why: the construction it would otherwise have used carries
+        // the vertex across the disc and lands it back inside the solid. Swept
+        // over several interior points rather than asserted at one, because a
+        // single point can land on the surface by coincidence - the answer is
+        // wrong in this regime, not wrong everywhere in it.
+        let worst = [inside, [0.6, 2.0, 0.0], [0.0, 2.0, 0.0]]
+            .into_iter()
+            .map(|p| {
+                assert_eq!(overlapping.nearest_surface_point(p), None, "{p:?}");
+                let on_line = tube_closest_point(p, p1, p2, Some(bend));
+                let outward = difference(p, on_line);
+                let naive = sum(on_line, scale(outward, 3.0 / length(outward)));
+                overlapping.signed_distance(naive)
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            worst < -0.5,
+            "the fixture no longer reproduces the defect: worst is {worst}"
+        );
+
+        // Through the pass: the vertex is left exactly where it was, counted,
+        // and given up on in one round rather than eight.
+        let boundaries = forbidden(vec![overlapping]);
+        assert_eq!(push_out(inside, &overlapping), None);
+        assert_eq!(
+            one_pass(inside, &boundaries),
+            None,
+            "the pass has to give up on the first round rather than burn its budget"
+        );
+        let mut mesh = loose(vec![inside, [50.0, 50.0, 50.0]]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.vertices_moved, 0, "{report:?}");
+        assert_eq!(report.gave_up, 1, "{report:?}");
+        assert_eq!(mesh.vertices[0], inside, "the vertex was moved");
+        assert_eq!(mesh.vertices[1], [50.0, 50.0, 50.0]);
+
+        // A straight tube cannot self-intersect however thick it is, which is
+        // the same arithmetic as a bend that never became an arc.
+        for bend in [
+            None,
+            Some([arc_radius, 0.0, 0.5 * constants::TUBE_COLLINEAR_EPS_MM]),
+        ] {
+            let straight = Shape::Tube {
+                p1,
+                p2,
+                bend,
+                radius: 1e6,
+            };
+            assert!(!straight.self_intersects(), "{bend:?}");
+        }
+    }
+
+    /// The other way a tube overlaps itself, and the one the fold bound alone
+    /// cannot see: an arc bent nearly the whole way round, whose two **ends**
+    /// have closed on each other across the gap. Its radius is well under the
+    /// arc's, so nothing about its bend is wrong; what is wrong is that a point
+    /// beyond one end projects to a surface point inside the other.
+    ///
+    /// These are the numbers the review found it at, at printable scale.
+    #[test]
+    fn a_tube_whose_ends_have_closed_across_the_gap_is_refused_too() {
+        use crate::geometry::{tube_arc, tube_closest_point};
+
+        let (p1, p2, bend) = ([5.909, 0.522, 0.0], [5.909, -0.522, 0.0], [-6.0, 0.0, 0.0]);
+        let radius = 1.8;
+        let shape = Shape::Tube {
+            p1,
+            p2,
+            bend: Some(bend),
+            radius,
+        };
+        let arc = tube_arc(p1, p2, Some(bend)).expect("an arc");
+
+        // The fold bound is nowhere near: this tube is less than a third of its
+        // own arc radius, and more than half a turn round it.
+        assert!(
+            radius < 0.35 * arc.radius,
+            "arc radius {} against tube radius {radius}",
+            arc.radius
+        );
+        assert!(arc.span > std::f64::consts::PI);
+        assert!(arc.reach() < radius, "reach {}", arc.reach());
+        assert!(shape.self_intersects(), "the gap mode was not detected");
+
+        // Points in the gap, just inside one end: refused, and the construction
+        // that would otherwise have been used lands well inside the other end.
+        let worst = [[5.909, 0.3, 0.0], [6.2, 0.0, 0.0], [5.7, -0.3, 0.0]]
+            .into_iter()
+            .map(|p| {
+                assert!(shape.signed_distance(p) < 0.0, "{p:?} is not inside");
+                assert_eq!(shape.nearest_surface_point(p), None, "{p:?}");
+                let on_line = tube_closest_point(p, p1, p2, Some(bend));
+                let outward = difference(p, on_line);
+                let naive = sum(on_line, scale(outward, radius / length(outward)));
+                shape.signed_distance(naive)
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            worst < -0.5,
+            "the fixture no longer reproduces the defect: worst is {worst}"
+        );
+
+        // And through the pass: one round to the give-up, vertex untouched.
+        let boundaries = forbidden(vec![shape]);
+        let vertex = [5.909, 0.3, 0.0];
+        assert_eq!(push_out(vertex, &shape), None);
+        assert_eq!(one_pass(vertex, &boundaries), None);
+        let mut mesh = loose(vec![vertex]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.vertices_moved, 0, "{report:?}");
+        assert_eq!(report.gave_up, 1, "{report:?}");
+        assert_eq!(mesh.vertices[0], vertex);
+
+        // Open the same gap out and the tube is ordinary again: the ends are
+        // then further apart than the tube is thick, and the projection is
+        // exact. Nothing here is a blanket refusal of a nearly closed arc.
+        let open = Shape::Tube {
+            p1: [3.0, 5.196, 0.0],
+            p2: [3.0, -5.196, 0.0],
+            bend: Some(bend),
+            radius,
+        };
+        assert!(!open.self_intersects());
+        // Probed at the same place the closed one fails: just inside one end,
+        // facing the other across the gap.
+        for inside in [[3.0, 4.696, 0.0], [3.4, 5.0, 0.2], [-5.0, 0.0, 0.3]] {
+            assert!(open.signed_distance(inside) < 0.0, "{inside:?}");
+            let surface = open.nearest_surface_point(inside).expect("a projection");
+            assert!(
+                open.signed_distance(surface).abs() < 1e-9,
+                "{inside:?} landed {} off the surface",
+                open.signed_distance(surface)
+            );
+        }
+    }
+
+    /// The give-up path: a vertex with no single nearest surface point is left
+    /// exactly where it was, and counted.
+    #[test]
+    fn a_vertex_the_projection_cannot_name_a_target_for_is_left_and_counted() {
+        // The centre of a sphere is equidistant from all of it.
+        let shape = Shape::Sphere {
+            center: [3.0, 4.0, 5.0],
+            radius: 2.0,
+        };
+        let mut mesh = loose(vec![[3.0, 4.0, 5.0]]);
+        let report = resolve(&mut mesh, &forbidden(vec![shape]), VOXEL_MM);
+        assert_eq!(report.vertices_moved, 0);
+        assert_eq!(report.gave_up, 1);
+        assert_eq!(mesh.vertices[0], [3.0, 4.0, 5.0], "the vertex was moved");
+        let notes = report.notes();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[1].starts_with("warning: 1 vertex was"), "{notes:?}");
+    }
+
+    /// The sanity cap: a vertex a whole voxel and more inside a keepout is not
+    /// the sub-voxel artefact this pass corrects, so it is left alone.
+    #[test]
+    fn a_correction_past_the_displacement_cap_is_refused() {
+        let shape = Shape::Sphere {
+            center: [0.0; 3],
+            radius: 10.0,
+        };
+        let voxel = 1.0;
+        let cap = constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS * voxel;
+        // Just inside the cap, and just outside it.
+        let near = [0.0, 0.0, 10.0 - 0.5 * cap];
+        let deep = [0.0, 0.0, 10.0 - 2.0 * cap];
+
+        let mut mesh = loose(vec![near, deep]);
+        let report = resolve(&mut mesh, &forbidden(vec![shape]), voxel);
+        assert_eq!(report.vertices_moved, 1, "{report:?}");
+        assert_eq!(report.gave_up, 1, "{report:?}");
+        assert!(report.max_displacement_mm <= cap);
+        assert_ne!(mesh.vertices[0], near, "the shallow vertex was not moved");
+        assert_eq!(mesh.vertices[1], deep, "the deep vertex was moved anyway");
+    }
+
+    /// The other half of the pass: a vertex outside the domain is pulled back
+    /// onto it, including through a subtraction, where the field is a composite
+    /// with a seam rather than a single shape.
+    #[test]
+    fn a_vertex_outside_the_domain_is_pulled_back_onto_it() {
+        use crate::geometry::CsgOp;
+
+        let domain = Csg::new(vec![
+            (
+                CsgOp::Add,
+                Shape::axis_aligned_box([0.0, 0.0, 0.0], [20.0, 20.0, 20.0]),
+            ),
+            (
+                CsgOp::Subtract,
+                Shape::Sphere {
+                    center: [20.0, 10.0, 10.0],
+                    radius: 6.0,
+                },
+            ),
+        ]);
+        let boundaries = Boundaries {
+            domain,
+            keepout: ShapeUnion::default(),
+        };
+        // Past the far face, and inside the bite the sphere takes out of it.
+        let past_face = [20.4, 4.0, 4.0];
+        let in_the_bite = [17.0, 10.0, 10.0];
+        assert!(boundaries.domain.signed_distance(past_face) > 0.0);
+        assert!(boundaries.domain.signed_distance(in_the_bite) > 0.0);
+
+        let mut mesh = loose(vec![past_face, in_the_bite]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.gave_up, 0, "{report:?}");
+        assert_eq!(report.vertices_moved, 2);
+        for vertex in &mesh.vertices {
+            let distance = boundaries.domain.signed_distance(*vertex);
+            assert!(distance < 0.0, "{vertex:?} is still outside: {distance}");
+            assert!(
+                distance > -2.0 * constants::BOUNDARY_CLAMP_EPS_MM,
+                "{vertex:?} was pushed {distance} deep rather than onto the surface"
+            );
+        }
+        assert!(report.max_displacement_mm > 0.0);
+        assert!(report.notes()[0].starts_with("clamped 2 vertices"));
+    }
+
+    /// The descent underneath that: it arrives on the level set it was asked
+    /// for, and gives up rather than spinning when there is no direction to go.
+    #[test]
+    fn the_descent_arrives_on_its_level_set_or_says_it_did_not() {
+        let sphere = Shape::Sphere {
+            center: [0.0; 3],
+            radius: 7.0,
+        };
+        let field = |p: Vec3| sphere.signed_distance(p);
+        for target in [0.0, -0.5, 1.5] {
+            let landed = descend([13.0, 2.0, -4.0], target, field).expect("a descent");
+            assert!(
+                (field(landed) - target).abs() <= constants::BOUNDARY_CLAMP_TOLERANCE_MM,
+                "target {target}: landed at {}",
+                field(landed)
+            );
+        }
+        // A field with no gradient anywhere has nowhere to send the point.
+        assert_eq!(descend([1.0, 2.0, 3.0], 0.0, |_| 5.0), None);
+        // And one that is not a number is refused rather than followed.
+        assert_eq!(descend([1.0, 2.0, 3.0], 0.0, |_| f64::NAN), None);
+    }
+
+    /// Empty boundaries constrain nothing, which is what lets a caller hold a
+    /// mesh to its keepouts alone - or to nothing at all.
+    #[test]
+    fn empty_boundaries_move_nothing() {
+        let vertices = vec![[0.0, 0.0, 0.0], [1e6, -1e6, 1e6]];
+        let mut mesh = loose(vertices.clone());
+        let report = resolve(&mut mesh, &Boundaries::default(), VOXEL_MM);
+        assert_eq!(report.vertices_moved, 0);
+        assert_eq!(report.gave_up, 0);
+        assert_eq!(mesh.vertices, vertices);
+    }
+}

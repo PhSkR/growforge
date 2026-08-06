@@ -1,0 +1,78 @@
+[package]
+name = "growforge"
+version = "0.31.1"
+edition = "2024"
+description = "Topology optimization and growth heuristics for strong, weight-optimized printable structures"
+
+[lib]
+name = "growforge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "growforge"
+path = "src/main.rs"
+
+[features]
+default = ["gpu", "viewer"]
+# GPU accelerated linear solve: `[solver] backend = "gpu"`. Independent of
+# `viewer` - a headless build can still solve on the GPU - but the two share the
+# wgpu dependency. `--no-default-features` builds a pure CPU solver.
+gpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+# Native 3D viewer: `growforge view`, `growforge run --view` and the visual
+# editor `growforge edit`. Gates every graphics dependency, so
+# `--no-default-features` builds the solver alone. `toml_edit` is in here rather
+# than in the base dependencies because only the editor writes a configuration
+# back out; a headless build only ever reads one.
+viewer = [
+    "dep:bytemuck",
+    "dep:egui",
+    "dep:egui-wgpu",
+    "dep:egui-winit",
+    "dep:pollster",
+    "dep:rfd",
+    "dep:toml_edit",
+    "dep:wgpu",
+    "dep:winit",
+]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.3"
+
+# Graphics and compute stack, shared by the `gpu` and `viewer` features. egui
+# 0.35 is built against wgpu 29 and winit 0.30; the three versions must move
+# together, or the wgpu types egui-wgpu expects stop matching the ones we hand
+# it. `bytemuck`, `pollster` and `wgpu` are what the headless compute solver
+# needs on its own.
+bytemuck = { version = "1.25.2", features = ["derive"], optional = true }
+egui = { version = "0.35.0", optional = true }
+egui-wgpu = { version = "0.35.0", features = ["winit"], optional = true }
+egui-winit = { version = "0.35.0", default-features = false, features = [
+    "links",
+    "wayland",
+    "x11",
+], optional = true }
+pollster = { version = "1.0.1", optional = true }
+# The native file picker behind the editor's "open" and "new" buttons: the
+# platform's own dialog rather than one drawn in egui, so a session starts and
+# switches files the way every other program on the machine does. Under the
+# `viewer` feature because only the editor ever asks for a file; a headless
+# build is handed its path on the command line. It takes the same
+# `raw-window-handle` 0.6 the winit and wgpu stack above pins, and is raised
+# unparented in any case, so it adds nothing to that version's constraints.
+rfd = { version = "0.17.2", optional = true }
+# Format preserving TOML, used by the editor's save-back so that comments, key
+# order and the formatting of everything the user did not touch survive a round
+# trip. The `toml` crate above stays the reader: it is what deserializes into
+# the typed configuration.
+toml_edit = { version = "0.25.13", optional = true }
+wgpu = { version = "29.0.4", optional = true }
+winit = { version = "0.30.13", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

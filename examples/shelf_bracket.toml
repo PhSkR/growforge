@@ -1,0 +1,99 @@
+# growforge example: wall mounted shelf bracket.
+#
+# Units everywhere: millimetres, newtons, MPa (N/mm^2), N*mm for torque,
+# g/cm^3 for mass density and mm/s^2 for gravity.
+#
+# The bracket bolts to a wall through the flange at x = 0 and carries a shelf on
+# the 90 mm deep pad along its top edge. x runs out from the wall, y is the
+# bracket's width and z is up. The load case holds a 400 N shelf load spread over
+# the whole pad plus the bracket's own weight, and the design has to come out
+# printable standing on its z = 0 face with no support material.
+#
+# This is the overhang showcase, so it runs the update scheme the README
+# recommends for one: the self-supporting filter turns a design variable into a
+# near-discrete "does this column print or not" decision, and the multiplicative
+# optimality criteria step cannot settle those - it ends this problem on the
+# iteration cap with a design variable change of 0.025 against the 0.01 asked
+# for. The method of moving asymptotes damps exactly those variables and
+# converges. `update = "oc"` is still the global default; see the README.
+#
+#   growforge check examples/shelf_bracket.toml
+#   growforge run   examples/shelf_bracket.toml
+#   growforge run   examples/shelf_bracket.toml --view
+
+[project]
+name = "shelf_bracket"
+engine = "simp"
+
+[resolution]
+# 3 mm voxels give a 30 x 9 x 47 element grid.
+voxel_size_mm = 3.0
+
+[material]
+preset = "petg"
+
+[optimization]
+mass_fraction = 0.16
+min_feature_mm = 9.0
+max_iterations = 150
+convergence_tol = 0.01
+update = "mma"
+
+  # Self-supporting constraint. Layers stack towards +z, so the build plate is
+  # the z = 0 face and every overhang has to stay within 45 degrees of vertical.
+  # The angle is fixed by the filter's supporting stencil; there is no knob.
+  [optimization.overhang]
+  build_direction = "z+"
+
+[output]
+# Relative paths resolve against the directory holding this file.
+stl_path = "shelf_bracket.stl"
+iso_level = 0.5
+smoothing_iterations = 8
+# Report cavities the exported surface would seal, without filling them.
+voids = "warn"
+# Machine readable copy of the von Mises table printed at the end of the run.
+stress_json = "shelf_bracket_stress.json"
+
+# Design domain: the envelope the bracket may occupy.
+[[domain]]
+op = "add"
+shape = "box"
+min = [0.0, 0.0, 0.0]
+max = [90.0, 25.0, 140.0]
+
+# Wall flange: the flat face the bolts pull against, forced solid over the full
+# height so the bracket always has a wall contact and a footprint to print from.
+[[keepin]]
+shape = "box"
+min = [0.0, 0.0, 0.0]
+max = [6.0, 25.0, 140.0]
+
+# Shelf pad: the flat top surface the shelf rests on, so the distributed load
+# has something to push against and is never optimized away.
+[[keepin]]
+shape = "box"
+min = [0.0, 0.0, 134.0]
+max = [90.0, 25.0, 140.0]
+
+# Bolted to the wall over the whole flange face.
+[[supports]]
+region = { shape = "box", min = [-0.5, -0.5, -0.5], max = [0.5, 25.5, 140.5] }
+directions = ["x", "y", "z"]
+
+[[loadcases]]
+name = "shelf-load"
+weight = 1.0
+
+  # 400 N of shelf and contents, spread evenly over the pad's top nodes.
+  [[loadcases.loads]]
+  type = "force"
+  region = { shape = "box", min = [-0.5, -0.5, 138.5], max = [90.5, 25.5, 140.5] }
+  vector = [0.0, 0.0, -400.0]
+
+  # The bracket's own weight, in the same load case as the shelf load. It scales
+  # with the physical density, so it is reassembled every iteration.
+  [[loadcases.loads]]
+  type = "gravity"
+  direction = [0.0, 0.0, -1.0]
+  g_mm_s2 = 9810.0

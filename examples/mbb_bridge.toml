@@ -1,0 +1,76 @@
+# growforge example: MBB style bridge.
+#
+# Units everywhere: millimetres, newtons, MPa (N/mm^2), N*mm for torque and
+# g/cm^3 for mass density.
+#
+# A 240 x 40 x 40 mm span rests on both bottom ends and carries a 300 N load
+# spread across a solid strip along the top centre. The left support is pinned,
+# the right one is a roller (free along x) so the span can expand.
+#
+#   growforge check examples/mbb_bridge.toml
+#   growforge run   examples/mbb_bridge.toml
+
+[project]
+name = "mbb_bridge"
+
+engine = "simp"
+
+[resolution]
+# 2.5 mm voxels give a 96 x 16 x 16 element grid.
+voxel_size_mm = 2.5
+
+[material]
+preset = "petg"
+
+[optimization]
+mass_fraction = 0.25
+min_feature_mm = 10.0
+max_iterations = 150
+convergence_tol = 0.01
+
+[output]
+stl_path = "mbb_bridge.stl"
+iso_level = 0.5
+smoothing_iterations = 10
+
+[[domain]]
+op = "add"
+shape = "box"
+min = [0.0, 0.0, 0.0]
+max = [240.0, 40.0, 40.0]
+
+# Solid pads at both feet so the reactions do not chew through the supports.
+[[keepin]]
+shape = "box"
+min = [0.0, 0.0, 0.0]
+max = [10.0, 40.0, 5.0]
+
+[[keepin]]
+shape = "box"
+min = [230.0, 0.0, 0.0]
+max = [240.0, 40.0, 5.0]
+
+# Solid strip along the top centre that carries the deck load.
+[[keepin]]
+shape = "box"
+min = [110.0, 0.0, 35.0]
+max = [130.0, 40.0, 40.0]
+
+# Pinned foot on the left.
+[[supports]]
+region = { shape = "box", min = [-0.5, -0.5, -0.5], max = [5.5, 40.5, 0.5] }
+directions = ["x", "y", "z"]
+
+# Roller foot on the right: vertical and lateral restraint only.
+[[supports]]
+region = { shape = "box", min = [234.5, -0.5, -0.5], max = [240.5, 40.5, 0.5] }
+directions = ["y", "z"]
+
+[[loadcases]]
+name = "deck"
+weight = 1.0
+
+  [[loadcases.loads]]
+  type = "force"
+  region = { shape = "box", min = [109.5, -0.5, 39.5], max = [130.5, 40.5, 40.5] }
+  vector = [0.0, 0.0, -300.0]
