@@ -2058,6 +2058,14 @@ switch the session to whatever comes back, without closing the window: see
 | show                | the same layer switches the viewer has, plus the editor's own selection, hover, gizmo, dimension, floor grid and placement preview overlays; under them, what the [trim](#trimming-unloaded-material) pass removed from the design on screen, or the warning that it was refused, what the [reinforcement](#reinforcement-minimum-printable-thickness) pass spent on its thin arms, or the warning that a member could not be thickened, and what the [boundary clamp](#exact-boundaries) moved onto the shapes |
 | stress              | the [safety factor](#stress-report) of the part that was just written, first, with the peak von Mises stress of every load case under it; present after a full run and after `generate stl`, absent while one is running and absent when the stress solve produced no report |
 
+**Every labelled block above folds away**, and stays however you left it for the
+session. The window opens on the ones a session works in - `objects`,
+`properties`, `show` and `stress` - with `problem` and `controls` folded, and
+with **the five object lists themselves closed**: click `keepout (3)` to see
+what is in it. `material` and `output` open closed as they always have. The
+toolbar, the snapping controls and the validation block are not foldable: a
+warning you cannot see is a warning that was never printed.
+
 An optional key has a checkbox in front of it: unticked means the key is not in
 the file at all and growforge's own default applies, and the default is shown
 next to it. Ticking it writes the key with that default as its starting value.

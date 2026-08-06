@@ -438,7 +438,7 @@ pub fn panel(root: &mut egui::Ui, editor: &mut Editor, scene: &mut Scene, adapte
                 ui.separator();
                 summary(ui, &editor.state);
                 ui.separator();
-                layer_switches(ui, scene, true);
+                show_block(ui, scene);
                 pass_notes(ui, editor);
                 stress_summary(ui, editor);
                 ui.separator();
@@ -705,7 +705,7 @@ fn validation(ui: &mut egui::Ui, editor: &Editor) {
 /// how to address the entry at an index.
 type ShapeList = (&'static str, usize, fn(usize) -> Selection);
 
-/// The object tree, with an add menu per list and a delete for the selection.
+/// The object tree, with an add menu per list, under a header of its own.
 ///
 /// Returns the object an add row asked to *place* rather than to add, which is
 /// the tube button and nothing else: a tube is two clicked points, so its
@@ -713,7 +713,20 @@ type ShapeList = (&'static str, usize, fn(usize) -> Selection);
 /// centre of the domain. The mode is the session's, not the document's, so it
 /// is handed back to the caller rather than applied here.
 fn tree(ui: &mut egui::Ui, field: &mut Field<'_>) -> Option<NewObject> {
-    ui.label(egui::RichText::new("objects").strong());
+    let mut placing: Option<NewObject> = None;
+    egui::CollapsingHeader::new(constants::VIEW_EDIT_BLOCK_OBJECTS)
+        .default_open(true)
+        .show(ui, |ui| placing = object_lists(ui, field));
+    placing
+}
+
+/// The five lists themselves, drawn into the body the tree's header opens.
+///
+/// Its own function because a collapsing header is identified by the ui it is
+/// drawn in: the lists laid out here can therefore be laid out anywhere else -
+/// a test, in particular - with their ids known, which is what the salts below
+/// exist to keep still.
+fn object_lists(ui: &mut egui::Ui, field: &mut Field<'_>) -> Option<NewObject> {
     let selection = field.state.selection();
 
     let mut clicked: Option<Selection> = None;
@@ -743,8 +756,14 @@ fn tree(ui: &mut egui::Ui, field: &mut Field<'_>) -> Option<NewObject> {
         ),
     ];
     for (name, count, make) in lists {
+        // Salted with the name alone, because the label carries the count and
+        // egui identifies a header by its label text unless it is told
+        // otherwise: without this, adding or deleting an object would rename
+        // the header, and a list the user had opened would shut itself the
+        // moment its contents changed.
         egui::CollapsingHeader::new(format!("{name} ({count})"))
-            .default_open(true)
+            .id_salt(name)
+            .default_open(false)
             .show(ui, |ui| {
                 for index in 0..count {
                     let entry = make(index);
@@ -788,8 +807,9 @@ fn tree(ui: &mut egui::Ui, field: &mut Field<'_>) -> Option<NewObject> {
     }
 
     let cases = field.state.config().loadcases.len();
-    egui::CollapsingHeader::new(format!("load cases ({cases})"))
-        .default_open(true)
+    egui::CollapsingHeader::new(format!("{} ({cases})", constants::VIEW_EDIT_LOAD_CASE_LIST))
+        .id_salt(constants::VIEW_EDIT_LOAD_CASE_LIST)
+        .default_open(false)
         .show(ui, |ui| {
             for case in 0..cases {
                 let entry = Selection::LoadCase(case);
@@ -837,24 +857,35 @@ fn tree(ui: &mut egui::Ui, field: &mut Field<'_>) -> Option<NewObject> {
     placing
 }
 
-/// The properties of whatever is selected.
+/// The properties of whatever is selected, under a header of its own.
 ///
 /// Returns whether the delete button was pressed. The delete itself is the
 /// caller's to apply, because it is the session's business as well as the
 /// document's - it cancels a placement in progress, which is why the button and
 /// the `Delete` key both end up in [`Editor::delete_selection`] rather than in
 /// two places that have to agree.
+///
+/// A closed block has no button to press, which is what the missing body says:
+/// nothing was clicked, so nothing is deleted.
 fn properties(ui: &mut egui::Ui, field: &mut Field<'_>) -> bool {
+    egui::CollapsingHeader::new(constants::VIEW_EDIT_BLOCK_PROPERTIES)
+        .default_open(true)
+        .show(ui, |ui| properties_body(ui, field))
+        .body_returned
+        .unwrap_or(false)
+}
+
+/// The rows of that block, drawn into the body its header opens.
+fn properties_body(ui: &mut egui::Ui, field: &mut Field<'_>) -> bool {
     let Some(selection) = field.state.selection() else {
-        ui.label(egui::RichText::new("properties").strong());
         ui.label("nothing selected; click an object in the viewport or the tree");
         return false;
     };
-    let mut delete = false;
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("properties").strong());
-        delete = ui.small_button("delete").clicked();
-    });
+    // The first row of the body rather than the heading that used to carry it:
+    // the delete belongs to the object whose fields are under it, and a control
+    // that removes something has to sit with those fields rather than on a
+    // header that is there whether or not they are.
+    let delete = ui.small_button("delete").clicked();
     // The fields of an object that is going are not drawn, exactly as they were
     // not drawn when the delete happened here.
     if delete {
@@ -2644,13 +2675,17 @@ fn stress_summary(ui: &mut egui::Ui, editor: &Editor) {
         return;
     };
     ui.separator();
-    ui.label(egui::RichText::new("stress").strong());
     stress_block(ui, &summary);
 }
 
-/// The summary itself, drawn from a summary rather than from the editor, so
-/// every state of it - including the export that came out in pieces - can be laid
-/// out in a test.
+/// The summary itself, header and all, drawn from a summary rather than from
+/// the editor, so every state of it - including the export that came out in
+/// pieces - can be laid out in a test.
+///
+/// The header is here rather than in [`stress_summary`] for that same reason:
+/// the block exists only behind a finished run, and a header drawn where the
+/// summary is would be one no test without a run could ask about. What gates it
+/// is unchanged - no summary, no block and no header.
 ///
 /// The warning goes above the headline and in the warning colour, which is the
 /// rule [`pass_notes`] draws its own warnings by: what a safety factor is worth
@@ -2663,28 +2698,51 @@ fn stress_summary(ui: &mut egui::Ui, editor: &Editor) {
 /// which cannot widen the panel. A multi-widget `ui.horizontal` added here can,
 /// and would have to be `horizontal_wrapped` and brought inside that test.
 fn stress_block(ui: &mut egui::Ui, summary: &StressSummary) {
-    if let Some(warning) = &summary.warning {
-        ui.label(
-            egui::RichText::new(warning.as_str())
-                .strong()
-                .color(ui.visuals().warn_fg_color),
-        );
-    }
-    ui.label(egui::RichText::new(summary.headline.as_str()).strong());
-    for case in &summary.cases {
-        ui.monospace(case.as_str());
-    }
+    egui::CollapsingHeader::new(constants::VIEW_EDIT_BLOCK_STRESS)
+        .default_open(true)
+        .show(ui, |ui| {
+            if let Some(warning) = &summary.warning {
+                ui.label(
+                    egui::RichText::new(warning.as_str())
+                        .strong()
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            ui.label(egui::RichText::new(summary.headline.as_str()).strong());
+            for case in &summary.cases {
+                ui.monospace(case.as_str());
+            }
+        });
+}
+
+/// The layer switches, under a header of their own.
+///
+/// The switches are the viewer's own, so the same scene is controlled the same
+/// way in both windows; only the header is the editor's, which is why the wrap
+/// is here at the call site rather than in the shared function - and why that
+/// function is told not to write the heading a second time.
+fn show_block(ui: &mut egui::Ui, scene: &mut Scene) {
+    egui::CollapsingHeader::new(constants::VIEW_LAYER_SWITCHES_LABEL)
+        .default_open(true)
+        .show(ui, |ui| layer_switches(ui, scene, true));
 }
 
 /// The live problem summary.
+///
+/// Closed to begin with: it is a read-out of what the configuration on screen
+/// amounts to - grid, counts, memory - and the panel opens on the objects and
+/// their properties, which is what a session is there to change.
 fn summary(ui: &mut egui::Ui, state: &EditorState) {
-    ui.label(egui::RichText::new("problem").strong());
-    if state.is_stale() {
-        ui.label(egui::RichText::new("refreshing...").weak());
-    }
-    for line in state.summary() {
-        ui.monospace(line);
-    }
+    egui::CollapsingHeader::new(constants::VIEW_EDIT_BLOCK_PROBLEM)
+        .default_open(false)
+        .show(ui, |ui| {
+            if state.is_stale() {
+                ui.label(egui::RichText::new("refreshing...").weak());
+            }
+            for line in state.summary() {
+                ui.monospace(line);
+            }
+        });
 }
 
 /// The control legend, as the panel lists it.
@@ -2712,11 +2770,18 @@ const CONTROLS: [&str; 15] = [
 ];
 
 /// The control legend.
+///
+/// Closed to begin with, like the problem summary: it is a reference to look up
+/// once rather than something a session works in, and it is the longest block
+/// the panel has.
 fn controls(ui: &mut egui::Ui) {
-    ui.label(egui::RichText::new("controls").strong());
-    for line in CONTROLS {
-        ui.monospace(line);
-    }
+    egui::CollapsingHeader::new(constants::VIEW_EDIT_BLOCK_CONTROLS)
+        .default_open(false)
+        .show(ui, |ui| {
+            for line in CONTROLS {
+                ui.monospace(line);
+            }
+        });
 }
 
 /// The floating number boxes over the viewport: what the drag in progress is
@@ -2896,16 +2961,94 @@ mod tests {
         });
     }
 
+    /// Draw every labelled block of the panel once, into the root ui of a fresh
+    /// context, and hand back that context with the scope their headers hang
+    /// under.
+    ///
+    /// egui identifies a collapsing header by the ui it is drawn in combined
+    /// with the header's salt - its label, unless it names one - so the id of a
+    /// header is only knowable to whoever knows that ui. Every block here opens
+    /// its own header as the first thing it does in the ui it is handed, so
+    /// drawing them into a root the test holds gives exactly the ids the panel
+    /// draws with, without reproducing the panel's own nesting of scroll area
+    /// and headers. The object lists are drawn a second time straight into the
+    /// root for that reason: inside the tree they sit in the body its header
+    /// opens, whose id is egui's own to invent.
+    fn draw_blocks(editor: &mut Editor, scene: &mut Scene) -> (egui::Context, egui::Id) {
+        let context = egui::Context::default();
+        let mut scope = egui::Id::NULL;
+        // The stress block is the one that needs a run behind it in the panel;
+        // it is drawn here from a summary of its own, which is what it takes.
+        let stress = StressSummary {
+            warning: None,
+            headline: "safety factor 5.07 (peak 9.2700 MPa vs yield 47 MPa)".to_string(),
+            cases: vec!["tip peak 9.2700 MPa".to_string()],
+        };
+        let _ = context.run_ui(egui::RawInput::default(), |root| {
+            scope = header_scope(root);
+            let containment = editor.containment();
+            {
+                let mut field = Field::new(&mut editor.state, containment);
+                tree(root, &mut field);
+                object_lists(root, &mut field);
+                properties(root, &mut field);
+                sections(root, &mut field);
+            }
+            summary(root, &editor.state);
+            show_block(root, scene);
+            stress_block(root, &stress);
+            controls(root);
+        });
+        (context, scope)
+    }
+
+    /// The id every collapsing header drawn straight into `ui` hangs under.
+    ///
+    /// `CollapsingHeader::show` lays its header and body out inside a vertical
+    /// scope of the ui it was handed, and it is that scope - not the ui itself -
+    /// that the header's id is salted from. egui gives every sibling scope of
+    /// one parent the same stable id, so opening an empty one and asking it is
+    /// egui's own arithmetic rather than a second spelling of it here.
+    fn header_scope(ui: &mut egui::Ui) -> egui::Id {
+        ui.vertical(|ui| ui.id()).inner
+    }
+
+    /// The id of the header salted `salt`, under that scope.
+    ///
+    /// `CollapsingHeader` salts with an `IdSalt` rather than with the text
+    /// itself - `IdSalt::new` of its label, or of whatever `id_salt` it was
+    /// given - and the two hash differently, so the salt is built the same way
+    /// here rather than handed over as a string.
+    fn header_id(scope: egui::Id, salt: &str) -> egui::Id {
+        scope.with(egui::IdSalt::new(salt))
+    }
+
+    /// Whether the header salted `salt`, under the scope `scope` names, is open.
+    ///
+    /// Panics when nothing was drawn at that id, which is the only way to tell
+    /// a closed block from an id that names no block at all: both would
+    /// otherwise read as "not open".
+    fn header_is_open(context: &egui::Context, scope: egui::Id, salt: &str) -> bool {
+        egui::collapsing_header::CollapsingState::load(context, header_id(scope, salt))
+            .unwrap_or_else(|| panic!("no collapsing header was drawn at the id salted {salt:?}"))
+            .is_open()
+    }
+
     /// Lay the whole panel out in a window the size the editor opens at, with
     /// every section of it expanded, and return how far its content spilled
     /// past the width the panel declares.
     ///
     /// `set_everything_is_visible` is egui's own switch for exactly this: it
-    /// opens every collapsing header - `material` and `output` are closed by
-    /// default, and their rows would otherwise never be laid out at all - along
-    /// with every dropdown and every hover text. Those last two float in areas
-    /// of their own and so cannot widen the panel either way; the sections are
-    /// the point.
+    /// opens every collapsing header - the five object lists, `problem`,
+    /// `controls`, `material` and `output` are all closed by default, and their
+    /// rows would otherwise never be laid out at all - along with every dropdown
+    /// and every hover text. Those last two float in areas of their own and so
+    /// cannot widen the panel either way; the blocks are the point.
+    ///
+    /// Every block of the panel is inside a header of its own, so its rows are
+    /// laid out one indent deeper than they were drawn before there was one, and
+    /// a list's rows two: what this measures is each row at the width its own
+    /// depth leaves it.
     ///
     /// Twice, because the first pass is what leaves the scroll area and the
     /// headers the state the second lays out against.
@@ -3158,6 +3301,119 @@ mod tests {
             ));
         }
         shapes
+    }
+
+    /// What a launched session finds open, block by block.
+    ///
+    /// The panel opens on what a session works in - the objects, their
+    /// properties, the layer switches and the safety factor of what was last
+    /// run - and with everything else folded away: the object lists themselves,
+    /// which are the longest thing in the panel, the problem read-out and the
+    /// control legend. The scalar sections keep the defaults they already had,
+    /// which is what pins them here.
+    ///
+    /// Every one of these is one line of code, and every one of them is a
+    /// decision about what the panel looks like when it opens; a test is the
+    /// only thing that notices when one of them is changed by accident.
+    #[test]
+    fn the_panel_opens_on_the_blocks_a_session_works_in() {
+        let (_dir, path) = write_temp("panel_defaults", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        // The whole panel first, as a launched session draws it: the blocks
+        // asked about below are the ones this frame is made of.
+        draw(&mut editor, &mut scene);
+
+        let (context, scope) = draw_blocks(&mut editor, &mut scene);
+        for (salt, open) in [
+            (constants::VIEW_EDIT_BLOCK_OBJECTS, true),
+            (constants::VIEW_EDIT_BLOCK_PROPERTIES, true),
+            (constants::VIEW_LAYER_SWITCHES_LABEL, true),
+            (constants::VIEW_EDIT_BLOCK_STRESS, true),
+            (constants::VIEW_EDIT_BLOCK_PROBLEM, false),
+            (constants::VIEW_EDIT_BLOCK_CONTROLS, false),
+            // The five lists of the tree, all folded away.
+            ("domain", false),
+            ("keepout", false),
+            ("keepin", false),
+            ("supports", false),
+            (constants::VIEW_EDIT_LOAD_CASE_LIST, false),
+            // And the scalar sections, whose own defaults nothing here changed.
+            ("engine", true),
+            ("resolution", true),
+            ("material", false),
+            ("optimization", true),
+            ("output", false),
+        ] {
+            assert_eq!(
+                header_is_open(&context, scope, salt),
+                open,
+                "the {salt:?} block opens {}",
+                if open { "closed" } else { "open" }
+            );
+        }
+
+        // The growth section is engine gated, so it is pinned on a
+        // configuration that has one.
+        let (_dir, path) = write_temp("panel_defaults_growth", growth_fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        let (context, scope) = draw_blocks(&mut editor, &mut scene);
+        assert!(header_is_open(&context, scope, "growth"));
+    }
+
+    /// A list the user opened stays open when something is added to it or taken
+    /// out of it.
+    ///
+    /// Its label carries a live count, and egui identifies a collapsing header
+    /// by its label text unless the header names a salt of its own - so without
+    /// the salt, `keepout (2)` and `keepout (3)` are two different headers, and
+    /// the second one has never been opened. A list that shuts itself every time
+    /// an object is added is worse than one that never opens: the state the user
+    /// put it in is thrown away by the very action they opened it to take.
+    #[test]
+    fn an_object_list_stays_open_when_its_count_changes() {
+        let (_dir, path) = write_temp("panel_list_ids", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let context = egui::Context::default();
+        let mut scope = egui::Id::NULL;
+        let lists = ["keepout", constants::VIEW_EDIT_LOAD_CASE_LIST];
+
+        // A first frame, which is what leaves the headers' state behind.
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            scope = header_scope(ui);
+            let mut field = Field::new(&mut editor.state, true);
+            object_lists(ui, &mut field);
+        });
+
+        // Opened the way a click on the header opens them.
+        for salt in lists {
+            assert!(
+                !header_is_open(&context, scope, salt),
+                "{salt} did not start closed"
+            );
+            let mut state =
+                egui::collapsing_header::CollapsingState::load(&context, header_id(scope, salt))
+                    .expect("a header");
+            state.set_open(true);
+            state.store(&context);
+        }
+
+        // What renames both headers: one object more in each list.
+        editor.state.add(NewObject::Keepout(ShapeKind::Sphere));
+        editor.state.add(NewObject::LoadCase);
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let mut field = Field::new(&mut editor.state, true);
+            object_lists(ui, &mut field);
+        });
+
+        for salt in lists {
+            assert!(
+                header_is_open(&context, scope, salt),
+                "the {salt} list shut itself when its count changed: its header is identified by \
+                 a label that carries that count"
+            );
+        }
     }
 
     #[test]

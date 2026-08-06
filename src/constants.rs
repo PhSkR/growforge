@@ -1797,6 +1797,13 @@ pub const VIEW_PREVIEW_MIN_INTERVAL_S: f64 = 0.20;
 /// Width of the egui side panel in points.
 pub const VIEW_PANEL_WIDTH_POINTS: f32 = 260.0;
 
+/// What the block of layer visibility switches is called, in both windows.
+///
+/// Shared because the block is: the run panel writes it as the block's own
+/// heading, and the editor's panel writes it on the collapsing header the block
+/// sits under, where it is the header's persistent id as well as its label.
+pub const VIEW_LAYER_SWITCHES_LABEL: &str = "show";
+
 /// How often the viewer wakes to service its window message queue after the
 /// window has been torn down but the run behind it is still going.
 ///
@@ -1821,6 +1828,37 @@ pub const VIEW_DETACHED_POLL_INTERVAL_S: f64 = 0.25;
 /// panel puts three numeric fields on a row where the run panel puts one line
 /// of text. The 3D viewport is sized against whichever of the two is showing.
 pub const VIEW_EDIT_PANEL_WIDTH_POINTS: f32 = 360.0;
+
+/// Label of the object tree's block.
+///
+/// Every labelled block of the panel sits under a collapsing header, so a
+/// session can put away whatever it is not working on. egui derives a header's
+/// persistent id from its label text, which makes each of these labels the name
+/// of a piece of session state as well as what the block says on screen - and
+/// is why the lists whose own labels carry a live count are given one of these
+/// as an explicit id salt instead.
+pub const VIEW_EDIT_BLOCK_OBJECTS: &str = "objects";
+
+/// Label of the block holding the properties of the selection.
+pub const VIEW_EDIT_BLOCK_PROPERTIES: &str = "properties";
+
+/// Label of the block holding the safety factor of the run on screen.
+pub const VIEW_EDIT_BLOCK_STRESS: &str = "stress";
+
+/// Label of the block holding the live problem summary.
+pub const VIEW_EDIT_BLOCK_PROBLEM: &str = "problem";
+
+/// Label of the block holding the control legend.
+pub const VIEW_EDIT_BLOCK_CONTROLS: &str = "controls";
+
+/// Name of the load case list in the object tree.
+///
+/// Its header reads `load cases (n)`, so the name is also given to the header
+/// as an explicit id salt: a label that carries a count is a label that changes,
+/// and a header identified by a changing label loses whatever the user did to
+/// it every time an object is added or deleted. The four region lists are
+/// salted the same way with their own names, which they already hold.
+pub const VIEW_EDIT_LOAD_CASE_LIST: &str = "load cases";
 
 /// Undo steps the editor keeps. Older steps fall off the bottom.
 pub const VIEW_EDIT_UNDO_DEPTH: usize = 100;

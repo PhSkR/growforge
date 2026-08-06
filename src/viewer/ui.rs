@@ -17,11 +17,19 @@ const ABSENT_LAYER_HELP: &str = "nothing has produced this layer yet";
 /// whichever mode the window is in. Layers the editor alone produces are listed
 /// only when `editor` is set; everywhere else they do not exist.
 ///
+/// `editor` decides the block's own heading too: this panel writes it here,
+/// while the editor's panel draws the block under a collapsing header that
+/// carries the same word, and a heading inside that body would say it twice.
+/// The one flag decides both because it is the one question - which of the two
+/// panels is drawing.
+///
 /// Every switch carries the hover text of the layer it draws, which the layer
 /// table holds beside the label. Both windows therefore explain the same
 /// switches the same way.
 pub fn layer_switches(ui: &mut egui::Ui, scene: &mut Scene, editor: bool) {
-    ui.label(egui::RichText::new("show").strong());
+    if !editor {
+        ui.label(egui::RichText::new(constants::VIEW_LAYER_SWITCHES_LABEL).strong());
+    }
     for info in LAYERS
         .iter()
         .filter(|info| editor || info.role != LayerRole::Editor)

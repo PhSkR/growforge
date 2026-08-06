@@ -1,6 +1,6 @@
 [package]
 name = "growforge"
-version = "0.31.1"
+version = "0.32.0"
 edition = "2024"
 description = "Topology optimization and growth heuristics for strong, weight-optimized printable structures"
 

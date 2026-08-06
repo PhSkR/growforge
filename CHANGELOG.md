@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-08-05 - 0.32.0 - Collapsible panel blocks
+
+Asked for by the user: the object lists closed to begin with, and a dropdown on
+every other labelled block of the editor's panel.
+
+- **Every labelled block of the panel is now a collapsing header**: `objects`,
+  `properties`, `show`, `stress`, `problem` and `controls`, beside the six
+  scalar sections that already had one. The first four open, the last two
+  closed. The toolbar, the precision block and the validation block are
+  deliberately not collapsible: warnings may not be hideable.
+- **The five object lists start closed**, which is what the panel opens on: the
+  tree, folded, with the properties of whatever is picked under it.
+- **Each list's header carries an explicit `id_salt`.** Their labels hold a live
+  count, and egui identifies a header by its label text - so without it,
+  `keepout (2)` and `keepout (3)` are two different headers, and a list the user
+  had opened would shut itself the moment an object was added to it.
+- The `delete` button moved from the `properties` heading to the first row
+  inside that block. Same button, same undo step, same `Delete` key beside it.
+- The shared layer switches take their heading from the panel that draws them:
+  the run panel writes it as before, the editor's header carries it instead of
+  saying the same word twice. The run panel is otherwise untouched.
+- Tests: every block's opening state, list by list and section by section, and a
+  list that stays open across the add that renames it - which fails without the
+  salt. The width guard re-measures every row at its new indent depth.
+- Version 0.32.0.
+
 ## 2026-08-05 - 0.31.1 - The stray line down the editor panel
 
 Reported by the user: a full height vertical line drawn across the side panel,
