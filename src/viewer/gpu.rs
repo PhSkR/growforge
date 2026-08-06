@@ -30,6 +30,98 @@ struct LayerBuffer {
     vertices: u32,
 }
 
+/// What acquiring the next surface frame reported.
+///
+/// The renderer's own reading of `wgpu::CurrentSurfaceTexture`, so the recovery
+/// policy below is decided - and tested - without a device to acquire from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceStatus {
+    /// A frame came back and can be drawn into.
+    Acquired,
+    /// No frame this time, and nothing is wrong with the surface: the
+    /// compositor was busy, or the window is not visible.
+    Skipped,
+    /// The surface no longer matches the window and has to be reconfigured.
+    Stale,
+    /// The device refused to hand a frame over at all.
+    Rejected,
+}
+
+impl SurfaceStatus {
+    /// Read what wgpu answered.
+    fn of(acquired: &wgpu::CurrentSurfaceTexture) -> SurfaceStatus {
+        match acquired {
+            wgpu::CurrentSurfaceTexture::Success(_)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(_) => SurfaceStatus::Acquired,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                SurfaceStatus::Skipped
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                SurfaceStatus::Stale
+            }
+            wgpu::CurrentSurfaceTexture::Validation => SurfaceStatus::Rejected,
+        }
+    }
+}
+
+/// What the renderer does about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceAction {
+    /// Draw into the frame that came back.
+    Draw,
+    /// Skip this frame and leave the surface alone.
+    Skip,
+    /// Reconfigure the surface and skip this frame.
+    Reconfigure,
+    /// The same, after a rejection: `streak` counts the consecutive rejected
+    /// frames including this one, so the first of a streak can say so once.
+    Retry { streak: u32 },
+    /// Give up on the device: `streak` frames in a row were rejected and it has
+    /// not come back.
+    GiveUp { streak: u32 },
+}
+
+/// How the drawing surface is behaving, frame by frame.
+///
+/// A rejected frame used to end the viewer where it stood. It is instead a
+/// device that may be resetting: the surface is reconfigured and the frame
+/// skipped, exactly as a stale surface is, and only a rejection that goes on
+/// for [`constants::VIEW_SURFACE_REJECTION_LIMIT`] consecutive frames is a
+/// device that is not coming back. A frame that *is* acquired is what clears
+/// the streak - the recovery is proven by drawing, not by any other answer the
+/// surface gives - so a skipped or stale frame neither counts towards the limit
+/// nor forgives what came before it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SurfaceHealth {
+    rejections: u32,
+}
+
+impl SurfaceHealth {
+    /// Record what one acquisition reported and say what to do about it.
+    pub fn observe(&mut self, status: SurfaceStatus) -> SurfaceAction {
+        match status {
+            SurfaceStatus::Acquired => {
+                self.rejections = 0;
+                SurfaceAction::Draw
+            }
+            SurfaceStatus::Skipped => SurfaceAction::Skip,
+            SurfaceStatus::Stale => SurfaceAction::Reconfigure,
+            SurfaceStatus::Rejected => {
+                self.rejections = self.rejections.saturating_add(1);
+                if self.rejections >= constants::VIEW_SURFACE_REJECTION_LIMIT {
+                    SurfaceAction::GiveUp {
+                        streak: self.rejections,
+                    }
+                } else {
+                    SurfaceAction::Retry {
+                        streak: self.rejections,
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Everything egui needs painted in a frame.
 pub struct EguiFrame {
     /// Tessellated egui primitives.
@@ -53,6 +145,9 @@ pub struct Gpu {
     bind_group: wgpu::BindGroup,
     buffers: Vec<Option<LayerBuffer>>,
     egui_renderer: egui_wgpu::Renderer,
+    /// Consecutive rejected frames, which is what tells a device resetting
+    /// apart from one that is gone.
+    health: SurfaceHealth,
     /// Human readable description of the adapter the viewer picked.
     pub adapter_description: String,
 }
@@ -182,6 +277,7 @@ impl Gpu {
             bind_group,
             buffers: (0..LAYERS.len()).map(|_| None).collect(),
             egui_renderer,
+            health: SurfaceHealth::default(),
             adapter_description,
         })
     }
@@ -247,20 +343,43 @@ impl Gpu {
             }),
         );
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+        let acquired = self.surface.get_current_texture();
+        match self.health.observe(SurfaceStatus::of(&acquired)) {
+            SurfaceAction::Draw => {}
+            SurfaceAction::Skip => return Ok(()),
+            SurfaceAction::Reconfigure => {
                 let (width, height) = self.size();
                 self.resize(width, height);
                 return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(anyhow!("the GPU rejected the next frame of the viewer"));
+            SurfaceAction::Retry { streak } => {
+                // Once per streak, on the frame that opened it. A device that
+                // is resetting rejects frames as fast as they are asked for,
+                // and a line each would be a wall of them for what is usually
+                // over before it can be read.
+                if streak == 1 {
+                    println!(
+                        "viewer surface the GPU rejected a frame; reconfiguring and retrying (the \
+                         device may be resetting)"
+                    );
+                }
+                let (width, height) = self.size();
+                self.resize(width, height);
+                return Ok(());
             }
+            SurfaceAction::GiveUp { streak } => {
+                return Err(anyhow!(
+                    "the GPU rejected {streak} consecutive frames of the viewer; the device was \
+                     likely reset and did not come back"
+                ));
+            }
+        }
+        let (wgpu::CurrentSurfaceTexture::Success(frame)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(frame)) = acquired
+        else {
+            // Those two are the whole of `Draw`; this arm is the compiler's
+            // share of the destructuring, not a case.
+            return Ok(());
         };
         let view = frame
             .texture
@@ -477,4 +596,79 @@ fn build_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The streak policy alone, which is the whole of the decision: what wgpu
+    /// answered cannot be produced without a window and a device, so
+    /// [`SurfaceStatus::of`] is the one line that stays a reading of the four
+    /// cases rather than a decision about them.
+    ///
+    /// Rejections short of the limit are retried, and each says how far the
+    /// streak has got so the first of one can be the only one reported.
+    #[test]
+    fn a_rejected_frame_is_retried_until_the_limit_and_then_given_up_on() {
+        let mut health = SurfaceHealth::default();
+        for streak in 1..constants::VIEW_SURFACE_REJECTION_LIMIT {
+            assert_eq!(
+                health.observe(SurfaceStatus::Rejected),
+                SurfaceAction::Retry { streak },
+                "rejection {streak} of {} is still a retry",
+                constants::VIEW_SURFACE_REJECTION_LIMIT
+            );
+        }
+        let streak = constants::VIEW_SURFACE_REJECTION_LIMIT;
+        assert_eq!(
+            health.observe(SurfaceStatus::Rejected),
+            SurfaceAction::GiveUp { streak },
+            "the limit is what the viewer gives up at"
+        );
+    }
+
+    /// A frame that was acquired is the recovery, and it is the only thing that
+    /// counts as one: the streak starts again from nothing after it.
+    #[test]
+    fn an_acquired_frame_clears_the_streak() {
+        let mut health = SurfaceHealth::default();
+        for _ in 0..constants::VIEW_SURFACE_REJECTION_LIMIT - 1 {
+            health.observe(SurfaceStatus::Rejected);
+        }
+        assert_eq!(health.observe(SurfaceStatus::Acquired), SurfaceAction::Draw);
+        assert_eq!(
+            health.observe(SurfaceStatus::Rejected),
+            SurfaceAction::Retry { streak: 1 },
+            "a drawn frame leaves nothing behind to give up on"
+        );
+    }
+
+    /// A busy compositor and a resized window are not a device in trouble.
+    /// Neither counts towards the limit - a session that skipped a thousand
+    /// frames behind another window may not die of it - and neither forgives a
+    /// rejection either, because neither proves the device drew anything.
+    #[test]
+    fn a_skipped_or_stale_frame_is_not_a_rejection_and_does_not_clear_one() {
+        let mut health = SurfaceHealth::default();
+        for _ in 0..constants::VIEW_SURFACE_REJECTION_LIMIT * 2 {
+            assert_eq!(health.observe(SurfaceStatus::Skipped), SurfaceAction::Skip);
+            assert_eq!(
+                health.observe(SurfaceStatus::Stale),
+                SurfaceAction::Reconfigure
+            );
+        }
+
+        assert_eq!(
+            health.observe(SurfaceStatus::Rejected),
+            SurfaceAction::Retry { streak: 1 }
+        );
+        health.observe(SurfaceStatus::Skipped);
+        health.observe(SurfaceStatus::Stale);
+        assert_eq!(
+            health.observe(SurfaceStatus::Rejected),
+            SurfaceAction::Retry { streak: 2 },
+            "the streak carries across the answers that are not about the device"
+        );
+    }
 }

@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-08-06 - 0.34.0 - A rejected frame is not the end of the session
+
+From an incident: 40 000 GPU compute iterations on the physical GPU the window
+was drawing on almost certainly tripped a driver reset, the next frame came back
+as a validation error, and the viewer died on the spot - `error: the GPU rejected
+the next frame of the viewer`, exit 1. A reset that lasts a moment took the
+window with it, and anything unsaved in an editing session would have gone too.
+
+- **A rejected frame is retried rather than fatal.** `Gpu::render` reads what the
+  surface answered as a `SurfaceStatus` and asks `SurfaceHealth` what to do: a
+  rejection reconfigures the surface and skips the frame, exactly as a stale one
+  does, and only `VIEW_SURFACE_REJECTION_LIMIT` (30) consecutive rejections give
+  up - about a fifth of a second at 144 Hz. **An acquired frame is what clears
+  the streak**, so recovery is proven by drawing; a timeout, an occluded window
+  and a stale surface neither count towards the limit nor forgive what came
+  before them. One console line on the first rejection of a streak and none after
+  it, so a reset that passes costs a note rather than a wall of them.
+- **The exit semantics are unchanged.** A device that never comes back still
+  ends the window with an error and the process with a failure, now saying what
+  happened: *"the GPU rejected 30 consecutive frames of the viewer; the device
+  was likely reset and did not come back"*.
+- **An editing session's unsaved document survives the window.** Any fatal frame
+  error now goes through `ViewerApp::fail`, which writes a dirty session's
+  configuration to `<name>.recovered.toml` beside the file it came from before
+  the teardown, through the same format preserving projection a save uses - the
+  recovered file is byte for byte what `Ctrl+S` would have written. **The file
+  being edited is never touched**, and the session is not marked saved: a rescue
+  is not a save. `view` and `run --view` windows have no document and do
+  nothing. Both outcomes are reported on the console under the `editor rescue`
+  prefix, the write that failed included.
+- Tests: the streak policy below the limit, at it, cleared by a drawn frame, and
+  unmoved by skipped and stale frames; the rescue writing what the save it stood
+  in for produces, leaving the original bytes and the unsaved marker alone,
+  replacing a previous recovery, naming the file in a write that could not be
+  made, and writing nothing when the projection itself fails; the fatal path
+  rescuing a dirty session, keeping its error, and writing nothing for a clean
+  session or a window with no document.
+- Version 0.34.0.
+
 ## 2026-08-06 - 0.33.0 - The nine decades under the load path
 
 The tension case again, and the same class of incident as 0.28.0 one layer down.

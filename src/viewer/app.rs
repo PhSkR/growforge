@@ -6,6 +6,7 @@
 //! isosurface extraction on a mesher thread. This module only uploads finished
 //! vertex buffers and draws.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -249,6 +250,62 @@ impl<'a> ViewerApp<'a> {
                     0.0
                 }
             );
+        }
+    }
+
+    /// End the session on an error a frame could not survive, having first put
+    /// anything unsaved somewhere it can be got back from.
+    ///
+    /// Drawing stops, but the loop is not abandoned: the run behind the window
+    /// still needs its message queue serviced, which is what
+    /// [`ViewerApp::begin_teardown`] leaves it doing. The error is kept and
+    /// returned by [`ViewerApp::run`], so a viewer that could not go on is still
+    /// a failure at the command line - the recovery below is what is saved from
+    /// it, not a reason to call it a success.
+    fn fail(&mut self, error: anyhow::Error) {
+        self.rescue_unsaved_edits();
+        self.error = Some(error);
+        self.begin_teardown();
+    }
+
+    /// Write an editing session's unsaved document beside the file it came
+    /// from, and say where it went. `None` when there was nothing to write, or
+    /// when writing it failed.
+    ///
+    /// This is the last moment at which the document exists at all: the window
+    /// is going, and everything typed since the last save would go with it. It
+    /// is written *beside* the file rather than into it, because a viewer that
+    /// died is not the user asking for a save - the file on disk stays the
+    /// source of truth it is everywhere else in the editor, and what is recovered
+    /// is looked at before it is kept. A `view` or `run --view` window has no
+    /// document and nothing to do here.
+    ///
+    /// Reported on the console: the status line that would have carried it
+    /// belongs to the window that has just died. A write that fails says so and
+    /// changes nothing else - the fatal error is what the process ends on
+    /// either way.
+    fn rescue_unsaved_edits(&self) -> Option<PathBuf> {
+        let editor = self.editor.as_ref()?;
+        if !editor.state.is_dirty() {
+            return None;
+        }
+        match editor.state.write_recovery() {
+            Ok(path) => {
+                println!(
+                    "editor rescue the viewer stopped with unsaved changes; they are in {}\n\
+                     editor rescue {} itself is unchanged",
+                    path.display(),
+                    editor.state.path().display()
+                );
+                Some(path)
+            }
+            Err(error) => {
+                eprintln!(
+                    "editor rescue the viewer stopped with unsaved changes and they could not be \
+                     written: {error:#}"
+                );
+                None
+            }
         }
     }
 
@@ -691,10 +748,7 @@ impl<'a> ViewerApp<'a> {
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.redraw() {
-                    // Stop drawing, but do not abandon the loop: the run behind
-                    // the window still needs its message queue serviced.
-                    self.error = Some(error);
-                    self.begin_teardown();
+                    self.fail(error);
                 }
             }
             _ => {}
@@ -2901,6 +2955,72 @@ mod tests {
         assert!(app.torn_down && app.window.is_none());
         // And the file was never written.
         assert_eq!(std::fs::read_to_string(&path).expect("read"), fixture());
+    }
+
+    /// The fatal path an unusable frame takes: an editing session's unsaved
+    /// document is written beside its file before the window goes, and the error
+    /// the process ends on is kept whatever the rescue did.
+    #[test]
+    fn a_fatal_frame_rescues_the_unsaved_document_before_the_window_goes() {
+        use crate::viewer::editor::Editor;
+
+        let (_dir, path) = write_temp("app_rescue", fixture());
+        let before = std::fs::read(&path).expect("read");
+        let mut editor = Editor::open(&path).expect("open");
+        editor
+            .state
+            .edit(|config| config.optimization.mass_fraction = 0.42);
+        let recovered = editor.state.recovery_path();
+        let mut app = ViewerApp::new("test".to_string(), scene_with_a_box(), None).editing(editor);
+
+        app.fail(anyhow::anyhow!("the GPU rejected 30 consecutive frames"));
+        assert!(app.torn_down && app.window.is_none());
+        assert!(
+            recovered.is_file(),
+            "the unsaved document went nowhere: {}",
+            recovered.display()
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            before,
+            "the file being edited is not what a dying window writes to"
+        );
+        assert!(
+            app.editor.as_ref().expect("an editor").state.is_dirty(),
+            "a rescue is not a save"
+        );
+
+        // The window is still a failure: what was rescued is not a reason to
+        // report success.
+        let error = app.error.take().expect("the error is kept");
+        assert!(error.to_string().contains("rejected"), "{error:#}");
+    }
+
+    /// Nothing to lose, nothing written. The clean session and the two windows
+    /// that have no document at all take the same fatal path and leave no file
+    /// behind them.
+    #[test]
+    fn a_fatal_frame_with_nothing_unsaved_writes_nothing() {
+        use crate::viewer::editor::Editor;
+
+        let (_dir, path) = write_temp("app_rescue_clean", fixture());
+        let editor = Editor::open(&path).expect("open");
+        let recovered = editor.state.recovery_path();
+        let mut app = ViewerApp::new("test".to_string(), scene_with_a_box(), None).editing(editor);
+        assert!(app.rescue_unsaved_edits().is_none());
+        app.fail(anyhow::anyhow!("a frame that could not be drawn"));
+        assert!(
+            !recovered.exists(),
+            "a session with nothing unsaved has nothing to recover"
+        );
+        assert!(app.torn_down && app.error.is_some());
+
+        // `view` and `run --view` have no document: the rescue is a no-op rather
+        // than a path that has to guess where one would go.
+        let mut app = ViewerApp::new("test".to_string(), scene_with_a_box(), None);
+        assert!(app.rescue_unsaved_edits().is_none());
+        app.fail(anyhow::anyhow!("a frame that could not be drawn"));
+        assert!(app.torn_down && app.error.is_some());
     }
 
     #[test]

@@ -1630,6 +1630,19 @@ pub const VIEW_AUTOCLOSE_ENV: &str = "GROWFORGE_VIEW_AUTOCLOSE_S";
 /// Background clear colour, RGBA in the surface's own encoding.
 pub const VIEW_BACKGROUND_COLOR: [f64; 4] = [0.07, 0.08, 0.10, 1.0];
 
+/// Consecutive frames the drawing surface may reject before the viewer gives up
+/// on its device.
+///
+/// A rejected frame is what a driver reset - a Windows TDR, which a long compute
+/// job on the same physical GPU can trip - looks like from the window's side:
+/// the device the frames come from is gone for a moment. Reconfiguring the
+/// surface is the renderer's only recovery, and a surface whose device comes
+/// back does so within a few frames, so this is the grace a reset needs rather
+/// than a limit on anything healthy. Thirty frames is about a fifth of a second
+/// at 144 Hz: generous for a reset, short enough that a device which never comes
+/// back is reported instead of leaving a dead session drawing nothing.
+pub const VIEW_SURFACE_REJECTION_LIMIT: u32 = 30;
+
 // ---------------------------------------------------------------------------
 // Viewer: camera
 // ---------------------------------------------------------------------------
@@ -1988,6 +2001,15 @@ pub const VIEW_EDIT_FILE_EXTENSION: &str = "toml";
 
 /// What the file dialogs call that kind of file in their filter dropdown.
 pub const VIEW_EDIT_FILE_FILTER: &str = "growforge configuration";
+
+/// Extension of the copy an editing session writes beside its file when the
+/// viewer dies with unsaved changes in it.
+///
+/// A second extension rather than a suffix on the stem, so `rod_bracket.toml`
+/// is recovered as `rod_bracket.recovered.toml`: a name that says what it is,
+/// still a `.toml` the editor and `growforge run` open, and never the name of
+/// the file the session was editing.
+pub const VIEW_EDIT_RECOVERY_EXTENSION: &str = "recovered.toml";
 
 /// Title of the dialog the "open" button raises.
 pub const VIEW_EDIT_OPEN_DIALOG_TITLE: &str = "open a growforge configuration";

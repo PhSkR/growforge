@@ -1192,6 +1192,38 @@ impl EditorState {
         Ok(())
     }
 
+    /// Where an emergency save puts the document: beside the file being edited,
+    /// under its own name and [`constants::VIEW_EDIT_RECOVERY_EXTENSION`].
+    pub fn recovery_path(&self) -> PathBuf {
+        self.path
+            .with_extension(constants::VIEW_EDIT_RECOVERY_EXTENSION)
+    }
+
+    /// Write the configuration as it stands to [`EditorState::recovery_path`],
+    /// replacing whatever was there, and answer where it went.
+    ///
+    /// The emergency exit, taken when the window is dying with unsaved changes
+    /// in it - see the viewer's fatal path. It produces exactly what a save
+    /// would have written, through the same format preserving projection, and
+    /// it is the one thing about it that matters: what comes back is the
+    /// session's own file, comments and all, ready to be renamed over the
+    /// original by someone who has read it.
+    ///
+    /// **Nothing here touches the session.** The projection runs on a copy of
+    /// the document, the file being edited is not written to, and what "unsaved"
+    /// is measured against is left where it was: a rescue is not a save, and a
+    /// session that survived one must still know it has changes to lose. A
+    /// projection that cannot write a value fails here, before any file is
+    /// touched, exactly as a save does.
+    pub fn write_recovery(&self) -> Result<PathBuf> {
+        let mut document = self.document.clone();
+        document.sync(&self.config)?;
+        let path = self.recovery_path();
+        std::fs::write(&path, document.render())
+            .with_context(|| format!("writing recovered config file {}", path.display()))?;
+        Ok(path)
+    }
+
     /// The lines of the live problem summary, or the reason there is none.
     pub fn summary(&self) -> Vec<String> {
         let Some(problem) = &self.problem else {
@@ -1688,6 +1720,124 @@ mod tests {
             std::fs::read_to_string(&path).expect("read"),
             text,
             "a failed save may not touch the file"
+        );
+    }
+
+    /// The emergency save the viewer's fatal path takes: the same document a
+    /// save would have written, beside the file rather than into it, and a
+    /// session left believing exactly what it believed before.
+    #[test]
+    fn an_emergency_save_writes_what_a_save_would_have_written_and_touches_nothing_else() {
+        let (_dir, path) = write_temp("rescue", fixture());
+        let before = std::fs::read(&path).expect("read");
+        let mut state = EditorState::open(&path).expect("open");
+        state.edit(|config| config.optimization.mass_fraction = 0.44);
+        state.edit(|config| config.optimization.min_feature_mm = 20.0);
+
+        let recovered = state.write_recovery().expect("the rescue writes");
+        assert_eq!(
+            recovered,
+            path.with_extension(constants::VIEW_EDIT_RECOVERY_EXTENSION)
+        );
+        assert!(
+            recovered.ends_with("config.recovered.toml"),
+            "an unmistakable name of its own: {}",
+            recovered.display()
+        );
+        assert_eq!(
+            recovered.parent(),
+            path.parent(),
+            "the copy belongs beside the file it came from"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            before,
+            "a rescue may never write to the file being edited"
+        );
+        assert!(
+            state.is_dirty(),
+            "a rescue is not a save: the changes are still unsaved"
+        );
+
+        // And what it holds is what the save it stood in for produces, byte for
+        // byte - the format preserving projection, not a re-serialization.
+        let rescued = std::fs::read(&recovered).expect("read");
+        state.save().expect("save");
+        assert_eq!(std::fs::read(&path).expect("read"), rescued);
+        assert!(
+            Config::parse(&String::from_utf8(rescued).expect("utf8")).is_ok(),
+            "what is recovered has to be a configuration that opens"
+        );
+    }
+
+    /// A second rescue replaces the first: what is beside the file is the last
+    /// thing that was in the window, never an older one kept by accident.
+    #[test]
+    fn an_emergency_save_replaces_the_one_before_it() {
+        let (_dir, path) = write_temp("rescue_again", fixture());
+        let mut state = EditorState::open(&path).expect("open");
+        let recovered = state.recovery_path();
+        std::fs::write(&recovered, "# whatever was here before\n").expect("write");
+
+        state.edit(|config| config.optimization.mass_fraction = 0.44);
+        assert_eq!(
+            state.write_recovery().expect("the rescue writes"),
+            recovered
+        );
+        let text = std::fs::read_to_string(&recovered).expect("read");
+        assert!(
+            !text.contains("whatever was here before"),
+            "the previous recovery survived: {text}"
+        );
+        assert_eq!(
+            Config::parse(&text)
+                .expect("parse")
+                .optimization
+                .mass_fraction,
+            0.44
+        );
+    }
+
+    /// A rescue that cannot be written says so and leaves everything alone.
+    /// Its caller is a window that is already dying, so the one thing it may
+    /// not do is panic on the way.
+    #[test]
+    fn an_emergency_save_that_cannot_be_written_reports_it() {
+        let (_dir, path) = write_temp("rescue_blocked", fixture());
+        let mut state = EditorState::open(&path).expect("open");
+        state.edit(|config| config.optimization.mass_fraction = 0.44);
+
+        // A directory in the way of the file, which is a write that fails on
+        // every platform without needing permissions arranged.
+        let blocked = state.recovery_path();
+        std::fs::create_dir(&blocked).expect("directory");
+        let error = format!("{:#}", state.write_recovery().unwrap_err());
+        assert!(
+            error.contains(&blocked.display().to_string()),
+            "the report has to name the file: {error}"
+        );
+        assert!(state.is_dirty());
+
+        // The other way it can fail is the projection itself, which fails
+        // before any file is touched - see `save`. Nothing is left half
+        // written in its name either.
+        std::fs::remove_dir(&blocked).expect("remove");
+        let reserved: Vec<String> = (0..constants::VIEW_EDIT_MAX_BIG_INTEGERS as i64 * 2)
+            .map(|offset| (i64::MAX - offset).to_string())
+            .collect();
+        let text = format!(
+            "# reserved: {}\n{}\n[growth]\nseed = 1\n",
+            reserved.join(" "),
+            fixture()
+        );
+        let (_dir, path) = write_temp("rescue_no_sentinel", &text);
+        let mut state = EditorState::open(&path).expect("open");
+        state.edit(|config| config.growth.as_mut().expect("growth").seed = Some(u64::MAX));
+        let error = state.write_recovery().unwrap_err().to_string();
+        assert!(error.contains("seed"), "unexpected error: {error}");
+        assert!(
+            !state.recovery_path().exists(),
+            "a projection that failed may not leave a file behind"
         );
     }
 

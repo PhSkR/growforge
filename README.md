@@ -2012,6 +2012,25 @@ message telling you to rebuild. If the machine has no usable GPU adapter, both
 fail immediately, before any optimization work, with a message telling you to run
 without `--view`.
 
+**A frame the GPU rejects is retried, not fatal.** A driver reset - a Windows
+TDR, which a long compute job on the same physical GPU can trip - shows up at the
+window as the surface refusing to hand over the next frame. The renderer
+reconfigures the surface and skips that frame, exactly as it does for a surface
+that has gone stale, and prints one line the first time it happens:
+
+```
+viewer surface the GPU rejected a frame; reconfiguring and retrying (the device may be resetting)
+```
+
+Nothing more is printed while it lasts. A frame that is actually drawn clears the
+streak; frames skipped because the compositor was busy or the window is not
+visible are not rejections and count towards nothing. Only **30 consecutive
+rejected frames** - about a fifth of a second at 144 Hz - is a device that is not
+coming back, and then the window ends with `the GPU rejected 30 consecutive
+frames of the viewer; the device was likely reset and did not come back` and the
+process exits failure. A `growforge edit` session with unsaved changes writes
+them out first: see [Saving](#saving).
+
 The `gpu` feature is independent of `viewer`: a headless build can still solve on
 the GPU, and a viewer build can still be told `backend = "cpu"`. They share the
 wgpu dependency but not a device - the compute solver opens its own, so
@@ -2555,6 +2574,25 @@ the window with any asks first: **save**, **discard** or **cancel**. Nothing is
 ever silently written or silently thrown away. "Unsaved" is measured against
 what the file holds rather than latched by the first edit, so undoing your way
 back to the saved state clears the marker and closes without a question.
+
+**If the window dies with unsaved changes in it, they are written out beside the
+file.** A viewer error nothing can be drawn through - a GPU device that never
+came back, above all - puts the configuration as it stands in
+`<name>.recovered.toml`, in the directory the file being edited lives in, and
+says so on the console:
+
+```
+editor rescue the viewer stopped with unsaved changes; they are in parts/bracket.recovered.toml
+editor rescue parts/bracket.toml itself is unchanged
+```
+
+It is the same format preserving round trip a save is, so the recovered file is
+byte for byte what `Ctrl+S` would have written and is a configuration `edit` and
+`run` open as they are: read it, and rename it over the original if you want it.
+**The file you were editing is never written to by this path**, an earlier
+recovered file is replaced rather than added to, and a write that could not be
+made says so instead of being lost. The window still ends in failure - a rescue
+is not a recovery of the session, only of the document.
 
 ### Opening and starting files
 
