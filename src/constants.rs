@@ -248,9 +248,41 @@ pub const SIMP_PENALTY: f64 = 3.0;
 /// of the method is inverted; that is rejected rather than run.
 pub const SIMP_PENALTY_MIN: f64 = 1.0;
 
-/// Void stiffness floor as a fraction of the solid modulus. Keeps the global
-/// stiffness matrix positive definite where density has collapsed to zero.
+/// Stiffness floor of a design cell as a fraction of the solid modulus, used
+/// when `[optimization] stiffness_floor` says nothing.
+///
+/// It is the `Emin` of `E(x) = Emin + x^p (E0 - Emin)`: what a cell the
+/// optimizer has emptied still carries, and what keeps the global stiffness
+/// matrix positive definite where density has collapsed to zero. Nine decades
+/// below the solid modulus is the classical value and the one every recorded
+/// trajectory and every shipped example was written against. Forced void cells
+/// are not interpolated at all and carry a literal zero - their nodes are
+/// pinned out of the system entirely - so this is a design cell's floor and
+/// only a design cell's.
 pub const SIMP_EMIN_FRACTION: f64 = 1e-9;
+
+/// Lowest `[optimization] stiffness_floor` a configuration may ask for.
+///
+/// Three decades below the default. The stiffness contrast across the grid is
+/// what the conjugate gradient's iteration count grows with, and at 1e-12 the
+/// assembly already spans twelve decades against the 2.2e-16 of relative
+/// precision an f64 sum carries: the system is numerically singular rather than
+/// merely stiff, and a solve asked to resolve it spends its budget on rounding
+/// error. Nothing is bought below here that a lower floor does not cost twice.
+pub const STIFFNESS_FLOOR_MIN: f64 = 1e-12;
+
+/// Highest `[optimization] stiffness_floor` a configuration may ask for.
+///
+/// Six decades above the default, and the point where the floor stops being
+/// bookkeeping and starts being structure. The floor is parasitic stiffness -
+/// modulus the design never bought, holding load the optimizer should have had
+/// to route through material - and 1e-3 of the solid modulus is exactly what a
+/// cell at density 0.1 carries at the default penalty, which is the weakest
+/// path the crate already calls solvable rather than near-singular (see
+/// [`STRESS_LOAD_PATH_DENSITY`]). Above it the void genuinely carries the part:
+/// the compliance stops being a property of the design, and the optimizer is
+/// being paid to leave holes.
+pub const STIFFNESS_FLOOR_MAX: f64 = 1e-3;
 
 // ---------------------------------------------------------------------------
 // Density filter
@@ -1256,8 +1288,9 @@ pub const STRESS_CG_TOLERANCE: f64 = 1e-6;
 /// part" but "is there any stiffness here at all". A path through cells at 0.1
 /// carries `0.1^p = 1e-3` of the solid modulus at the default penalty and solves
 /// perfectly well; a path that exists only through cells at the SIMP floor carries
-/// [`SIMP_EMIN_FRACTION`], a factor of 1e9 down, and is what turns the system
-/// near-singular. Only the second is reported.
+/// `[optimization] stiffness_floor`, a factor of 1e9 down at its
+/// [`SIMP_EMIN_FRACTION`] default, and is what turns the system near-singular.
+/// Only the second is reported.
 pub const STRESS_LOAD_PATH_DENSITY: f64 = 0.05;
 
 // ---------------------------------------------------------------------------
@@ -2041,14 +2074,17 @@ pub const VIEW_EDIT_DRAG_SPEED_MM: f64 = 0.05;
 /// Fraction of a value a dimensionless numeric field moves per pixel of drag.
 pub const VIEW_EDIT_DRAG_SPEED_FRACTION: f64 = 0.002;
 
-/// Fraction of *itself* the solver tolerance field moves per pixel of drag.
+/// Fraction of *itself* a field written in exponent notation moves per pixel of
+/// drag.
 ///
-/// The one field whose useful range spans decades ([`CG_TOLERANCE_MIN`] to
-/// [`CG_TOLERANCE_MAX`]) rather than a factor of a few, so its drag is
-/// proportional and the pixels buy decades: at a fiftieth of the value per
-/// pixel a decade is about 115 points of travel and the whole range about 690,
-/// which is the same order as a length field crossing a part.
-pub const VIEW_EDIT_TOLERANCE_DRAG_FRACTION: f64 = 0.02;
+/// The fields whose useful range spans decades rather than a factor of a few -
+/// `[solver] tolerance` ([`CG_TOLERANCE_MIN`] to [`CG_TOLERANCE_MAX`]) and
+/// `[optimization] stiffness_floor` ([`STIFFNESS_FLOOR_MIN`] to
+/// [`STIFFNESS_FLOOR_MAX`]) - so the drag is proportional and the pixels buy
+/// decades: at a fiftieth of the value per pixel a decade is about 115 points
+/// of travel and a range of six about 690, which is the same order as a length
+/// field crossing a part.
+pub const VIEW_EDIT_SCIENTIFIC_DRAG_FRACTION: f64 = 0.02;
 
 /// Degrees a numeric rotation field moves per pixel of drag. Coarser than the
 /// length fields: a degree is a much smaller change to a part than a

@@ -1320,7 +1320,8 @@ is the *first* place a backend is opened at all.
 One failure mode is caught before the solve rather than by it. A load whose
 region reaches no support **through material** drives a system whose only path
 from the loaded nodes to the constrained ones runs through cells at the SIMP
-stiffness floor - a factor of 1e9 down - and no conjugate gradient resolves that;
+stiffness floor - a factor of 1e9 down at its default - and no conjugate gradient
+resolves that;
 it finds out by spending its whole 50 000 iteration budget and then saying so.
 The analysis already flood fills the field for the enclosed-cavity and
 solid-body reports, so the same fill answers the question first, and the report
@@ -1620,11 +1621,30 @@ says what the run will really do. A run at the default says nothing about it.
 stay compile-time constants in both places: a cap is the guardrail that ends a
 solve which has stopped converging, not a knob to be turned.
 
+**And a target you cannot reach is not always the thing to move.** A solve whose
+residual is still falling when the cap ends it - two and three decades short,
+rather than the factor of 1.5 above - is not being asked for too much precision;
+it is being handed a system too ill-conditioned to give it. What that costs is
+set by the *stiffness contrast* across the load path, and the contrast is
+`[optimization] stiffness_floor`: 1e-9 of the solid modulus by default, which is
+nine decades for the conjugate gradient to cross. The measured case is a
+one-sided anchor over a 204 mm span at 1.2 M degrees of freedom, which exhausted
+40 000 device iterations at 3.5e-6 against a target of 3e-8 and then 10 000 CPU
+ones at 4.3e-6. Raising the floor buys conditioning back for parasitic void
+stiffness the design never asked for, and the trade is cheap while the floor
+stays far below what the thinnest real member carries: at 1e-6 an emptied cell
+is a thousandth of the stiffness of one at density 0.1, and nothing the part
+does is measurably different. At the 1e-3 the key stops at, the void is carrying
+the structure - see the SIMP interpolation in the
+[configuration reference](#configuration-reference).
+
 ### Precision
 
 WGSL has no `f64`, and these are the worst systems to hand single precision: late
-in a run the stiffness contrast across the grid is 1e9 (the SIMP `Emin` floor)
-while the CPU backend promises a relative residual of 1e-8. An f32 conjugate
+in a run the stiffness contrast across the grid is 1e9 (the SIMP `Emin` floor at
+its default `[optimization] stiffness_floor` - lower configured floors widen it
+further, up to 1e12 at the bound) while the CPU backend promises a relative
+residual of 1e-8. An f32 conjugate
 gradient cannot reach that - f32 carries about 1.2e-7 of relative precision, so
 its residual stops falling a decade or two above the target however long it
 runs.
@@ -2606,6 +2626,14 @@ penalty = 3.0              # optional, default 3.0; simp only. The exponent p of
                            # density harder and drives the field black and white,
                            # at the cost of more local minima. Every recorded
                            # trajectory and every shipped example is at 3
+stiffness_floor = 1e-9     # optional, default 1e-9, 1e-12 .. 1e-3; simp only.
+                           # The Emin of that formula: what an emptied DESIGN
+                           # cell still carries, as a fraction of E0. The
+                           # default is nine decades of stiffness contrast
+                           # across the load path, which is what the solver's
+                           # iteration count grows with - raise it when a run
+                           # exhausts its budget short of the tolerance. Forced
+                           # void cells carry a literal zero either way
 max_iterations = 150       # optional, default 1000; simp only. A budget, not a
                            # target: a run stops on convergence, or on the stall
                            # criterion, long before it here. See "When a run
@@ -3071,7 +3099,8 @@ all, and a `hold_iterations` that outlasts `max_iterations`.
    axis aligned with cubic cells covering the domain bounding box.
 2. **Analyse.** 8-node hexahedral elements with full 2x2x2 Gauss integration,
    `E(x) = Emin + x^p (E0 - Emin)` with `p` from `[optimization] penalty`,
-   3 by default. `K u = f` is solved
+   3 by default, and `Emin` from `[optimization] stiffness_floor` times `E0`,
+   1e-9 of it by default. `K u = f` is solved
    matrix-free by Jacobi preconditioned conjugate gradients; supports are
    applied by projection, and the element loop is parallelised over eight
    parity colours so scatter-adds never race. Displacements warm-start from the
@@ -3155,7 +3184,8 @@ domain or into a keepout, is what `[output] boundaries` now corrects.
 Every default and tolerance a configuration does *not* carry lives in
 `src/constants.rs` with a doc comment - the defaults of the optional keys
 included, so the file is where "what happens if I leave this out" is answered:
-the default SIMP penalty and its lower bound, the void stiffness floor, filter
+the default SIMP penalty and its lower bound, the default design-cell stiffness
+floor and the bounds of the key that carries it, filter
 radius divisor, OC move limit,
 damping and self-weight shift margin, the MMA move limit, asymptote
 initialization, shrink and expand factors and their clamps, the local volume

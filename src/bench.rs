@@ -115,6 +115,7 @@ pub fn run(problem: &Problem) -> Result<BenchReport> {
         &densities,
         problem.material.youngs_modulus_mpa,
         problem.optimization.penalty,
+        problem.optimization.stiffness_floor,
         &mut moduli,
     );
     let ke0 = hex8_stiffness(problem.material.poisson_ratio, grid.h);

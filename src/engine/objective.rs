@@ -79,6 +79,10 @@ pub struct Objective<'a> {
     chain: &'a DensityChain,
     ke0: Ke,
     e0: f64,
+    /// `[optimization] stiffness_floor` times [`Objective::e0`], formed once
+    /// here so the sensitivity below differentiates the same interpolation
+    /// [`crate::engine::simp_moduli`] evaluated: a forward sweep and an adjoint
+    /// taken at two different floors is a gradient nothing reports as wrong.
     emin: f64,
     penalty: f64,
     /// Relative residual the load case solves are taken to: the problem's
@@ -98,7 +102,7 @@ impl<'a> Objective<'a> {
             chain,
             ke0: hex8_stiffness(problem.material.poisson_ratio, problem.grid.h),
             e0,
-            emin: constants::SIMP_EMIN_FRACTION * e0,
+            emin: problem.optimization.stiffness_floor * e0,
             penalty: problem.optimization.penalty,
             cg_tolerance: problem.solver.tolerance,
             has_gravity: problem.has_gravity(),
@@ -147,6 +151,7 @@ impl<'a> Objective<'a> {
             &work.printed,
             self.e0,
             self.penalty,
+            self.problem.optimization.stiffness_floor,
             &mut work.moduli,
         );
 
@@ -451,6 +456,69 @@ vector = [0.0, 0.0, -30.0]
             soft < default && default < hard,
             "compliance has to grow with the penalty at a grey design: {soft}, {default}, {hard}"
         );
+    }
+
+    /// The stiffness floor is a configured number for the same reason and with
+    /// the same failure mode: `Emin` enters the forward interpolation and the
+    /// adjoint's `(E0 - Emin)` factor separately, so a stage left reading the
+    /// constant while the rest moved is a gradient that is quietly wrong rather
+    /// than a run that stops. Only a floor the constant does not hold can see
+    /// it, and 1e-6 is three decades from the default.
+    ///
+    /// The whole range is walked rather than one value: the floor scales the
+    /// term it appears in, and at the upper bound it is a thousandth of the
+    /// solid modulus rather than a billionth.
+    #[test]
+    fn the_gradient_matches_finite_differences_at_a_non_default_stiffness_floor() {
+        for floor in [
+            constants::STIFFNESS_FLOOR_MIN,
+            1e-6,
+            constants::STIFFNESS_FLOOR_MAX,
+        ] {
+            let problem = problem(&config(&format!("stiffness_floor = {floor:e}"), ""));
+            assert_eq!(problem.optimization.stiffness_floor, floor);
+            let error = gradient_error(&problem, &chain_for(&problem));
+            println!("stiffness_floor {floor:e}: relative gradient error {error:.3e}");
+            assert!(
+                error < 1e-7,
+                "relative gradient error {error} at Emin/E0 = {floor:e}"
+            );
+        }
+    }
+
+    /// And the floor really reaches the interpolation the solve is assembled
+    /// from, at both ends of a design cell's range: an emptied cell carries
+    /// exactly the fraction the configuration named, and a full one carries the
+    /// solid modulus whatever the floor is.
+    #[test]
+    fn the_stiffness_floor_reaches_the_moduli_the_solve_is_assembled_from() {
+        let moduli_at = |extra: &str, density: f64| {
+            let problem = problem(&config(extra, ""));
+            let e0 = problem.material.youngs_modulus_mpa;
+            let cells = problem.grid.n_cells();
+            let design = (0..cells)
+                .find(|&e| problem.grid.cells[e] == CellKind::Design)
+                .expect("the fixture has design cells");
+            let mut moduli = vec![0.0; cells];
+            crate::engine::simp_moduli(
+                &problem.grid,
+                &vec![density; cells],
+                e0,
+                problem.optimization.penalty,
+                problem.optimization.stiffness_floor,
+                &mut moduli,
+            );
+            (moduli[design], e0)
+        };
+
+        // The default is what it always was, to the bit.
+        let (empty, e0) = moduli_at("", 0.0);
+        assert_eq!(empty, constants::SIMP_EMIN_FRACTION * e0);
+        // And a floor the file names is the one the assembly gets.
+        let (empty, e0) = moduli_at("stiffness_floor = 1e-6", 0.0);
+        assert_eq!(empty, 1e-6 * e0);
+        let (full, e0) = moduli_at("stiffness_floor = 1e-6", 1.0);
+        assert_eq!(full, e0, "a solid design cell carries E0 at any floor");
     }
 
     #[test]

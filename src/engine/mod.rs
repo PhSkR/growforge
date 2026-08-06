@@ -38,19 +38,22 @@ use crate::report::Reporter;
 /// Void cells carry no stiffness at all and forced solid cells the full modulus;
 /// only design cells are interpolated. The optimizer and the post-run stress
 /// analysis share this so a reported stress can never belong to a different
-/// structure than the one that was optimized - which is also why `penalty` is
-/// passed in rather than read from [`constants`]: it is
-/// `[optimization] penalty`, and a stress report taken at a different exponent
-/// would describe a different structure.
+/// structure than the one that was optimized - which is also why both numbers
+/// the formula holds are passed in rather than read from [`constants`]: they are
+/// `[optimization] penalty` and `[optimization] stiffness_floor`, and a stress
+/// report taken at either of them different would describe a different
+/// structure. `stiffness_floor` is the fraction of `E0` the floor sits at, so
+/// `Emin` is formed here and nowhere else.
 pub fn simp_moduli(
     grid: &Grid,
     densities: &[f64],
     youngs_modulus_mpa: f64,
     penalty: f64,
+    stiffness_floor: f64,
     out: &mut [f64],
 ) {
     let e0 = youngs_modulus_mpa;
-    let emin = constants::SIMP_EMIN_FRACTION * e0;
+    let emin = stiffness_floor * e0;
     let kinds = &grid.cells;
     out.par_iter_mut().enumerate().for_each(|(e, slot)| {
         *slot = match kinds[e] {

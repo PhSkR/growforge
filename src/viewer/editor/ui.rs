@@ -187,29 +187,52 @@ fn integer_row(
     changed
 }
 
-/// A drag value for a relative residual, in scientific notation.
+/// A drag value for a key whose useful range spans decades, in scientific
+/// notation.
 ///
 /// Not [`number_widget`]: that one rounds to [`constants::VIEW_EDIT_DECIMALS`]
-/// places, a floor of 5e-4 that every tolerance a configuration may hold sits
-/// below - it would draw 1e-8 as `0` and set it to `0` on the first pixel of a
-/// drag. This one moves by a fraction of the value itself, so the pixels buy
-/// decades, and carries the range the configuration accepts so a drag or a
-/// typed number cannot leave it.
+/// places, a floor of 5e-4 that every value these keys hold sits below - it
+/// would draw 1e-8 as `0` and set it to `0` on the first pixel of a drag. This
+/// one moves by a fraction of the value itself, so the pixels buy decades, and
+/// carries `range`, the range the configuration accepts, so a drag or a typed
+/// number cannot leave it.
 ///
 /// A value the *file* carries is shown as it is written, out of range or not
 /// (`clamp_existing_to_range(false)`): the validation block above the sections
 /// is what says a key is wrong, and a panel that quietly rewrote one on the
 /// frame it was drawn would be editing a document nobody touched.
-fn tolerance_widget(ui: &mut egui::Ui, value: &mut f64) -> egui::Response {
-    let speed =
-        value.abs().max(constants::CG_TOLERANCE_MIN) * constants::VIEW_EDIT_TOLERANCE_DRAG_FRACTION;
+fn scientific_widget(
+    ui: &mut egui::Ui,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+) -> egui::Response {
+    let speed = value.abs().max(*range.start()) * constants::VIEW_EDIT_SCIENTIFIC_DRAG_FRACTION;
     ui.add(
         egui::DragValue::new(value)
             .speed(speed)
-            .range(constants::CG_TOLERANCE_MIN..=constants::CG_TOLERANCE_MAX)
+            .range(range)
             .clamp_existing_to_range(false)
             .custom_formatter(|value, _| format!("{value:e}"))
             .custom_parser(finite_number),
+    )
+}
+
+/// The relative residual of `[solver] tolerance`.
+fn tolerance_widget(ui: &mut egui::Ui, value: &mut f64) -> egui::Response {
+    scientific_widget(
+        ui,
+        value,
+        constants::CG_TOLERANCE_MIN..=constants::CG_TOLERANCE_MAX,
+    )
+}
+
+/// The modulus fraction of `[optimization] stiffness_floor`, which spans decades
+/// for the same reason and is drawn the same way.
+fn stiffness_floor_widget(ui: &mut egui::Ui, value: &mut f64) -> egui::Response {
+    scientific_widget(
+        ui,
+        value,
+        constants::STIFFNESS_FLOOR_MIN..=constants::STIFFNESS_FLOOR_MAX,
     )
 }
 
@@ -1438,6 +1461,7 @@ impl Section {
                     mass_fraction,
                     min_feature_mm,
                     penalty: None,
+                    stiffness_floor: None,
                     max_iterations: None,
                     convergence_tol: None,
                     update: None,
@@ -1931,6 +1955,21 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                  intermediate density out of the design. At least 1, and 2 to 5 is the useful \
                  range: higher drives the field black and white at the cost of more local \
                  minima. Every shipped example is at the default 3. simp only",
+            );
+            changed |= optional_value_row(
+                ui,
+                field,
+                "stiffness floor",
+                &mut optimization.stiffness_floor,
+                constants::SIMP_EMIN_FRACTION,
+                &format!("{:e}", constants::SIMP_EMIN_FRACTION),
+                "the Emin of E(x) = Emin + x^p (E0 - Emin): what an emptied design cell still \
+                 carries, as a fraction of the solid modulus. The default 1e-9 is nine decades of \
+                 stiffness contrast across the load path, and that contrast is what the solver's \
+                 iteration count grows with - raise it when a run exhausts its budget still short \
+                 of the tolerance. 1e-6 costs a part nothing it could be measured for; by 1e-3 the \
+                 void is carrying the design. simp only",
+                stiffness_floor_widget,
             );
             changed |= optional_integer_row(
                 ui,
@@ -3116,6 +3155,10 @@ mod tests {
                 config.optimization.overhang = Some(OverhangConfig {
                     build_direction: constants::VIEW_EDIT_DEFAULT_BUILD_DIRECTION,
                 });
+                // The one scalar key pinned here as well: its row draws a drag
+                // value in exponent notation while it is pinned, where every
+                // other row of this section draws a plain field or a label.
+                config.optimization.stiffness_floor = Some(1e-6);
                 config.optimization.wireframe = Some(WireframeConfig {
                     radius_mm: Some(3.0),
                     hold_iterations: Some(12),
@@ -3555,8 +3598,16 @@ mod tests {
         editor.state.edit(|config| {
             config.optimization.local_volume = None;
             config.optimization.penalty = Some(4.0);
+            // The scientific row in its pinned state; unpinned it draws the
+            // default label instead, which every other draw above covers.
+            config.optimization.stiffness_floor = Some(1e-6);
         });
         draw(&mut editor, &mut scene);
+        assert_eq!(
+            editor.state.config().optimization.stiffness_floor,
+            Some(1e-6),
+            "the panel rewrote a key on the frame it drew it"
+        );
 
         // A growth configuration that pins no `[growth]` key at all still has
         // to draw the section those keys live in.
@@ -3766,6 +3817,7 @@ mod tests {
                 mass_fraction: 0.42,
                 min_feature_mm: 30.0,
                 penalty: Some(4.0),
+                stiffness_floor: Some(1e-6),
                 max_iterations: Some(9),
                 convergence_tol: Some(1e-3),
                 update: Some(UpdateScheme::Mma),
@@ -3909,6 +3961,7 @@ mod tests {
                 constants::VIEW_EDIT_RESET_MIN_FEATURE_VOXELS * voxel
             );
             assert_eq!(optimization.penalty, None);
+            assert_eq!(optimization.stiffness_floor, None);
             assert_eq!(optimization.max_iterations, None);
             assert_eq!(optimization.convergence_tol, None);
             assert_eq!(optimization.update, None);
@@ -4291,6 +4344,7 @@ mod tests {
 
         editor.state.edit(|config| {
             config.optimization.penalty = Some(4.0);
+            config.optimization.stiffness_floor = Some(1e-6);
             config.optimization.max_iterations = Some(9);
             config.optimization.wireframe = Some(WireframeConfig {
                 radius_mm: Some(3.0),
@@ -4308,6 +4362,7 @@ mod tests {
         );
         // The rest of the section reset all the same: the click did something.
         assert_eq!(optimization.penalty, None);
+        assert_eq!(optimization.stiffness_floor, None);
         assert_eq!(optimization.max_iterations, None);
         assert_eq!(optimization.wireframe, None);
     }

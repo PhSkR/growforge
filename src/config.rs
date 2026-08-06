@@ -100,6 +100,23 @@ pub struct OptimizationConfig {
     pub min_feature_mm: f64,
     /// SIMP penalization exponent. Defaults to [`constants::SIMP_PENALTY`].
     pub penalty: Option<f64>,
+    /// Stiffness a design cell at zero density keeps, as a fraction of the solid
+    /// modulus - the `Emin` of `E(x) = Emin + x^p (E0 - Emin)`. Defaults to
+    /// [`constants::SIMP_EMIN_FRACTION`] and must lie between
+    /// [`constants::STIFFNESS_FLOOR_MIN`] and
+    /// [`constants::STIFFNESS_FLOOR_MAX`] inclusive.
+    ///
+    /// The default is nine decades of stiffness contrast across the load path,
+    /// and that contrast is what the conjugate gradient's iteration count grows
+    /// with: an ill-conditioned model can exhaust its budget still short of the
+    /// residual it was asked for. Raising the floor trades void stiffness the
+    /// design never bought for a system that solves - negligible while the
+    /// floor stays far below what the thinnest real member carries, and no
+    /// longer negligible above that.
+    ///
+    /// Forced void cells are untouched: they carry a literal zero and their
+    /// nodes are pinned out of the system, whatever this says.
+    pub stiffness_floor: Option<f64>,
     /// Iteration cap.
     pub max_iterations: Option<usize>,
     /// Stop once the largest absolute design variable change drops below this.
@@ -1349,6 +1366,11 @@ pub struct OptimizationParams {
     pub filter_radius_mm: f64,
     /// SIMP penalization exponent `p` of `E(x) = Emin + x^p (E0 - Emin)`.
     pub penalty: f64,
+    /// Stiffness floor `Emin` of that interpolation, as a fraction of the solid
+    /// modulus. Every stage that interpolates a modulus or differentiates one
+    /// reads it from here, so the forward solve and the sensitivity can never
+    /// be taken at two different floors.
+    pub stiffness_floor: f64,
     /// Iteration cap.
     pub max_iterations: usize,
     /// Design variable change threshold for convergence.
@@ -1822,6 +1844,11 @@ impl Config {
         finite("[optimization]", "penalty", o.penalty.unwrap_or_default())?;
         finite(
             "[optimization]",
+            "stiffness_floor",
+            o.stiffness_floor.unwrap_or_default(),
+        )?;
+        finite(
+            "[optimization]",
             "convergence_tol",
             o.convergence_tol.unwrap_or_default(),
         )?;
@@ -2016,6 +2043,23 @@ impl Config {
                 constants::SIMP_PENALTY
             );
         }
+        let stiffness_floor = o.stiffness_floor.unwrap_or(constants::SIMP_EMIN_FRACTION);
+        if !(stiffness_floor.is_finite()
+            && (constants::STIFFNESS_FLOOR_MIN..=constants::STIFFNESS_FLOOR_MAX)
+                .contains(&stiffness_floor))
+        {
+            bail!(
+                "[optimization]: stiffness_floor must lie between {:e} and {:e} inclusive (got \
+                 {stiffness_floor:e}); it is the Emin of E(x) = Emin + x^p (E0 - Emin), what an \
+                 emptied design cell still carries as a fraction of the solid modulus, and below \
+                 the lower bound the stiffness contrast is past what the arithmetic resolves while \
+                 above the upper the void carries the part rather than the design - {:e} is the \
+                 default",
+                constants::STIFFNESS_FLOOR_MIN,
+                constants::STIFFNESS_FLOOR_MAX,
+                constants::SIMP_EMIN_FRACTION
+            );
+        }
         let max_iterations = o
             .max_iterations
             .unwrap_or(constants::DEFAULT_MAX_ITERATIONS);
@@ -2056,6 +2100,7 @@ impl Config {
             min_feature_mm: o.min_feature_mm,
             filter_radius_mm,
             penalty,
+            stiffness_floor,
             max_iterations,
             convergence_tol,
             update,
@@ -2690,6 +2735,81 @@ vector = [0.0, 0.0, -10.0]
                 "unexpected error for {bad}: {error}"
             );
         }
+    }
+
+    /// `[optimization] stiffness_floor`: absent is the constant, present is what
+    /// the file says, and the bounds are refused at both ends.
+    ///
+    /// The key exists because the fixed floor was one: nine decades of stiffness
+    /// contrast across a one-sided anchoring's load path exhausted the whole
+    /// device iteration budget at a relative residual of 3.5e-6 against a target
+    /// of 3e-8, and an honest model had nowhere to say that the void it is
+    /// solved through need not be quite that empty.
+    #[test]
+    fn the_stiffness_floor_defaults_to_the_constant_and_is_bounded_at_both_ends() {
+        let with = |body: &str| {
+            MINIMAL.replace(
+                "mass_fraction = 0.3",
+                &format!("mass_fraction = 0.3\n{body}"),
+            )
+        };
+        let params = |text: &str| Config::parse(text).expect("parse").optimization_params();
+
+        // Absent, every configuration written before the key runs at exactly
+        // what it always ran at.
+        let default = params(MINIMAL).expect("params");
+        assert_eq!(default.stiffness_floor, constants::SIMP_EMIN_FRACTION);
+        assert_eq!(default.stiffness_floor, 1e-9);
+
+        // Named, it is what runs, and it rides beside the exponent rather than
+        // in place of it.
+        let named = Config::parse(&with("penalty = 4.0\nstiffness_floor = 1e-6")).expect("parse");
+        named.validate_static().expect("validate");
+        assert_eq!(
+            named.optimization.stiffness_floor,
+            Some(1e-6),
+            "the schema field"
+        );
+        let resolved = named.optimization_params().expect("params");
+        assert_eq!(resolved.stiffness_floor, 1e-6);
+        assert_eq!(resolved.penalty, 4.0);
+
+        // Both bounds are reachable: they are the range, not the outside of it.
+        for edge in [
+            constants::STIFFNESS_FLOOR_MIN,
+            constants::STIFFNESS_FLOOR_MAX,
+        ] {
+            let text = with(&format!("stiffness_floor = {edge:e}"));
+            assert_eq!(params(&text).expect("params").stiffness_floor, edge);
+        }
+
+        // And outside them nothing is softened. Zero is refused with the rest:
+        // a design cell at no stiffness at all is a singular row in a system
+        // nothing pins, which is a run that fails late instead of here.
+        for bad in ["1e-13", "1e-2", "0.0", "-1e-9", "nan", "inf", "-inf"] {
+            let text = with(&format!("stiffness_floor = {bad}"));
+            // A non-finite literal is stopped by the finite pass at parse, the
+            // rest by the range check at resolution; either way the message
+            // names the section and the key and nothing reaches a solver.
+            let error = match Config::parse(&text) {
+                Ok(config) => config
+                    .optimization_params()
+                    .expect_err(&format!("{bad} was accepted"))
+                    .to_string(),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("stiffness_floor"), "for {bad}: {error}");
+            assert!(error.contains("[optimization]"), "for {bad}: {error}");
+        }
+        // The bounds are named, so the message says what the range is.
+        let error = params(&with("stiffness_floor = 1e-2"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("{:e}", constants::STIFFNESS_FLOOR_MIN))
+                && error.contains(&format!("{:e}", constants::STIFFNESS_FLOOR_MAX)),
+            "the message has to name the bounds: {error}"
+        );
     }
 
     /// `[optimization.local_volume]`: every key optional, the defaults derived

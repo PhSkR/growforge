@@ -237,6 +237,15 @@ impl Document {
             config.optimization.convergence_tol,
         );
         set_opt_float(optimization, "penalty", config.optimization.penalty);
+        // Exponent notation, as the `[solver]` tolerance is written and for its
+        // reason: a floor of 1e-9 spelled out is a decimal point and eight
+        // zeros, and the panel, the README and the run's own messages all write
+        // these keys the short way.
+        set_opt_scientific_float(
+            optimization,
+            "stiffness_floor",
+            config.optimization.stiffness_floor,
+        );
         set_opt_str(
             optimization,
             "update",
@@ -1206,6 +1215,61 @@ mod tests {
         config.optimization.update = None;
         document.sync(&config).expect("sync");
         assert_eq!(document.render(), text, "the table outlived the cap");
+    }
+
+    /// `[optimization] stiffness_floor` is written in exponent notation, and
+    /// what is read back is the number that was held.
+    ///
+    /// The shared float writer spells an `f64` the way `Display` does, which for
+    /// this key is a decimal point and eight zeros at its default and a decimal
+    /// point and eleven at its lower bound - a file nobody would recognise and,
+    /// re-read through a decimal-rounding widget, a floor of zero. The key
+    /// therefore takes the same writer `[solver] tolerance` does.
+    #[test]
+    fn the_stiffness_floor_round_trips_in_exponent_notation() {
+        let text = fixture();
+        let (mut config, mut document) = open(text);
+
+        for floor in [
+            1e-6,
+            constants::STIFFNESS_FLOOR_MIN,
+            constants::STIFFNESS_FLOOR_MAX,
+        ] {
+            config.optimization.stiffness_floor = Some(floor);
+            document.sync(&config).expect("sync");
+            let saved = document.render();
+            assert!(
+                saved.contains(&format!("stiffness_floor = {floor:e}")),
+                "{floor:e} was not written as an exponent: {saved}"
+            );
+            let reparsed = Config::parse(&saved).expect("reparse");
+            reparsed
+                .validate_static()
+                .expect("the saved file has to run");
+            assert_eq!(
+                reparsed
+                    .optimization_params()
+                    .expect("params")
+                    .stiffness_floor,
+                floor
+            );
+        }
+
+        // Unpinned again the key goes, the resolution is the constant once more,
+        // and the file is byte for byte what it was.
+        config.optimization.stiffness_floor = None;
+        document.sync(&config).expect("sync");
+        let saved = document.render();
+        assert!(!saved.contains("stiffness_floor"), "{saved}");
+        assert_eq!(
+            Config::parse(&saved)
+                .expect("reparse")
+                .optimization_params()
+                .expect("params")
+                .stiffness_floor,
+            constants::SIMP_EMIN_FRACTION
+        );
+        assert_eq!(document.render(), text, "the key outlived the floor");
     }
 
     /// Both keys of the `[solver]` table, together and apart.

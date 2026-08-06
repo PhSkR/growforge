@@ -299,7 +299,8 @@ pub fn analyse(problem: &Problem, densities: &[f64]) -> Result<StressReport> {
 /// The near-singular system this is about is the one where a load enters a
 /// structure that is joined to nothing: the only path from the loaded nodes to
 /// the constrained ones runs through cells at the SIMP stiffness floor, a factor
-/// of [`constants::SIMP_EMIN_FRACTION`] down, and no conjugate gradient will
+/// of `[optimization] stiffness_floor` down - [`constants::SIMP_EMIN_FRACTION`]
+/// unless the configuration named another - and no conjugate gradient will
 /// resolve it. That is not something the solve can discover cheaply - it
 /// discovers it by grinding for tens of thousands of iterations and then failing
 /// - but it is one flood fill to answer here.
@@ -444,6 +445,7 @@ pub fn analyse_with_solver(
         densities,
         e0,
         problem.optimization.penalty,
+        problem.optimization.stiffness_floor,
         &mut moduli,
     );
     let ke0 = hex8_stiffness(problem.material.poisson_ratio, grid.h);

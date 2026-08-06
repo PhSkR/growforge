@@ -5,7 +5,8 @@
 //!
 //! WGSL has no `f64`, and the systems this crate solves are the worst case for
 //! single precision: late in a SIMP run the stiffness contrast across the grid
-//! is [`constants::SIMP_EMIN_FRACTION`], a factor of 1e9, while the CPU backend
+//! is `[optimization] stiffness_floor`, a factor of 1e9 at its default of
+//! [`constants::SIMP_EMIN_FRACTION`], while the CPU backend
 //! promises the relative residual it was asked for, which is
 //! [`constants::CG_RELATIVE_TOLERANCE`], 1e-8, unless `[solver] tolerance`
 //! names a looser one.

@@ -1,5 +1,59 @@
 # Changelog
 
+## 2026-08-06 - 0.33.0 - The nine decades under the load path
+
+The tension case again, and the same class of incident as 0.28.0 one layer down.
+A 1.2 M degree of freedom run at `mass_fraction = 0.15` over a 204 mm span, held
+on one side, exhausted 40 000 device iterations at a relative residual of 3.5e-6
+against a target of 3e-8 - still falling, not stalled - and then 10 000 CPU ones
+at 4.3e-6. Nothing was wrong with the model: the stiffness contrast it hands the
+conjugate gradient was hardwired at 1e9.
+
+- **`[optimization] stiffness_floor`**, the `Emin` of
+  `E(x) = Emin + x^p (E0 - Emin)` as a fraction of the solid modulus - what an
+  emptied *design* cell still carries. Optional, defaulting to
+  `constants::SIMP_EMIN_FRACTION` (1e-9), bounded by `STIFFNESS_FLOOR_MIN`
+  (1e-12) and `STIFFNESS_FLOOR_MAX` (1e-3) inclusive and refused outside them by
+  `Config::optimization_params`, so `growforge check` says so before any work is
+  done. Every existing configuration resolves to the value it always ran at.
+- **What it buys and what it costs.** The contrast across the load path is what
+  a conjugate gradient's iteration count grows with, and nine decades of it is
+  what an ill-conditioned honest model spends its whole budget on. A higher
+  floor is parasitic stiffness the design never bought; at 1e-6 an emptied cell
+  is still a thousandth of one at density 0.1, and at the 1e-3 the key stops at
+  the void is carrying the structure rather than helping it be solved for.
+- **Forced void cells are untouched at any floor**: they carry a literal zero
+  and their nodes are pinned out of the system entirely. The floor is a design
+  cell's, and only a design cell's.
+- **One resolved value reaches every mirror of the interpolation.**
+  `engine::simp_moduli` takes it beside `penalty` - the optimizer, the benchmark
+  and the post-run stress analysis all call it - and `Objective` forms its `emin`
+  from `problem.optimization.stiffness_floor` rather than the constant. A
+  forward sweep and an adjoint taken at two different floors is a gradient
+  nothing reports as wrong, so the finite difference check is run at three of
+  them.
+- **Scope held deliberately narrow**, as 0.28.0 held it: the iteration caps stay
+  compile-time constants - a cap is the guardrail that ends a solve which has
+  stopped converging, not a knob - and the GPU precision fixtures stay pinned to
+  the default floor, because what they measure is the worst contrast a
+  configuration can hand the backends.
+- **The editor grew the row beside `penalty`**, drawn by the exponent-notation
+  drag value 0.28.0 added for the tolerance: `tolerance_widget` is now
+  `scientific_widget` over the range its caller names, and
+  `VIEW_EDIT_TOLERANCE_DRAG_FRACTION` is `VIEW_EDIT_SCIENTIFIC_DRAG_FRACTION`
+  with two fields under it. The row resets with its section, and the save writes
+  `stiffness_floor = 1e-6` rather than a decimal point and five zeros.
+- Tests: the key absent, named, at both bounds and refused past either (plus
+  zero, a negative, `nan` and both infinities), the message naming the section,
+  the key and the range; the default pinned to the constant *and* to 1e-9; the
+  moduli of a design cell at density 0 and 1 read off the array the solve is
+  assembled from; the finite difference gradient at 1e-12, 1e-6 and 1e-3, all
+  within 8e-10 relative; the row drawn pinned and unpinned and unchanged by the
+  frame that drew it, the section reset clearing it, the panel width guard with
+  it pinned, and the key round-tripped through a save at three values and gone
+  again from a file that never had it.
+- Version 0.33.0.
+
 ## 2026-08-05 - 0.32.0 - Collapsible panel blocks
 
 Asked for by the user: the object lists closed to begin with, and a dropdown on

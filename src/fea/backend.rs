@@ -380,6 +380,7 @@ mod tests {
                 min_feature_mm: 4.0,
                 filter_radius_mm: 2.0,
                 penalty: crate::constants::SIMP_PENALTY,
+                stiffness_floor: crate::constants::SIMP_EMIN_FRACTION,
                 max_iterations: 1,
                 convergence_tol: 1e-3,
                 update: crate::config::UpdateScheme::Oc,
@@ -531,6 +532,12 @@ mod tests {
 
     /// SIMP moduli of a density field, so a fixture carries the same 1e9
     /// stiffness contrast a real late optimization iteration does.
+    ///
+    /// Pinned to the default floor rather than taking `[optimization]
+    /// stiffness_floor`: what these fixtures are for is the *worst* contrast a
+    /// configuration can hand the backends, and that is the default one. A
+    /// higher floor is a strictly easier system, and measuring the backends on
+    /// one would be measuring nothing.
     fn simp_moduli(densities: &[f64], e0: f64) -> Vec<f64> {
         let emin = SIMP_EMIN_FRACTION * e0;
         densities
