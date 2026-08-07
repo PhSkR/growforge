@@ -5294,6 +5294,57 @@ mod tests {
         assert!(!stl.exists(), "drawing the button wrote {}", stl.display());
     }
 
+    /// And the same of the engine that reports no iteration at all: the button
+    /// lights up on the design it produced, exactly as it does on one that was
+    /// iterated towards.
+    ///
+    /// The defect the toolbar showed: with retention fed by the per-iteration
+    /// callback alone, a solid run - full or preview - left nothing behind, and
+    /// "generate stl" was greyed out for the whole session. Auto-regrow is
+    /// switched on by hand here because this engine takes the SIMP default, which
+    /// is off; what is under test is the run, not what starts it.
+    #[test]
+    fn the_toolbar_offers_generate_stl_on_a_design_no_iteration_was_reported_for() {
+        let (_dir, path) = write_temp("panel_generate_solid", solid_fixture());
+        let stl = path.with_file_name("fixture.stl");
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        editor.set_auto_regrow(true);
+
+        assert!(!editor.can_generate_stl());
+        draw(&mut editor, &mut scene);
+
+        editor
+            .state
+            .edit(|config| config.output.iso_level = Some(0.4));
+        editor.on_edited();
+        std::thread::sleep(std::time::Duration::from_secs_f64(
+            constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
+        ));
+        editor.pump(&mut scene);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while std::time::Instant::now() < deadline && !editor.can_generate_stl() {
+            editor.pump(&mut scene);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            editor.can_generate_stl(),
+            "the solid preview left no design to export"
+        );
+        // Its engine reported nothing while doing it, which is the whole of that
+        // engine's contract and is not what makes the button work.
+        assert!(
+            editor.run_line().is_some_and(|line| !line.contains("step")),
+            "{:?}",
+            editor.run_line()
+        );
+        draw(&mut editor, &mut scene);
+
+        editor.detach();
+        editor.finish();
+        assert!(!stl.exists(), "drawing the button wrote {}", stl.display());
+    }
+
     /// The panel is where the increment and the containment rule are set, so
     /// what it puts in front of the user has to be what the drags then use.
     #[test]

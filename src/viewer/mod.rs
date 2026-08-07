@@ -121,7 +121,7 @@ pub fn run_with_view(
             link: &link,
             detach: true,
         };
-        let worker = threads.spawn(|| run_worker(problem, reporter, &link));
+        let worker = threads.spawn(|| run_worker(problem, reporter, &link, &keeps_nothing));
         let window = {
             // The window keeps servicing its message queue until the worker
             // is done, so this borrow has to end before the join below.
@@ -166,10 +166,16 @@ pub fn run_with_view(
 /// A run that *fails* is a different thing from one that is stopped: the error
 /// travels to the window as [`RunStatus::Failed`] and out to the caller, which
 /// on the command line ends the process and in the editor ends only the run.
+///
+/// `keep` is handed the field the engine produced, once, at the moment it
+/// produces it - which is what leaves a design behind for a run that reported no
+/// iteration of one. See [`keeps_nothing`] for the callers that have nowhere to
+/// keep it.
 pub(crate) fn run_worker(
     problem: &Problem,
     reporter: &dyn Reporter,
     link: &ViewLink,
+    keep: &dyn Fn(&[f64]),
 ) -> Result<Option<RunOutcome>> {
     // Declared first so it drops last: whatever unwinds below, the window is
     // told before this function's frame is gone.
@@ -191,6 +197,19 @@ pub(crate) fn run_worker(
     let optimize_s = start.elapsed().as_secs_f64();
 
     let mut field = field;
+    // The engine's field, handed over before [`finish`] resolves it in place.
+    // The order is the whole of it: what is kept here is what may later be asked
+    // for the deliverables of, through this same `finish`, and a field that had
+    // already been through the cavity policy and the `[output]` passes would have
+    // them applied to it a second time - the flush's fringe reaches further out
+    // on every pass, so that is corruption rather than a no-op.
+    //
+    // Engine-agnostic on purpose. An engine that reports no iteration at all -
+    // the solid one reports none, by design - leaves its design behind here
+    // exactly as one that reports five hundred does; for the others this is the
+    // last reported iteration's field again, which is the same field or the one
+    // it settled on.
+    keep(&field.densities);
     // The stress solve is the longest single call of the analysis stage, so the
     // stop reaches inside it rather than waiting at the far end of it.
     let stop = || reporter.cancelled();
@@ -230,6 +249,11 @@ pub(crate) fn run_worker(
         export_s,
     }))
 }
+
+/// The `keep` of a caller with nowhere to keep a design: `growforge run --view`
+/// writes its file and leaves, so nothing outlives the run to export the field
+/// again from.
+pub(crate) fn keeps_nothing(_densities: &[f64]) {}
 
 /// Everything [`finish`] produced from a density field.
 ///
@@ -752,9 +776,14 @@ vector = [0.0, 0.0, 30.0]
         problem.output.stl_path = directory.join("growforge_viewer_fragmented.stl");
 
         let link = ViewLink::new();
-        let outcome = run_worker(&problem, &crate::report::SilentReporter, &link)
-            .expect("the run must finish")
-            .expect("nothing asked it to stop");
+        let outcome = run_worker(
+            &problem,
+            &crate::report::SilentReporter,
+            &link,
+            &keeps_nothing,
+        )
+        .expect("the run must finish")
+        .expect("nothing asked it to stop");
 
         // The block in the second lobe is welded to nothing, and it left.
         assert!(
@@ -811,9 +840,14 @@ vector = [0.0, 0.0, 30.0]
         problem.output.stl_path = directory.join("growforge_viewer_trimmed.stl");
 
         let link = ViewLink::new();
-        let outcome = run_worker(&problem, &crate::report::SilentReporter, &link)
-            .expect("the run must finish")
-            .expect("nothing asked it to stop");
+        let outcome = run_worker(
+            &problem,
+            &crate::report::SilentReporter,
+            &link,
+            &keeps_nothing,
+        )
+        .expect("the run must finish")
+        .expect("nothing asked it to stop");
 
         let notes = outcome.trim.as_ref().expect("a trim report").notes();
         assert!(!notes.is_empty(), "the pass ran and said nothing");
@@ -839,9 +873,14 @@ vector = [0.0, 0.0, 30.0]
         assert_eq!(problem.output.trim, crate::config::TrimPolicy::Off);
 
         let link = ViewLink::new();
-        let outcome = run_worker(&problem, &crate::report::SilentReporter, &link)
-            .expect("the run must finish")
-            .expect("nothing asked it to stop");
+        let outcome = run_worker(
+            &problem,
+            &crate::report::SilentReporter,
+            &link,
+            &keeps_nothing,
+        )
+        .expect("the run must finish")
+        .expect("nothing asked it to stop");
         assert!(outcome.trim.is_none());
         assert!(link.progress().trim.is_empty());
         // The clamp is a separate line and is on by default, so silence about
@@ -866,9 +905,14 @@ vector = [0.0, 0.0, 30.0]
         );
 
         let link = ViewLink::new();
-        let outcome = run_worker(&problem, &crate::report::SilentReporter, &link)
-            .expect("the run must finish")
-            .expect("nothing asked it to stop");
+        let outcome = run_worker(
+            &problem,
+            &crate::report::SilentReporter,
+            &link,
+            &keeps_nothing,
+        )
+        .expect("the run must finish")
+        .expect("nothing asked it to stop");
         let notes = outcome.clamp.expect("a clamp report").notes();
         assert!(!notes.is_empty(), "the pass ran and said nothing");
         assert_eq!(
@@ -883,7 +927,7 @@ vector = [0.0, 0.0, 30.0]
         off.output.boundaries = crate::config::BoundaryFidelity::Voxel;
         off.output.stl_path = directory.join("growforge_viewer_unclamped.stl");
         let link = ViewLink::new();
-        let outcome = run_worker(&off, &crate::report::SilentReporter, &link)
+        let outcome = run_worker(&off, &crate::report::SilentReporter, &link, &keeps_nothing)
             .expect("the run must finish")
             .expect("nothing asked it to stop");
         assert!(outcome.clamp.is_none());

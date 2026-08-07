@@ -1,5 +1,46 @@
 # Changelog
 
+## 2026-08-07 - 0.36.1 - Two editor run-completion defects
+
+Both reported by the user, on a session of the solid engine: "generate stl"
+greyed out after a run that had just written its file, and the toolbar still
+saying the run was going long after it was over.
+
+- **A completed run keeps its design, whatever its engine reported.** Retention
+  was fed by the per-iteration callback alone, so an engine that reports no
+  iteration - the solid one reports none, by design - left nothing behind: a full
+  run wrote its STL and "generate stl" stayed disabled for the rest of the
+  session, and a solid preview left the button disabled too. `run_worker` now
+  hands the field to a `keep` callback the moment the engine hands it over, and
+  the editor's full run keeps it there; a preview keeps the field it ends on the
+  same way. The engine's own reporting is untouched: it still reports nothing,
+  and the panel still shows no per-iteration block for it.
+- **Before the deliverable passes, never after.** What is kept is the field *as
+  the engine produced it*, taken before `finish` resolves it in place, because
+  "generate stl" puts whatever is kept through that same pipeline: a field kept
+  after it would come back through the cavity policy and the `[output]` passes
+  twice, and the flush's fringe reaches further out on every application. Pinned
+  by the file - a full run with `flush = "walls"` and a generation from its kept
+  design are compared byte for byte, and keeping the post-`finish` field makes
+  that test fail with a part 8 kB larger than the one the run wrote.
+- **A run that finishes says so.** The panel had a transition for a run that was
+  stopped and one for a run that failed, and none at all for one that ended on
+  its own, so "running the full pipeline; it will write ..." stayed on the status
+  line for the rest of the session - a generic defect that the solid engine's
+  one-frame run merely made impossible to miss. `note_run_success` sits beside
+  `note_run_failure` in the same pump, keyed on `RunStatus::Finished`, with a
+  dedup flag of its own reset at the three run-start sites: a full run says what
+  it wrote and where, a generation says what it generated, and a preview - which
+  writes nothing and says nothing when it starts - says nothing here either.
+- Tests: a solid full run through the worker keeping its design, generating from
+  it, and producing a file identical to the run's own, with the engine's silence
+  asserted beside it; the flush comparison above; the toolbar offering the button
+  after a solid preview; and, through the editor, the status line moving off the
+  running message when a full run finishes, saying it once, and going back to the
+  running message for the next run - with the generation's own line asserted where
+  that path is already driven.
+- Version 0.36.1.
+
 ## 2026-08-06 - 0.36.0 - The wall reaches the shape it was drawn against
 
 From the user's ask: a smoothing pass that fills in material on the outer walls

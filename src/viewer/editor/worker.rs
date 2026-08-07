@@ -215,6 +215,13 @@ impl Retention {
     /// Keep `densities` as the newest design of this run, unless this run has
     /// been cancelled.
     ///
+    /// Called from two places, and they are the same statement: every iteration
+    /// the engine reports one, and the moment the engine hands its finished field
+    /// over. A run whose engine reports iterations therefore ends by keeping the
+    /// field it settled on over the last snapshot of it - the same field, or the
+    /// one it converged to - and a run whose engine reports none, the solid one
+    /// above all, keeps its only one there.
+    ///
     /// The cancellation is checked *under the slot's own lock*, which is what
     /// makes it mean anything. A run is superseded by cancelling it and then
     /// clearing the slot for its replacement, both from the window's thread; the
@@ -430,18 +437,25 @@ impl Worker {
     /// it was produced against.
     ///
     /// This is what the window is showing: it is fed by the very per-iteration
-    /// callback the preview mesher is fed by, and cleared when a run starts, so
-    /// there is a design here exactly when one has been drawn for the
-    /// configuration as it was then. Whatever ended the run that produced it -
-    /// convergence, the iteration cap, the stop button - is not recorded and
-    /// does not matter: a field is a design either way, and exporting it is the
-    /// user's call.
+    /// callback the preview mesher is fed by, and again when the engine hands its
+    /// finished field over, and cleared when a run starts - so there is a design
+    /// here exactly when one has been computed for the configuration as it was
+    /// then. Whatever ended the run that produced it - convergence, the iteration
+    /// cap, the stop button, an engine with no iterations to end - is not
+    /// recorded and does not matter: a field is a design either way, and
+    /// exporting it is the user's call.
     ///
-    /// What it costs is one copy of the field per reported iteration - the
-    /// snapshot the preview mesher is sent is a copy of its own, and these are
-    /// deliberately not shared: a few megabytes of memcpy beside a finite element
-    /// solve is not worth threading shared ownership through the reporter for -
-    /// and one field of memory held between runs.
+    /// Always the field *as the engine produced it*, never one the deliverable
+    /// passes have been over: [`Worker::generate`] applies those passes to
+    /// whatever is here, so a field that had already been through them would come
+    /// out of a generation having had them applied twice.
+    ///
+    /// What it costs is one copy of the field per reported iteration, and one
+    /// more where the run ends - the snapshot the preview mesher is sent is a
+    /// copy of its own, and these are deliberately not shared: a few megabytes of
+    /// memcpy beside a finite element solve is not worth threading shared
+    /// ownership through the reporter for - and one field of memory held between
+    /// runs.
     pub fn retained(&self) -> Option<Arc<Retained>> {
         lock(&self.retained).clone()
     }
@@ -736,7 +750,12 @@ fn full(
         cancel,
         retain: retention,
     };
-    match crate::viewer::run_worker(problem, &reporter, link) {
+    // The engine's own field, kept the moment the engine hands it over - see
+    // [`crate::viewer::run_worker`], which is where the ordering that makes it
+    // exportable lives. Not the reporter's business: this run may report no
+    // iteration at all, and a run that ends is a design either way.
+    let completed = |densities: &[f64]| retention.keep(densities, cancel);
+    match crate::viewer::run_worker(problem, &reporter, link, &completed) {
         Ok(Some(outcome)) => {
             // Recorded here and nowhere else: this is the one moment at which
             // the file is known to have been written, which is what lets the
@@ -875,6 +894,11 @@ fn preview(retention: &Retention, link: &ViewLink, cancel: &AtomicBool) {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
+            // The field the engine ended on, kept as any reported iteration is.
+            // A preview never goes through [`crate::viewer::finish`], so this is
+            // the same field a generation would be handed either way; what it
+            // adds is the run whose engine reported no iteration to keep one of.
+            retention.keep(&field.densities, cancel);
             let surface = crate::viewer::scene::preview_surface(
                 &problem.grid,
                 &field.densities,
@@ -1328,6 +1352,138 @@ vector = [0.0, 0.0, -20.0]
             .and_then(|data| data.modified())
             .expect("the mtime");
         assert!(worker.wrote_output(&stl, modified));
+        worker.join();
+        std::fs::remove_file(&stl).ok();
+    }
+
+    /// An engine that reports no iteration at all still leaves its design behind,
+    /// and generating from it writes the very file the run wrote.
+    ///
+    /// The defect: retention was fed by the per-iteration callback alone, so a
+    /// completed solid run - which reports none, by design - kept nothing, and
+    /// "generate stl" stayed disabled for the rest of the session.
+    ///
+    /// The file the generation writes is compared with the run's own byte for
+    /// byte, because a design that generates something *else* is no better than
+    /// one that cannot be generated at all. This engine refuses the `[output]`
+    /// passes, so what that comparison pins here is the pipeline being the same
+    /// one twice over the same field; where in the run the field is kept is
+    /// pinned by
+    /// `a_completed_run_keeps_the_field_the_deliverable_passes_have_not_touched`,
+    /// on an engine that allows them. The engine's silence is asserted beside it:
+    /// the fix is where the field is kept, never a report the engine does not
+    /// make.
+    #[test]
+    fn a_solid_run_keeps_the_field_it_produced_and_generates_the_same_file() {
+        let (_dir, path) = write_temp("worker_solid_generate", solid_fixture());
+        let directory = path.parent().expect("a directory").to_path_buf();
+        let config = Config::parse(solid_fixture()).expect("parse");
+        let stl = directory.join(&config.output.stl_path);
+        let mut worker = Worker::new();
+        worker
+            .start(&config, &directory, RunKind::Full)
+            .expect("start");
+        drain_until(&worker, 300, |worker, _| !worker.is_running());
+        assert!(!worker.is_running(), "the run never finished");
+        assert!(stl.exists(), "the full run wrote no file");
+        let written = std::fs::read(&stl).expect("the run's own file");
+        std::fs::remove_file(&stl).expect("take the run's own file away");
+
+        // The engine reported nothing, and still reports nothing.
+        let progress = worker.progress().expect("a run to report on");
+        assert!(
+            progress.latest.is_none(),
+            "the solid engine was made to report an iteration: {:?}",
+            progress.latest
+        );
+        assert!(matches!(progress.status, RunStatus::Finished { .. }));
+
+        // And the design it produced is there to export.
+        let kept = worker.retained().expect("the solid run kept no design");
+        assert_eq!(kept.densities().len(), kept.problem().grid.n_cells());
+        assert!(
+            kept.densities().iter().any(|&density| density > 0.5),
+            "the kept field has nothing solid in it"
+        );
+        assert_eq!(kept.problem().output.stl_path, stl);
+        assert!(worker.can_generate(), "the button stayed disabled");
+
+        assert!(worker.generate(), "the generation never started");
+        drain_until(&worker, 300, |worker, _| !worker.is_running());
+        assert!(!worker.is_running(), "the generation never ended");
+        assert!(stl.exists(), "the generation wrote nothing");
+        let generated = std::fs::read(&stl).expect("the generation's file");
+        assert_eq!(
+            generated.len(),
+            written.len(),
+            "the generation wrote a different surface from the run's own"
+        );
+        assert!(
+            generated == written,
+            "the generation's file differs from the one the run wrote"
+        );
+        worker.join();
+        std::fs::remove_file(&stl).ok();
+    }
+
+    /// *Which* field a completed run keeps, pinned by the file it produces: the
+    /// one the engine handed over, never the one the deliverable pipeline has
+    /// already been over.
+    ///
+    /// `flush = "walls"` is the lever, because it is the pass that is not
+    /// idempotent: it reaches `flush_depth_mm` past the material it finds near a
+    /// surface, so applying it to a field it has already been applied to extends
+    /// that fringe again. A generation puts the kept field through that pipeline,
+    /// so a field kept *after* `finish` rather than before it comes out of the
+    /// generation as a different part from the one the run wrote - which is what
+    /// the byte comparison here catches.
+    #[test]
+    fn a_completed_run_keeps_the_field_the_deliverable_passes_have_not_touched() {
+        let text = growth_fixture().replace(
+            "stl_path = \"fixture.stl\"",
+            "stl_path = \"fixture.stl\"\nflush = \"walls\"",
+        );
+        let (_dir, path) = write_temp("worker_flush_generate", &text);
+        let directory = path.parent().expect("a directory").to_path_buf();
+        let config = Config::parse(&text).expect("parse");
+        let stl = directory.join(&config.output.stl_path);
+        let mut worker = Worker::new();
+        worker
+            .start(&config, &directory, RunKind::Full)
+            .expect("start");
+        drain_until(&worker, 300, |worker, _| !worker.is_running());
+        assert!(!worker.is_running(), "the run never finished");
+        let progress = worker.progress().expect("a run to report on");
+        assert!(
+            matches!(progress.status, RunStatus::Finished { .. }),
+            "{:?}",
+            progress.status
+        );
+        // The fixture has to make the pass do something, or it pins nothing: a
+        // fill that filled nothing fills nothing the second time either.
+        assert!(
+            progress
+                .flush
+                .iter()
+                .any(|note| note.starts_with("filled ")),
+            "the flush pass filled nothing, so a second application of it would be invisible: {:?}",
+            progress.flush
+        );
+        let written = std::fs::read(&stl).expect("the run's own file");
+        std::fs::remove_file(&stl).expect("take the run's own file away");
+
+        assert!(worker.can_generate());
+        assert!(worker.generate(), "the generation never started");
+        drain_until(&worker, 300, |worker, _| !worker.is_running());
+        assert!(!worker.is_running(), "the generation never ended");
+        let generated = std::fs::read(&stl).expect("the generation's file");
+        assert!(
+            generated == written,
+            "the generation exported a field the passes had already been over: {} bytes against \
+             the run's own {}",
+            generated.len(),
+            written.len()
+        );
         worker.join();
         std::fs::remove_file(&stl).ok();
     }

@@ -293,6 +293,11 @@ pub struct Editor {
     /// The run failure the panel has already been told about, so one failure
     /// produces one status line rather than one per frame.
     reported_failure: Option<String>,
+    /// Set once the run that is current has been reported as finished, for the
+    /// reason [`Editor::reported_failure`] exists: a finished run stays current
+    /// until the next one starts, so without this every frame would rewrite the
+    /// line - over anything the session has said since.
+    reported_success: bool,
     /// Direction the camera is looking, for the drags that move in its plane.
     view_direction: Vec3,
     /// Where the camera projects world points to, for the callouts: the frame's
@@ -395,6 +400,7 @@ impl Editor {
             floor_grid: None,
             shown_grid: None,
             reported_failure: None,
+            reported_success: false,
             view_direction: [0.0, 0.0, -1.0],
             projection: None,
             snap: Snap::default(),
@@ -608,8 +614,10 @@ impl Editor {
         let directory = self.state.directory().to_path_buf();
         let warning = self.output_warning(&self.state.output_path());
         // Whatever the last run failed with belongs to that run: a new one that
-        // fails the same way is a new thing to be told about.
+        // fails the same way is a new thing to be told about, and so is a new one
+        // that finishes where the last one finished.
         self.reported_failure = None;
+        self.reported_success = false;
         match self.worker.start(&config, &directory, RunKind::Full) {
             Ok(()) => {
                 let mut status = format!(
@@ -687,8 +695,9 @@ impl Editor {
         // where the configuration says to now.
         let path = kept.problem().output.stl_path.clone();
         let warning = self.output_warning(&path);
-        // Whatever the last run failed with belongs to that run.
+        // Whatever the last run failed with, or wrote, belongs to that run.
         self.reported_failure = None;
+        self.reported_success = false;
         if !self.worker.generate() {
             return;
         }
@@ -708,6 +717,7 @@ impl Editor {
         let config = worker::preview_config(self.state.config(), problem);
         let directory = self.state.directory().to_path_buf();
         self.reported_failure = None;
+        self.reported_success = false;
         if self
             .worker
             .start(&config, &directory, RunKind::Preview)
@@ -963,6 +973,10 @@ impl Editor {
         // failed while an edit had queued a preview was overwritten by that
         // preview in the same pump, and the panel never said a word.
         self.note_run_failure();
+        // Beside it, and for the same reason it is here rather than lower down:
+        // the run that finished is readable only through itself, and the preview
+        // an edit queued would replace it in this very pump.
+        self.note_run_success();
         if self.refresh.take(Instant::now()) {
             self.rebuild_setup(scene);
             refresh.setup = true;
@@ -1574,6 +1588,42 @@ impl Editor {
             "{what} failed and wrote nothing: {reason} - the session is unaffected; change the \
              configuration and run again"
         ));
+    }
+
+    /// Notice a run that finished on its own, once, and say so in the panel.
+    ///
+    /// The counterpart of [`Editor::note_run_failure`], and the same shape: a run
+    /// that ends says nothing of itself, so the line the *start* of it wrote -
+    /// "running the full pipeline; it will write ..." - stayed on the panel for
+    /// the rest of the session, describing a run that was over and a file that
+    /// was already there. The run line beside it moves to "done" on its own and
+    /// is not what this repeats: what this says is that the file was written, and
+    /// where.
+    ///
+    /// Only the two kinds that write ever put a run on the status line, so only
+    /// they have a finish to report; a preview writes nothing, says nothing when
+    /// it starts, and never reaches
+    /// [`crate::viewer::snapshot::RunStatus::Finished`] at all.
+    fn note_run_success(&mut self) {
+        if self.reported_success {
+            return;
+        }
+        let Some(progress) = self.worker.progress() else {
+            return;
+        };
+        let crate::viewer::snapshot::RunStatus::Finished { stl_path, .. } = &progress.status else {
+            return;
+        };
+        // The path the run resolved and wrote, which for a generation is the one
+        // its own design belongs to rather than the one the configuration names
+        // now.
+        let status = match self.worker.kind() {
+            Some(RunKind::Full) => format!("the full pipeline finished; it wrote {stl_path}"),
+            Some(RunKind::Export) => format!("generated {stl_path} from the design on screen"),
+            _ => return,
+        };
+        self.reported_success = true;
+        self.status = Some(status);
     }
 
     /// Close whatever interaction the panel left open once the pointer and the
@@ -4359,6 +4409,13 @@ vector = [0.0, 0.0, -80.0]
         editor.pump(&mut scene);
         assert!(!editor.is_running(), "the generation never ended");
         assert!(stl.exists(), "the generation wrote no file");
+        // And the panel moves off the line that said it was starting: a
+        // generation that is over is a file that is there.
+        let status = editor.status_line().expect("a status").to_string();
+        assert!(
+            status.starts_with("generated ") && status.contains("fixture.stl"),
+            "{status}"
+        );
 
         // And the window shows what it wrote: the exported surface, with the
         // stress colouring the panel's own switch hangs off.
@@ -4381,6 +4438,80 @@ vector = [0.0, 0.0, -80.0]
         // Its own file is recognized as its own, so a run started afterwards does
         // not accuse the session of it.
         assert!(editor.output_warning(&stl).is_none());
+        std::fs::remove_file(&stl).ok();
+    }
+
+    /// A run that ends on its own says so, in place of the line that said it was
+    /// starting.
+    ///
+    /// The defect: the panel had a transition for a run that was stopped and one
+    /// for a run that failed, and none for a run that finished - so "running the
+    /// full pipeline; it will write ..." stayed on it for the rest of the
+    /// session, describing a run that was over and a file that was already there.
+    /// The solid engine, whose whole run is one frame, is what made it plain, and
+    /// is what this runs for the speed of it; nothing here is that engine's.
+    #[test]
+    fn a_full_run_that_finishes_says_so_and_says_it_once() {
+        let (_dir, path) = write_temp("full_run_finished", solid_fixture());
+        let stl = path.with_file_name("fixture.stl");
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        assert!(editor.state.is_valid(), "{:?}", editor.state.error());
+
+        editor.start_full_run();
+        assert!(
+            editor
+                .status_line()
+                .expect("a status")
+                .contains("running the full pipeline"),
+            "{:?}",
+            editor.status_line()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while Instant::now() < deadline && editor.is_running() {
+            editor.pump(&mut scene);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        editor.pump(&mut scene);
+        assert!(!editor.is_running(), "the run never ended");
+        assert!(stl.exists(), "the full run wrote no file");
+
+        // What the panel says once it is over: that it is, and where the file
+        // went.
+        let status = editor.status_line().expect("a status").to_string();
+        assert!(
+            !status.contains("it will write"),
+            "the panel is still describing a run that is over: {status}"
+        );
+        assert!(
+            status.contains("finished") && status.contains("fixture.stl"),
+            "{status}"
+        );
+
+        // Once. A finished run stays the current one until the next starts, so a
+        // pump a frame later must not write its line over whatever has been said
+        // since.
+        editor.status = Some("a later message".to_string());
+        editor.pump(&mut scene);
+        assert_eq!(
+            editor.status_line(),
+            Some("a later message"),
+            "the finished run reported itself a second time"
+        );
+
+        // And the run after it puts the running line back.
+        editor.start_full_run();
+        assert!(
+            editor
+                .status_line()
+                .expect("a status")
+                .contains("running the full pipeline"),
+            "{:?}",
+            editor.status_line()
+        );
+        editor.stop_run();
+        editor.finish();
         std::fs::remove_file(&stl).ok();
     }
 

@@ -2601,7 +2601,10 @@ however its runs went.
 iteration budget, the cavity pass, the stress report, and the STL written to
 `[output] stl_path`. Progress appears in the window exactly as with
 `run --view`, the console prints the same per-iteration lines, and the run ends
-on the exported mesh with the stress colouring available.
+on the exported mesh with the stress colouring available. The status line ends
+with the file: *"the full pipeline finished; it wrote ..."*, as a stopped run
+ends with what it did not write and a failed one with why - and a generation
+with *"generated ..."*.
 
 **`generate stl`** writes the deliverables of **the design already on screen**:
 the enclosed cavity pass, the stress report, the mesh and the STL, without running
@@ -2611,15 +2614,19 @@ have produced from that field - and it is the answer to having stopped a long ru
 and wanted the part it had reached.
 
 Every run keeps its newest design for it: the full-resolution field of the last
-iteration it reported, together with **the problem that run was built from**. Both
-matter:
+iteration it reported, and the field it ends on when it ends, together with **the
+problem that run was built from**. Both matter:
 
 * **The field is whatever the window last showed.** A converged run, a run that
   spent its budget, a run you stopped at iteration 527, a coarsened `simp`
-  preview: all of them are designs, and any of them can be exported. The frame
-  label above the panel says which you are looking at, so a `preview` is never
-  mistaken for a converged result - it will be written at the resolution the
-  preview ran, because that is the design that is on screen.
+  preview, a `solid` run that reported no iteration at all: all of them are
+  designs, and any of them can be exported. The frame label above the panel says
+  which you are looking at, so a `preview` is never mistaken for a converged
+  result - it will be written at the resolution the preview ran, because that is
+  the design that is on screen. It is always the field **as the engine produced
+  it**: `generate stl` runs the cavity pass and the `[output]` passes over it
+  itself, so what is kept is what they have not been over yet, and generating
+  from a finished run's design writes the file that run wrote.
 * **The problem is the one that design was computed on**, not one rebuilt from the
   configuration as it stands now. Carry on editing after the run - change the
   resolution, move the loads, break the configuration outright - and the button
