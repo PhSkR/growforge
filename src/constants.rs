@@ -1612,6 +1612,31 @@ pub const BOUNDARY_CLAMP_CAPTURE_VOXELS: f64 = 0.5;
 /// distances keeps its significant digits.
 pub const BOUNDARY_CLAMP_GRADIENT_STEP_MM: f64 = 1e-5;
 
+/// How far from the nearest analytic boundary a vertex may come to rest, in
+/// voxels, and still be **counted** as adrift from it rather than read as a free
+/// surface through the middle of the domain.
+///
+/// This measures; it moves nothing. The clamp seats what it can reach
+/// ([`BOUNDARY_CLAMP_CAPTURE_VOXELS`], half a voxel) and deliberately leaves
+/// everything further out alone, and until this existed it left it *silently*:
+/// a face that came out a whole voxel off the surface it was drawn against read
+/// as an ordinary free surface, the clamp line said nothing about it, and the
+/// first thing to notice was the slicer. So the pass counts what it did not
+/// seat, and the report says so.
+///
+/// Two voxels is that band. Four times the capture, so everything the seat
+/// should have caught and did not is comfortably inside it and the reading is
+/// not a hair away from the correction; it also covers the incident that named
+/// it, a bottom face resting 0.88 of its run's voxel above the plate, with room
+/// on either side. It is the flush pass's own depth ([`FLUSH_DEPTH_VOXELS`]),
+/// which is not a coincidence: what that pass reaches out to fill is exactly
+/// what this one reports as resting short - and the definition below derives
+/// from it so the two cannot drift apart. Wider than this and an optimizer's
+/// free surface running past a wall - which rests on nothing and is nobody's
+/// defect - starts being counted; the count would then be noise on every
+/// organic part and would say nothing on the one that is wrong.
+pub const BOUNDARY_ADRIFT_WINDOW_VOXELS: f64 = FLUSH_DEPTH_VOXELS;
+
 // ---------------------------------------------------------------------------
 // STL output
 // ---------------------------------------------------------------------------

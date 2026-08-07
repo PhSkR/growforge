@@ -234,8 +234,15 @@ fn dispatch() -> Result<()> {
             print_island_report(&outcome.islands, problem.optimization.min_feature_mm);
             // After the island line because that is the order the export ran
             // them in: the clamp only ever moves vertices of the components the
-            // cull kept.
-            print_clamp_report(outcome.clamp.as_ref());
+            // cull kept. What the run was goes with it, because what a vertex
+            // resting off a boundary means is the run's answer: a defect on a
+            // part that was drawn, a flush that fell short on one that asked for
+            // its walls to reach, and nothing worth a line on one that did not.
+            print_clamp_report(
+                outcome.clamp.as_ref(),
+                problem.is_solid(),
+                problem.is_flushing(),
+            );
             // The count is the island report's, printed just above: the table
             // and the warning on it describe the same exported surface.
             print_stress_report(&outcome.stress, outcome.islands.bodies.len());

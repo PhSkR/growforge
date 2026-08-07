@@ -2800,8 +2800,9 @@ fn output_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
 /// default `off`, and the `[output] boundaries` clamp says nothing under
 /// `voxel`. Each line carries the name of the pass that wrote it, and an outcome
 /// that needs saying loudly - a trim the connectivity guard refused, a member
-/// the fill could not thicken, a vertex the clamp could not correct - is drawn
-/// in the panel's warning colour. None of it is something to find out from the
+/// the fill could not thicken, a vertex the clamp could not correct, a face the
+/// clamp left resting off the shape a solid part was drawn from - is drawn in
+/// the panel's warning colour. None of it is something to find out from the
 /// console afterwards.
 ///
 /// The three field passes are adjacent on purpose, in the order the pipeline ran
@@ -2823,13 +2824,23 @@ fn pass_notes(ui: &mut egui::Ui, editor: &Editor) {
         ("reinforce", editor.reinforce_notes()),
         ("boundaries", editor.clamp_notes()),
     ] {
-        for note in notes {
-            let mut text = egui::RichText::new(format!("{pass} {note}")).small();
-            if note.starts_with("warning") {
-                text = text.color(ui.visuals().warn_fg_color);
-            }
-            ui.label(text);
+        pass_note_lines(ui, pass, &notes);
+    }
+}
+
+/// One pass's lines, drawn by the rule above.
+///
+/// Split out of [`pass_notes`] so the rule can be laid out over the lines a
+/// report really produces: what reaches this block is a `Vec<String>` a run
+/// filled in, and a test that has to start a run to see one is a test that does
+/// not get written.
+fn pass_note_lines(ui: &mut egui::Ui, pass: &str, notes: &[String]) {
+    for note in notes {
+        let mut text = egui::RichText::new(format!("{pass} {note}")).small();
+        if note.starts_with("warning") {
+            text = text.color(ui.visuals().warn_fg_color);
         }
+        ui.label(text);
     }
 }
 
@@ -5029,6 +5040,64 @@ mod tests {
         draw(&mut editor, &mut scene);
         editor.finish();
         std::fs::remove_file(path.with_file_name("fixture.stl")).ok();
+    }
+
+    /// The clamp's adrift line in the block that draws it: under the `boundaries`
+    /// label like every other line of that pass, and - on a solid part, where a
+    /// vertex resting off a boundary is a face about to ship in the wrong place -
+    /// in the warning colour.
+    ///
+    /// Laid out from the report's own lines rather than from a run, so what is
+    /// drawn here is exactly what a run hands the panel through the link. The two
+    /// counter-checks: a design that asked for no flush hands this block nothing
+    /// about its free surfaces, and a report with nothing adrift hands it one
+    /// line and no warning.
+    #[test]
+    fn the_boundaries_block_draws_an_adrift_note_and_colours_the_solid_one() {
+        let clean = crate::mesh::clamp::ClampReport {
+            vertices_moved: 412,
+            max_displacement_mm: 0.0874,
+            gave_up: 0,
+            adrift: 0,
+            max_adrift_mm: 0.0,
+        };
+        let adrift = crate::mesh::clamp::ClampReport {
+            adrift: 37,
+            max_adrift_mm: 0.44,
+            ..clean
+        };
+
+        let solid = adrift.notes(true, false);
+        assert_eq!(solid.len(), 2, "{solid:?}");
+        assert!(
+            solid[1].starts_with("warning"),
+            "the colouring rule reads the first word: {solid:?}"
+        );
+        let flushed = adrift.notes(false, true);
+        assert_eq!(flushed.len(), 2, "{flushed:?}");
+        assert!(
+            !flushed[1].starts_with("warning"),
+            "a flush that fell short was drawn as a defect: {flushed:?}"
+        );
+        let designed = adrift.notes(false, false);
+        assert_eq!(designed.len(), 1, "{designed:?}");
+        assert!(
+            !designed.iter().any(|note| note.contains("off the surface")),
+            "an unflushed design's free surfaces reached the panel: {designed:?}"
+        );
+        let quiet = clean.notes(true, true);
+        assert_eq!(quiet.len(), 1, "{quiet:?}");
+        assert!(
+            !quiet.iter().any(|note| note.starts_with("warning")),
+            "a clean clamp drew a warning: {quiet:?}"
+        );
+
+        for notes in [solid, flushed, designed, quiet] {
+            let context = egui::Context::default();
+            let _ = context.run_ui(egui::RawInput::default(), |root| {
+                pass_note_lines(root, "boundaries", &notes);
+            });
+        }
     }
 
     /// "What is the safety factor?" - the number the editor computed after every

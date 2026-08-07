@@ -58,6 +58,21 @@
 //!   counted in [`ClampReport::gave_up`]. Nothing here loops forever and nothing
 //!   here claims a surface is clean when it is not.
 //!
+//! **And what it leaves alone is counted.** Leaving a vertex where it is, is the
+//! right answer for a free surface and the wrong one for a face that was drawn
+//! against a shape and came out short of it by more than the capture band. This
+//! pass cannot tell those two apart - the difference is the engine's, not the
+//! geometry's - so it measures rather than guesses: a vertex that comes to rest
+//! further from its nearest boundary than a clamped vertex's own offset, and
+//! nearer to it than [`constants::BOUNDARY_ADRIFT_WINDOW_VOXELS`], is counted in
+//! [`ClampReport::adrift`], with the worst distance beside it. Nothing moves
+//! because of it, and the count is taken on every run; what the run *says* about
+//! it is [`ClampReport::notes`]'s question, and depends on whether the part was
+//! drawn from shapes or designed between them. It exists because a face that
+//! shipped a fraction of a millimetre off the surface it belonged on read as a
+//! perfectly clean clamp line, and the slicer found the defect the tool had not
+//! mentioned.
+//!
 //! The pass runs **after** the island cull, so no work is spent on fragments
 //! that are about to be discarded and the culling verdicts see exactly the
 //! geometry they always did, and **before** validation, so what the validator
@@ -92,6 +107,20 @@ pub struct ClampReport {
     /// displacement cap. The exported surface still crosses a boundary at each
     /// of them.
     pub gave_up: usize,
+    /// Vertices that came to rest near an analytic boundary without sitting on
+    /// it: further out than a clamped vertex's own offset, and no further than
+    /// [`constants::BOUNDARY_ADRIFT_WINDOW_VOXELS`] from it. Measured after the
+    /// corrections above were applied, so a vertex the pass seated is not one of
+    /// these and a vertex it could not reach is.
+    ///
+    /// Nothing was done about them: this is the count of what the pass left, not
+    /// of what it failed at. Whether that is a defect, a pass falling short or
+    /// nothing at all is the run's question and not the geometry's, so the count
+    /// is always taken and not always spoken - see [`ClampReport::notes`].
+    pub adrift: usize,
+    /// How far the furthest of them rests from the boundary it is nearest to, in
+    /// millimetres. Zero when none are.
+    pub max_adrift_mm: f64,
 }
 
 impl ClampReport {
@@ -102,7 +131,35 @@ impl ClampReport {
     /// the word "warning", so a caller can print them straight or lay them out
     /// in a panel without parsing anything back out - the same contract
     /// [`crate::trim::TrimReport::notes`] keeps.
-    pub fn notes(&self) -> Vec<String> {
+    ///
+    /// `solid` is [`crate::problem::Problem::is_solid`] and `flushing` is
+    /// [`crate::problem::Problem::is_flushing`]. Between them they decide what -
+    /// and whether - this says about the vertices the pass left resting off a
+    /// surface, because what an adrift vertex *means* is the run's answer rather
+    /// than the mesh's:
+    ///
+    /// * **Drawn.** Under the solid engine the part is the shapes it was drawn
+    ///   from, so every exported surface belongs to a domain or keepout boundary
+    ///   and a vertex resting off one is a defect about to ship: a warning,
+    ///   always.
+    /// * **Designed, and flushed out to the shapes.** An engine that designs the
+    ///   material in between makes free surfaces everywhere, and one running near
+    ///   a boundary is not by itself wrong. But a run that asked for
+    ///   `[output] flush` asked for its walls to reach the shapes they rest
+    ///   against, and a vertex still short of one is that pass falling short:
+    ///   said plainly, with the key that reaches further.
+    /// * **Designed, and not flushed.** Nothing is said at all. Measured on a
+    ///   stock optimized part, roughly a third of its vertices lie within the
+    ///   window of the domain box - they are the part's own free surfaces near a
+    ///   wall, and a line that appears on every run of every design says nothing
+    ///   about the one run that is wrong. The count stays on the report for
+    ///   whatever asks it; `[output] flush` is how a user opts into being told.
+    ///
+    /// Both are taken as arguments rather than carried on the report because
+    /// every caller that composes these lines holds the problem already, and the
+    /// compiler is then what keeps the console and the editor's panel saying the
+    /// same thing.
+    pub fn notes(&self, solid: bool, flushing: bool) -> Vec<String> {
         let mut notes = Vec::new();
         if self.vertices_moved == 0 {
             notes.push(
@@ -129,6 +186,32 @@ impl ClampReport {
                 constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS
             ));
         }
+        if self.adrift > 0 {
+            let resting = if self.adrift == 1 {
+                "1 vertex rests".to_string()
+            } else {
+                format!("{} vertices rest", self.adrift)
+            };
+            match (solid, flushing) {
+                (true, _) => notes.push(format!(
+                    "warning: {resting} up to {:.4} mm off the surface they belong to: this part \
+                     is the shapes it was drawn from, so every exported surface is a domain or \
+                     keepout surface and one standing off it ships as a face in the wrong place",
+                    self.max_adrift_mm
+                )),
+                (false, true) => notes.push(format!(
+                    "[output] flush ran and {resting} up to {:.4} mm off the surface they belong \
+                     to: where that is a wall meant to meet the shape it rests against, the pass \
+                     did not reach it and a larger flush_depth_mm does; where it is a free \
+                     surface running past a boundary, it rests on nothing and nothing is wrong",
+                    self.max_adrift_mm
+                )),
+                // Every optimized part has free surfaces near its boundaries;
+                // see the note on this function for why silence is the honest
+                // answer when nothing asked for them to be brought out.
+                (false, false) => {}
+            }
+        }
         notes
     }
 }
@@ -147,8 +230,12 @@ enum Correction {
 /// Move every vertex of `mesh` onto the boundary it belongs on: the ones that
 /// violate one, and the ones resting a sampling error short of one.
 ///
-/// `voxel_mm` is the grid spacing the field was sampled on, which is what both
-/// the displacement cap and the capture band are measured in.
+/// `voxel_mm` is the grid spacing the field was sampled on, which is what the
+/// displacement cap, the capture band and the adrift window are all measured in.
+///
+/// What comes back describes both halves of the pass: what it moved, and - in
+/// [`ClampReport::adrift`] - what it left resting near a boundary without
+/// seating, measured on the positions this function leaves behind.
 pub fn resolve(mesh: &mut Mesh, boundaries: &Boundaries, voxel_mm: f64) -> ClampReport {
     let cap = constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS * voxel_mm;
     let capture = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * voxel_mm;
@@ -164,6 +251,8 @@ pub fn resolve(mesh: &mut Mesh, boundaries: &Boundaries, voxel_mm: f64) -> Clamp
         vertices_moved: 0,
         max_displacement_mm: 0.0,
         gave_up: 0,
+        adrift: 0,
+        max_adrift_mm: 0.0,
     };
     for (vertex, correction) in mesh.vertices.iter_mut().zip(corrections) {
         match correction {
@@ -178,7 +267,63 @@ pub fn resolve(mesh: &mut Mesh, boundaries: &Boundaries, voxel_mm: f64) -> Clamp
             Correction::GaveUp => report.gave_up += 1,
         }
     }
+
+    // Measured on the corrected positions, which is the surface that ships, and
+    // reduced rather than collected: a count and a maximum are the same whatever
+    // order the threads finished in.
+    let window = constants::BOUNDARY_ADRIFT_WINDOW_VOXELS * voxel_mm;
+    let (adrift, worst) = mesh
+        .vertices
+        .par_iter()
+        .filter_map(|vertex| adrift_by(*vertex, boundaries, window))
+        .map(|distance| (1usize, distance))
+        .reduce(|| (0, 0.0), |a, b| (a.0 + b.0, a.1.max(b.1)));
+    report.adrift = adrift;
+    report.max_adrift_mm = worst;
     report
+}
+
+/// How far `vertex` rests from the boundary it is nearest to, when that is far
+/// enough to be worth saying and near enough to be about that boundary at all;
+/// `None` otherwise.
+///
+/// The lower end is where a *corrected* vertex sits: the clamp lands one
+/// [`constants::BOUNDARY_CLAMP_EPS_MM`] off the surface it seats onto, and the
+/// iterated projections arrive within their own tolerance of that, so twice the
+/// offset is the width of "already on it" - the same figure the tests measure a
+/// seated vertex against. The upper end is
+/// [`constants::BOUNDARY_ADRIFT_WINDOW_VOXELS`], past which a vertex rests on
+/// nothing and belongs to no surface to be off.
+///
+/// It reads the same nearest boundary [`seated`] does, from the same function,
+/// so what is counted here is exactly what that decided not to seat.
+fn adrift_by(vertex: Vec3, boundaries: &Boundaries, window: f64) -> Option<f64> {
+    let (distance, _) = nearest_boundary(vertex, boundaries)?;
+    let seat = 2.0 * constants::BOUNDARY_CLAMP_EPS_MM;
+    (distance.is_finite() && distance > seat && distance <= window).then_some(distance)
+}
+
+/// The analytic boundary `p` is nearest to, whichever side of it `p` sits on: how
+/// far away it is, and which surface it is - a keepout member, or `None` for the
+/// domain as a whole, which is a composite rather than a member.
+///
+/// `None` when the caller described no boundary at all, which is a mesh held to
+/// nothing.
+fn nearest_boundary(p: Vec3, boundaries: &Boundaries) -> Option<(f64, Option<&Shape>)> {
+    let mut nearest: Option<(f64, Option<&Shape>)> = None;
+    for shape in boundaries.keepout.shapes() {
+        let distance = shape.signed_distance(p).abs();
+        if nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, Some(shape)));
+        }
+    }
+    if !boundaries.domain.is_empty() {
+        let distance = boundaries.domain.signed_distance(p).abs();
+        if nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, None));
+        }
+    }
+    nearest
 }
 
 /// True when `p` is inside the domain and outside every keepout.
@@ -240,21 +385,10 @@ fn corrected(vertex: Vec3, boundaries: &Boundaries, cap: f64, capture: f64) -> C
 /// crosses a boundary", which is never true of these.
 fn seated(vertex: Vec3, boundaries: &Boundaries, cap: f64, capture: f64) -> Correction {
     // The boundary this vertex is nearest to, whichever side of it the vertex
-    // sits on: a keepout member, or the domain as a whole.
-    let mut nearest: Option<(f64, Option<&Shape>)> = None;
-    for shape in boundaries.keepout.shapes() {
-        let distance = shape.signed_distance(vertex).abs();
-        if nearest.is_none_or(|(best, _)| distance < best) {
-            nearest = Some((distance, Some(shape)));
-        }
-    }
-    if !boundaries.domain.is_empty() {
-        let distance = boundaries.domain.signed_distance(vertex).abs();
-        if nearest.is_none_or(|(best, _)| distance < best) {
-            nearest = Some((distance, None));
-        }
-    }
-    let Some((distance, which)) = nearest else {
+    // sits on: a keepout member, or the domain as a whole. The same selection
+    // [`adrift_by`] reads, so that what is counted as resting off a surface is
+    // measured against the surface this would have seated it onto.
+    let Some((distance, which)) = nearest_boundary(vertex, boundaries) else {
         return Correction::Legal;
     };
     // Too far away to be a sampling artefact, or already on the surface: the
@@ -510,27 +644,163 @@ mod tests {
     }
 
     /// A point already outside a shape is never touched, whichever shape it is.
+    ///
+    /// Past the adrift window as well as past the capture band, so this is the
+    /// vertex the pass has no business with at all: nothing moved, and nothing
+    /// said, under either engine.
     #[test]
     fn a_vertex_that_violates_nothing_is_left_alone() {
         let shape = Shape::Sphere {
             center: [0.0; 3],
             radius: 4.0,
         };
-        // Well clear of the capture band as well as of the shape: what this
-        // asserts is the vertex the pass has no business with at all.
-        let outside = [19.0, 1.0, -2.0];
+        let window = constants::BOUNDARY_ADRIFT_WINDOW_VOXELS * VOXEL_MM;
+        let outside = [4.0 + 2.0 * window, 1.0, -2.0];
         let mut mesh = loose(vec![outside]);
         let report = resolve(&mut mesh, &forbidden(vec![shape]), VOXEL_MM);
         assert_eq!(report.vertices_moved, 0);
         assert_eq!(report.gave_up, 0);
         assert_eq!(report.max_displacement_mm, 0.0);
+        assert_eq!(report.adrift, 0, "{report:?}");
+        assert_eq!(report.max_adrift_mm, 0.0, "{report:?}");
         assert_eq!(mesh.vertices[0], outside);
+        for (solid, flushing) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                report.notes(solid, flushing),
+                vec![
+                    "every exported vertex was already inside the domain and clear of the keepouts"
+                        .to_string()
+                ]
+            );
+        }
+    }
+
+    /// What the pass leaves alone, it now counts: a vertex resting a whole voxel
+    /// off the surface it is nearest to is past the capture band, so the clamp
+    /// does not touch it, and inside the adrift window, so the report says how
+    /// many and how far.
+    ///
+    /// This is the reading the incident that asked for it needed. A part shipped
+    /// with its bottom face resting 0.88 of a voxel above the plate; the clamp
+    /// was right not to move it - that far out is not a sampling artefact - and
+    /// the run report said nothing whatever about it.
+    #[test]
+    fn a_vertex_resting_off_a_surface_is_counted_and_measured() {
+        let sphere = Shape::Sphere {
+            center: [0.0; 3],
+            radius: 20.0,
+        };
+        let boundaries = forbidden(vec![sphere]);
+        let capture = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * VOXEL_MM;
+        let window = constants::BOUNDARY_ADRIFT_WINDOW_VOXELS * VOXEL_MM;
+
+        // One voxel out: twice the capture band, a tenth of the way through the
+        // window, and exactly where it started when the pass is done.
+        let off = [20.0 + VOXEL_MM, 0.0, 0.0];
+        let mut mesh = loose(vec![off]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.vertices_moved, 0, "{report:?}");
+        assert_eq!(report.gave_up, 0, "{report:?}");
+        assert_eq!(mesh.vertices[0], off, "the measurement moved a vertex");
+        assert_eq!(report.adrift, 1, "{report:?}");
+        assert!(
+            (report.max_adrift_mm - VOXEL_MM).abs() < 1e-9,
+            "measured {} mm for a vertex one {VOXEL_MM} mm voxel out",
+            report.max_adrift_mm
+        );
+
+        // A seated vertex is on the surface, so it is not off it: the same
+        // fixture the dimple test uses, counted after the seat rather than
+        // before it.
+        let mut mesh = loose(vec![[20.0 + 0.4 * capture, 0.0, 0.0]]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.vertices_moved, 1, "{report:?}");
+        assert_eq!(report.adrift, 0, "{report:?}");
+        assert_eq!(report.max_adrift_mm, 0.0, "{report:?}");
+
+        // And the worst of several is what the report carries, over both kinds
+        // of boundary: the count is every one of them.
+        let mut mesh = loose(vec![
+            [20.0 + VOXEL_MM, 0.0, 0.0],
+            [0.0, 20.0 + 0.75 * window, 0.0],
+            [0.0, 0.0, 20.0 + 2.0 * window],
+        ]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.adrift, 2, "{report:?}");
+        assert!(
+            (report.max_adrift_mm - 0.75 * window).abs() < 1e-9,
+            "{report:?}"
+        );
+
+        // What the run says about it, from the report the pass really produced,
+        // in each of the three things a run can be. Loud on a part that is its
+        // shapes, whether or not it was flushed:
+        for flushing in [false, true] {
+            let loud = report.notes(true, flushing);
+            assert_eq!(loud.len(), 2, "{loud:?}");
+            assert!(
+                loud[1].starts_with("warning: 2 vertices rest up to"),
+                "{loud:?}"
+            );
+        }
+        // A designed part whose walls were asked to reach the shapes: the pass
+        // fell short, said plainly and with the key that reaches further.
+        let flushed = report.notes(false, true);
+        assert_eq!(flushed.len(), 2, "{flushed:?}");
+        assert!(!flushed[1].starts_with("warning"), "{flushed:?}");
+        assert!(
+            flushed[1].starts_with("[output] flush ran and"),
+            "{flushed:?}"
+        );
+        assert!(flushed[1].contains("flush_depth_mm"), "{flushed:?}");
+        // And a designed part that asked for nothing: silence. Every optimized
+        // part has free surfaces near its boundaries, and a line on every run
+        // is a line nobody reads on the run that matters.
+        let quiet = report.notes(false, false);
+        assert_eq!(quiet.len(), 1, "{quiet:?}");
+        assert!(
+            !quiet.iter().any(|note| note.contains("off the surface")),
+            "an unflushed design was told about its free surfaces: {quiet:?}"
+        );
+        // The count itself is taken either way: what changes is what is said.
+        assert_eq!(report.adrift, 2, "{report:?}");
+    }
+
+    /// Both ends of the window, on the measurement itself.
+    ///
+    /// The lower one is the width of "already on the surface": a clamped vertex
+    /// is left one offset clear of what it was seated onto, so nothing inside
+    /// twice that is off anything. The upper one is where a surface stops
+    /// belonging to a boundary at all - past it lies an optimizer's free surface
+    /// through the middle of the domain, which rests on nothing and is nobody's
+    /// defect.
+    #[test]
+    fn the_adrift_window_is_bounded_at_both_ends() {
+        let sphere = Shape::Sphere {
+            center: [0.0; 3],
+            radius: 20.0,
+        };
+        let boundaries = forbidden(vec![sphere]);
+        let window = constants::BOUNDARY_ADRIFT_WINDOW_VOXELS * VOXEL_MM;
+        let seat = 2.0 * constants::BOUNDARY_CLAMP_EPS_MM;
+        let out = |distance: f64| [20.0 + distance, 0.0, 0.0];
+
+        // On the surface, and within the offset a correction lands on: nothing
+        // to say about either.
+        assert_eq!(adrift_by(out(0.0), &boundaries, window), None);
+        assert_eq!(adrift_by(out(0.5 * seat), &boundaries, window), None);
+        // Clear of it: measured, however small the gap.
+        let just_off = adrift_by(out(10.0 * seat), &boundaries, window).expect("counted");
+        assert!((just_off - 10.0 * seat).abs() < 1e-12, "{just_off}");
+        // The far end is inclusive, and a hair past it is nothing.
+        let edge = adrift_by(out(window), &boundaries, window).expect("counted");
+        assert!((edge - window).abs() < 1e-12, "{edge}");
+        assert_eq!(adrift_by(out(window + 1e-6), &boundaries, window), None);
+
+        // A mesh held to nothing rests off nothing.
         assert_eq!(
-            report.notes(),
-            vec![
-                "every exported vertex was already inside the domain and clear of the keepouts"
-                    .to_string()
-            ]
+            adrift_by(out(0.5 * window), &Boundaries::default(), window),
+            None
         );
     }
 
@@ -583,12 +853,14 @@ mod tests {
 
         // Past the band nothing is touched: a free surface running through the
         // middle of the domain is not a sampling artefact, and the smoothing
-        // that shaped it is left alone.
+        // that shaped it is left alone. Left alone and counted, which is the
+        // whole of what the adrift reading adds: the geometry is the same.
         let far = [20.0 + 2.0 * band, 0.0, 0.0];
         let mut mesh = loose(vec![far]);
         let report = resolve(&mut mesh, &forbidden(vec![sphere]), VOXEL_MM);
         assert_eq!(report.vertices_moved, 0, "{report:?}");
         assert_eq!(mesh.vertices[0], far);
+        assert_eq!(report.adrift, 1, "{report:?}");
     }
 
     /// The ellipsoid has no closed form, so its projection is iterated - and it
@@ -906,9 +1178,24 @@ mod tests {
         assert_eq!(report.vertices_moved, 0);
         assert_eq!(report.gave_up, 1);
         assert_eq!(mesh.vertices[0], [3.0, 4.0, 5.0], "the vertex was moved");
-        let notes = report.notes();
-        assert_eq!(notes.len(), 2, "{notes:?}");
+        let notes = report.notes(false, true);
+        assert_eq!(notes.len(), 3, "{notes:?}");
         assert!(notes[1].starts_with("warning: 1 vertex was"), "{notes:?}");
+        // And the same vertex in the adrift count, which is not a double
+        // report of one thing but two statements about it: it crosses the
+        // boundary, and it rests 2 mm from the surface it belongs on. The
+        // count is positional and asks nothing about how a vertex got there.
+        assert_eq!(report.adrift, 1, "{report:?}");
+        assert!((report.max_adrift_mm - 2.0).abs() < 1e-9, "{report:?}");
+        assert!(notes[2].contains("1 vertex rests"), "{notes:?}");
+        // The give-up line is the pass's own and is said whatever the run was;
+        // only the adrift line is the one a design with no flush is spared.
+        let unflushed = report.notes(false, false);
+        assert_eq!(unflushed.len(), 2, "{unflushed:?}");
+        assert!(
+            unflushed[1].starts_with("warning: 1 vertex was"),
+            "{unflushed:?}"
+        );
     }
 
     /// The sanity cap: a vertex a whole voxel and more inside a keepout is not
@@ -975,7 +1262,14 @@ mod tests {
             );
         }
         assert!(report.max_displacement_mm > 0.0);
-        assert!(report.notes()[0].starts_with("clamped 2 vertices"));
+        assert!(report.notes(false, true)[0].starts_with("clamped 2 vertices"));
+        // Both were pulled onto the surface, so neither rests off one and the
+        // clamp's line is the only line, whatever the run was.
+        assert_eq!(report.adrift, 0, "{report:?}");
+        for (solid, flushing) in [(false, false), (false, true), (true, false), (true, true)] {
+            let notes = report.notes(solid, flushing);
+            assert_eq!(notes.len(), 1, "{notes:?}");
+        }
     }
 
     /// The descent underneath that: it arrives on the level set it was asked

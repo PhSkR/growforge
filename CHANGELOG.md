@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-08-07 - 0.36.2 - The clamp report learns to see a floated face
+
+A user's print failed on a part whose bottom face floated 0.44 mm above the
+plate. Every code path at HEAD was hunted and exonerated - the command line, the
+editor's full run and its generate-stl all produce a flush part - but the hunt
+found something worse than the bug it was looking for: had any of them produced
+that face, **the run report would have read perfectly clean**. The boundary
+clamp seats a vertex resting up to half a voxel short of a surface and silently
+leaves everything further out alone, counting nothing, so a face 0.88 of a voxel
+off the shape it was drawn against passed as an ordinary free surface. The
+slicer and the printer found the defect. The tool has to find it first.
+
+- **The clamp counts what it did not seat.** After the corrections are applied,
+  every vertex whose distance to its nearest analytic boundary - the same
+  nearest-boundary selection the seat itself makes, now one shared function - is
+  more than twice the offset a correction lands on and no more than
+  `BOUNDARY_ADRIFT_WINDOW_VOXELS` (two voxels, four times the capture band and
+  the flush pass's own depth) is counted in `ClampReport::adrift`, with the worst
+  distance beside it. **No geometry changed**: nothing is moved that was not
+  moved before, and a run's STL is byte for byte the file 0.36.1 wrote.
+- **What it means is the run's answer, so what is said about it is too.** Under
+  `engine = "solid"` the part *is* the shapes it was drawn from, every exported
+  surface belongs to a domain or keepout boundary, and a vertex resting off one
+  is a face about to ship in the wrong place: the line opens with `warning` and
+  is drawn in the panel's warning colour. Under an optimizing or growing engine
+  most of the surface belongs to nothing, and a free surface running near a
+  boundary is what the engine decided - so the count is spoken only when
+  `[output] flush` was asked for, where a vertex still short of a shape is that
+  pass falling short, and the line says so plainly and names `flush_depth_mm` as
+  what reaches further. With `flush = "off"` **nothing is said at all**: measured
+  on the shipped cantilever, 1749 of 5956 exported vertices lie within the window
+  of the part's own domain box, and a line on every run of every design says
+  nothing about the one run that is wrong. The count stays on the report either
+  way. `ClampReport::notes` takes both facts as arguments - `Problem::is_solid`
+  and the new `Problem::is_flushing` - so the compiler is what keeps the console
+  and the editor's panel saying the same thing.
+- **Silent when there is nothing to say.** A report with nothing adrift produces
+  no line at all, in any of the four runs it can belong to, which is asserted
+  directly rather than assumed.
+- Tests: the counted vertex, the vertex past the window, the seated vertex and
+  both ends of the window arithmetic, in the clamp module; all three voices, the
+  unflushed silence, the singular wording and the absence counter-check, in the
+  report module and again through the panel's own drawing rule. The silence
+  assertions were counter-verified by restoring the unconditional line, which
+  fails four of them. The solid engine's plug fixture keeps asserting that
+  nothing is adrift, now reading the pass's count instead of a helper of its own
+  - one definition, which cannot drift from the production one.
+- Version 0.36.2.
+
 ## 2026-08-07 - 0.36.1 - Two editor run-completion defects
 
 Both reported by the user, on a session of the solid engine: "generate stl"

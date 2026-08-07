@@ -828,11 +828,18 @@ pub fn print_island_report(report: &IslandReport, min_feature_mm: f64) {
 /// A vertex the pass could not correct prints as a warning. The surface still
 /// crosses a boundary there, which is the one outcome of this pass that a user
 /// has to act on rather than read.
-pub fn print_clamp_report(report: Option<&ClampReport>) {
+///
+/// `solid` is [`Problem::is_solid`] and `flushing` is [`Problem::is_flushing`];
+/// between them they decide whether the pass's other finding - vertices resting
+/// near a boundary without sitting on it - prints as a warning, as a line about
+/// the flush pass falling short, or not at all. See [`ClampReport::notes`]. They
+/// are passed rather than read off a problem here because this printer is handed
+/// a report alone, as every printer in this module is.
+pub fn print_clamp_report(report: Option<&ClampReport>, solid: bool, flushing: bool) {
     let Some(report) = report else {
         return;
     };
-    for (index, note) in report.notes().iter().enumerate() {
+    for (index, note) in report.notes(solid, flushing).iter().enumerate() {
         let label = if index == 0 { "boundaries" } else { "" };
         println!("{label:<14} {note}");
     }
@@ -1362,24 +1369,27 @@ mod tests {
     /// deliberately did not, at a place the user has to know about.
     #[test]
     fn the_clamp_report_prints_nothing_when_the_pass_never_ran() {
-        print_clamp_report(None);
+        print_clamp_report(None, false, false);
 
         let quiet = ClampReport {
             vertices_moved: 0,
             max_displacement_mm: 0.0,
             gave_up: 0,
+            adrift: 0,
+            max_adrift_mm: 0.0,
         };
-        assert_eq!(quiet.notes().len(), 1);
-        print_clamp_report(Some(&quiet));
+        assert_eq!(quiet.notes(false, false).len(), 1);
+        print_clamp_report(Some(&quiet), false, false);
 
         let moved = ClampReport {
             vertices_moved: 412,
             max_displacement_mm: 0.4213,
-            gave_up: 0,
+            ..quiet
         };
-        assert!(moved.notes()[0].contains("412"), "{:?}", moved.notes());
-        assert!(moved.notes()[0].contains("0.4213"), "{:?}", moved.notes());
-        print_clamp_report(Some(&moved));
+        let notes = moved.notes(false, false);
+        assert!(notes[0].contains("412"), "{notes:?}");
+        assert!(notes[0].contains("0.4213"), "{notes:?}");
+        print_clamp_report(Some(&moved), false, false);
 
         // The one line that has to be loud, in the wording every report in
         // growforge marks a warning with.
@@ -1387,14 +1397,15 @@ mod tests {
             vertices_moved: 3,
             max_displacement_mm: 0.1,
             gave_up: 7,
+            ..quiet
         };
-        let notes = refused.notes();
+        let notes = refused.notes(false, false);
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(
             notes[1].starts_with("warning: 7 vertices were"),
             "{notes:?}"
         );
-        print_clamp_report(Some(&refused));
+        print_clamp_report(Some(&refused), false, false);
 
         // One of them reads as one of them, rather than as "1 vertices".
         let single = ClampReport {
@@ -1402,11 +1413,109 @@ mod tests {
             ..refused
         };
         assert!(
-            single.notes()[1].starts_with("warning: 1 vertex was"),
+            single.notes(false, false)[1].starts_with("warning: 1 vertex was"),
             "{:?}",
-            single.notes()
+            single.notes(false, false)
         );
-        print_clamp_report(Some(&single));
+        print_clamp_report(Some(&single), false, false);
+    }
+
+    /// The vertices the pass left near a boundary without seating: always
+    /// counted, and said - or not said - according to what the run was.
+    ///
+    /// A solid part *is* the shapes it was drawn from, so a vertex resting off
+    /// one is a face about to ship in the wrong place and the line opens with the
+    /// word the panel colours, flush or no flush. An optimized or grown part has
+    /// free surfaces everywhere, one of which may legitimately pass near a
+    /// boundary: with `[output] flush` asked for, the same count is the shortfall
+    /// of that pass and is stated plainly with the key that reaches further;
+    /// without it, **nothing is said at all** - about a third of a stock
+    /// optimized part's vertices are within the window of its own domain box,
+    /// and a line on every run is a line nobody reads on the run that is wrong.
+    ///
+    /// Two counter-checks the whole thing rests on, asserted rather than assumed:
+    /// the unflushed design is silent, and a report with nothing adrift says
+    /// nothing new in any of the four runs it can belong to.
+    #[test]
+    fn an_adrift_vertex_is_a_warning_when_drawn_a_note_when_flushed_and_silence_otherwise() {
+        let clean = ClampReport {
+            vertices_moved: 412,
+            max_displacement_mm: 0.0874,
+            gave_up: 0,
+            adrift: 0,
+            max_adrift_mm: 0.0,
+        };
+        for (solid, flushing) in [(false, false), (false, true), (true, false), (true, true)] {
+            let notes = clean.notes(solid, flushing);
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(
+                !notes.iter().any(|note| note.contains("off the surface")),
+                "a clean clamp said something about adrift vertices: {notes:?}"
+            );
+            print_clamp_report(Some(&clean), solid, flushing);
+        }
+
+        let adrift = ClampReport {
+            adrift: 37,
+            max_adrift_mm: 0.4400,
+            ..clean
+        };
+
+        // Drawn: a warning either way, because the surface belongs to a shape
+        // whether or not a fill pass was asked to reach it.
+        for flushing in [false, true] {
+            let loud = adrift.notes(true, flushing);
+            assert_eq!(loud.len(), 2, "{loud:?}");
+            assert!(
+                loud[1].starts_with("warning: 37 vertices rest up to 0.4400 mm off the surface"),
+                "{loud:?}"
+            );
+            print_clamp_report(Some(&adrift), true, flushing);
+        }
+
+        // Designed and flushed: the pass that was asked for fell short, said
+        // plainly and naming what reaches further.
+        let flushed = adrift.notes(false, true);
+        assert_eq!(flushed.len(), 2, "{flushed:?}");
+        assert!(!flushed[1].starts_with("warning"), "{flushed:?}");
+        assert!(
+            flushed[1]
+                .starts_with("[output] flush ran and 37 vertices rest up to 0.4400 mm off the"),
+            "{flushed:?}"
+        );
+        assert!(
+            flushed[1].contains("flush_depth_mm"),
+            "the remedy is not named: {flushed:?}"
+        );
+        print_clamp_report(Some(&adrift), false, true);
+
+        // Designed and not flushed: nothing at all, which is the whole point of
+        // the rule. Asserted as an exact absence rather than as a length alone.
+        let designed = adrift.notes(false, false);
+        assert_eq!(designed.len(), 1, "{designed:?}");
+        assert!(
+            !designed
+                .iter()
+                .any(|note| note.contains("off the surface") || note.contains("flush")),
+            "a design that asked for no flush was told about its free surfaces: {designed:?}"
+        );
+        print_clamp_report(Some(&adrift), false, false);
+
+        // One of them reads as one of them here too.
+        let single = ClampReport {
+            adrift: 1,
+            ..adrift
+        };
+        assert!(
+            single.notes(true, false)[1].starts_with("warning: 1 vertex rests"),
+            "{:?}",
+            single.notes(true, false)
+        );
+        assert!(
+            single.notes(false, true)[1].contains("1 vertex rests"),
+            "{:?}",
+            single.notes(false, true)
+        );
     }
 
     /// A stress table of one load case with a safety factor, for the block that

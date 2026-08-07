@@ -2756,11 +2756,8 @@ fn a_bore_is_exported_as_the_cylinder_that_was_asked_for() {
         report.max_displacement_mm <= exact.grid.h,
         "{report:?} moved a vertex further than a voxel"
     );
-    assert!(
-        report.notes()[0].starts_with("clamped"),
-        "{:?}",
-        report.notes()
-    );
+    let notes = report.notes(exact.is_solid(), exact.is_flushing());
+    assert!(notes[0].starts_with("clamped"), "{notes:?}");
 
     // Both files are parts: closed, manifold, one piece, and on disk.
     for (mesh_out, islands, stats, path) in [
@@ -3011,25 +3008,11 @@ fn the_solid_engine_exports_the_domain_it_was_given() {
     // worst vertex sat 0.7018 mm - 0.47 voxels - inside the wall.
     //
     // Every vertex of this part rests on a boundary, because the part *is* the
-    // domain, so the claim is made over all of them rather than over a band.
-    let capture = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * problem.grid.h;
-    let (mut off_the_surface, mut adrift) = (0.0f64, 0usize);
-    for vertex in &outcome.mesh.vertices {
-        let distance = domain.signed_distance(*vertex).abs();
-        if distance > capture {
-            // Further out than a sampling artefact can be: the clamp is right
-            // not to touch it, and this fixture has none.
-            adrift += 1;
-            continue;
-        }
-        off_the_surface = off_the_surface.max(distance);
-    }
-    assert_eq!(
-        adrift,
-        0,
-        "{adrift} of {} vertices sit further than the capture band ({capture} mm) from the domain          they were drawn from",
-        outcome.mesh.vertices.len()
-    );
+    // domain, so the claim is made over all of them rather than over a band: the
+    // furthest any vertex sits from the tree is the offset a correction lands on.
+    let off_the_surface = outcome.mesh.vertices.iter().fold(0.0f64, |worst, v| {
+        worst.max(domain.signed_distance(*v).abs())
+    });
     assert!(
         off_the_surface <= 2.0 * eps,
         "the exported surface dimples {off_the_surface} mm inside the domain it was drawn from"
@@ -3041,6 +3024,28 @@ fn the_solid_engine_exports_the_domain_it_was_given() {
     assert!(
         report.max_displacement_mm <= problem.grid.h,
         "{report:?} moved a vertex further than a voxel"
+    );
+    // And the same claim as the pass itself makes it. This test used to count
+    // the vertices resting off the surface with a helper of its own; the clamp
+    // now counts them - it has to, because a run that ships one has to say so -
+    // and there is one definition of the count rather than two that can drift.
+    // On this part every surface is a domain surface, so the answer is none.
+    assert_eq!(
+        report.adrift,
+        0,
+        "{} of {} vertices rest off the domain they were drawn from, the worst by {} mm",
+        report.adrift,
+        outcome.mesh.vertices.len(),
+        report.max_adrift_mm
+    );
+    assert_eq!(report.max_adrift_mm, 0.0, "{report:?}");
+    // Which is the whole of what a clean solid run says: no warning line, and
+    // nothing about anything adrift.
+    let notes = report.notes(problem.is_solid(), problem.is_flushing());
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        !notes.iter().any(|note| note.starts_with("warning")),
+        "{notes:?}"
     );
 
     // And the vertices that sit on a surface sit on it exactly, on each of the

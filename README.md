@@ -1203,6 +1203,51 @@ culling verdicts see the geometry they always did - and **before** validation, s
 the positions that are validated are the positions that are written; a clamp that
 collapsed a triangle fails the export rather than shipping one.
 
+### What it leaves alone, it counts
+
+Leaving a vertex further out than the capture band where it is, is the right
+answer for a free surface and the wrong one for a face that was drawn against a
+shape and came out short of it. Until 0.36.2 the difference was invisible: a
+user's part shipped with its bottom face resting 0.44 mm - 0.88 of a voxel -
+above the plate, the clamp was right not to move it, and the run report read
+completely clean. The slicer found the defect.
+
+So the pass measures what it did not seat. Every vertex that comes to rest
+further from its nearest boundary than the offset a correction lands on, and no
+further than `BOUNDARY_ADRIFT_WINDOW_VOXELS` (two voxels - four times the capture
+band, and the flush pass's own depth), is counted, with the worst distance beside
+it. **Nothing moves because of it**: this is a reading of the surface that is
+about to ship, and the file is the same file.
+
+What that reading *means* is the run's answer, not the mesh's, so what the report
+says about it depends on what the run was. **A part that was drawn** - `engine =
+"solid"` - has every exported surface belonging to a boundary, so a vertex
+resting off one is a face about to ship in the wrong place:
+
+```text
+boundaries     warning: 37 vertices rest up to 0.4400 mm off the surface they belong to: this part is the shapes it was drawn from, so every exported surface is a domain or keepout surface and one standing off it ships as a face in the wrong place
+```
+
+on the console, and in the warning colour in the editor's panel.
+
+**A part that was designed** - by an optimizing or growing engine - has free
+surfaces everywhere, and one running near a boundary is what the engine decided.
+Counting those as a defect would be noise: on a stock cantilever roughly a third
+of the exported vertices lie within the window of the part's own domain box, and
+a line that appears on every run says nothing about the one run that is wrong. So
+the count is spoken only when the configuration asked for those walls to reach
+their shapes, with `flush = "walls"`, where a vertex still short of one is that
+pass falling short:
+
+```text
+boundaries     [output] flush ran and 37 vertices rest up to 0.4400 mm off the surface they belong to: where that is a wall meant to meet the shape it rests against, the pass did not reach it and a larger flush_depth_mm does; where it is a free surface running past a boundary, it rests on nothing and nothing is wrong
+```
+
+Plainly, with no warning: it is a number to act on or to accept. With
+`flush = "off"` - the default - nothing is said at all; the count is still taken
+and still on the report for anything that asks it. A run with nothing adrift says
+nothing extra in any case.
+
 `boundaries = "voxel"` exports the isosurface exactly as the field produced it.
 That is what growforge did before 0.22.0, and it is the setting for reproducing a
 file written by an older version - **the default changes the STL of an existing
@@ -1646,6 +1691,12 @@ with its outermost layer under the iso level - the exported floor stands
 **1.6214 mm** off the face it was drawn against, 0.81 of a voxel and past the
 1.0 mm the clamp captures by itself; with `flush = "walls"` every vertex of it
 is on that face to 1.0e-5 mm, which is the clamp's own offset.
+
+Asking for the pass is also what asks to be told about what it did not reach: the
+boundary clamp counts the vertices left resting off the surface they belong to on
+every run, and on an optimized part it [says so](#what-it-leaves-alone-it-counts)
+only under `flush = "walls"`, where the number means the fill fell short and
+`flush_depth_mm` is what reaches further.
 
 ## Solver backend
 

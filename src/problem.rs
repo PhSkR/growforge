@@ -7,7 +7,8 @@ use anyhow::{Result, bail};
 use rayon::prelude::*;
 
 use crate::config::{
-    Axis, Config, GrowthParams, LoadSpec, Material, OptimizationParams, OutputParams, SolverParams,
+    Axis, Config, FlushPolicy, GrowthParams, LoadSpec, Material, OptimizationParams, OutputParams,
+    SolverParams,
 };
 use crate::constants;
 use crate::geometry::{self, Boundaries, Shape, Vec3};
@@ -778,6 +779,16 @@ impl Problem {
     /// the same way, through [`Problem::growth`] being resolved.
     pub fn is_solid(&self) -> bool {
         self.engine == constants::SOLID_ENGINE
+    }
+
+    /// True when `[output] flush` will run over the finished field.
+    ///
+    /// The same test [`crate::flush::resolve`] gates itself on, named here
+    /// because a report has to key on it too: the boundary clamp's count of the
+    /// vertices resting short of a surface is a shortfall of *this* pass when it
+    /// was asked for, and nothing worth saying when it was not.
+    pub fn is_flushing(&self) -> bool {
+        self.output.flush != FlushPolicy::Off
     }
 
     /// True when any load case carries self weight.

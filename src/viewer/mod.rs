@@ -374,10 +374,14 @@ pub(crate) fn finish(
             .map(crate::reinforce::ReinforceReport::notes)
             .unwrap_or_default(),
     );
+    // What the run was goes into the clamp's lines for the reason the console's
+    // copy of them does: whether a vertex resting off a boundary is a defect, a
+    // flush that fell short or nothing to say is the run's answer, and the panel
+    // has to be told the same one the terminal is.
     link.set_clamp_notes(
         clamp
             .as_ref()
-            .map(crate::mesh::clamp::ClampReport::notes)
+            .map(|report| report.notes(problem.is_solid(), problem.is_flushing()))
             .unwrap_or_default(),
     );
     // The analysis `complete` hands back, which after a trim is the second one:
@@ -913,7 +917,10 @@ vector = [0.0, 0.0, 30.0]
         )
         .expect("the run must finish")
         .expect("nothing asked it to stop");
-        let notes = outcome.clamp.expect("a clamp report").notes();
+        let notes = outcome
+            .clamp
+            .expect("a clamp report")
+            .notes(problem.is_solid(), problem.is_flushing());
         assert!(!notes.is_empty(), "the pass ran and said nothing");
         assert_eq!(
             link.progress().clamp,
