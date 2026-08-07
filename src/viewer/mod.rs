@@ -199,6 +199,7 @@ pub(crate) fn run_worker(
         solids,
         stress,
         trim,
+        flush,
         reinforce,
         mesh,
         stats,
@@ -217,6 +218,7 @@ pub(crate) fn run_worker(
         solids,
         stress,
         trim,
+        flush,
         reinforce,
         mesh,
         stats,
@@ -245,6 +247,10 @@ pub(crate) struct Finished {
     /// `None` under the default `trim = "off"`. Its note lines are also on the
     /// link, which is what puts them in the editor's panel.
     pub trim: Option<crate::trim::TrimReport>,
+    /// What the `[output] flush` pass filled out to the surfaces the walls rest
+    /// on; `None` under the default `flush = "off"`. Its note lines are also on
+    /// the link, which is what puts them in the editor's panel.
+    pub flush: Option<crate::flush::FlushReport>,
     /// What the `[output] reinforce` pass thickened, and what it could not;
     /// `None` under the default `reinforce = "off"`. Its note lines are also on
     /// the link, which is what puts them in the editor's panel.
@@ -259,8 +265,8 @@ pub(crate) struct Finished {
     /// `boundaries = "voxel"`. Its note lines are also on the link, which is
     /// what puts them in the editor's panel.
     pub clamp: Option<crate::mesh::clamp::ClampReport>,
-    /// Wall clock seconds spent analysing, trimming, reinforcing and analysing
-    /// again.
+    /// Wall clock seconds spent analysing, trimming, flushing, reinforcing and
+    /// analysing again.
     pub analysis_s: f64,
     /// Wall clock seconds spent extracting, smoothing and writing the mesh.
     pub export_s: f64,
@@ -276,18 +282,18 @@ pub(crate) struct Finished {
 /// deliverables: the same cavity policy applied to the same field, the same
 /// culled mesh in the window and in the file, the same stress layer beside it.
 ///
-/// `densities` is resolved in place by the cavity policy and by the trim and
-/// reinforcement passes, so what comes back describes the field the caller now
-/// holds. `stop` is asked at every boundary a run asks it at - on the way in,
+/// `densities` is resolved in place by the cavity policy and by the trim, flush
+/// and reinforcement passes, so what comes back describes the field the caller
+/// now holds. `stop` is asked at every boundary a run asks it at - on the way in,
 /// between the analysis and the re-analysis those passes force, and immediately
 /// before the write - which is what keeps "nothing that was asked to stop ever
 /// exports" true of both callers; `Ok(None)` is that answer.
 ///
 /// The sequence itself is [`crate::complete`]'s, shared with the command line.
 /// What is this function's own is the window: the status line at each stage, the
-/// final frame with its stress layer, the note lines of the two field passes,
-/// and the stress summary - all of which reach the editor's panel through the
-/// link and the console through the outcome.
+/// final frame with its stress layer, the note lines of the field passes, and
+/// the stress summary - all of which reach the editor's panel through the link
+/// and the console through the outcome.
 pub(crate) fn finish(
     problem: &Problem,
     densities: &mut [f64],
@@ -307,6 +313,7 @@ pub(crate) fn finish(
         solids,
         stress,
         trim,
+        flush,
         reinforce,
         mesh,
         stats,
@@ -329,6 +336,12 @@ pub(crate) fn finish(
     link.set_trim_notes(
         trim.as_ref()
             .map(crate::trim::TrimReport::notes)
+            .unwrap_or_default(),
+    );
+    link.set_flush_notes(
+        flush
+            .as_ref()
+            .map(crate::flush::FlushReport::notes)
             .unwrap_or_default(),
     );
     link.set_reinforce_notes(
@@ -363,6 +376,7 @@ pub(crate) fn finish(
         solids,
         stress,
         trim,
+        flush,
         reinforce,
         mesh,
         stats,
@@ -382,9 +396,9 @@ struct ViewStages<'a> {
 
 impl crate::Stages for ViewStages<'_> {
     fn analysing(&self) {
-        // Shown again for the re-analysis the trim and reinforcement passes
-        // force: it is the same work, and a window that named it something else
-        // would be inventing a stage the pipeline does not have.
+        // Shown again for the re-analysis the trim, flush and reinforcement
+        // passes force: it is the same work, and a window that named it
+        // something else would be inventing a stage the pipeline does not have.
         self.link.set_status(RunStatus::Analysing);
     }
 

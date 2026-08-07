@@ -278,6 +278,26 @@ impl Problem {
                 constants::GROWTH_MIN_STEP_VOXELS
             );
         }
+        // How deep a flush may sensibly reach is measured in voxels - the
+        // artefact it corrects is a sampling one - and the voxel size is only
+        // known here, so the range is checked here rather than in the config,
+        // exactly as `[growth] step_mm`'s is. That the key is a length at all
+        // was settled with the rest of the `[output]` table.
+        let flush_depth_mm = crate::flush::depth_mm(h, output.flush_depth_mm);
+        let flush_voxels = flush_depth_mm / h;
+        if !(flush_voxels > constants::FLUSH_DEPTH_MIN_VOXELS
+            && flush_voxels < constants::FLUSH_DEPTH_MAX_VOXELS)
+        {
+            bail!(
+                "[output]: flush_depth_mm = {flush_depth_mm:.4} mm is {flush_voxels:.3} voxels at \
+                 a voxel size of {h:.4} mm, outside the ({}, {}) voxels the flush pass is bounded \
+                 to: below that it cannot reach past the cells the surface already passes through, \
+                 and above it the pass lays a skin over every wall rather than seating the ones \
+                 that rest on a surface",
+                constants::FLUSH_DEPTH_MIN_VOXELS,
+                constants::FLUSH_DEPTH_MAX_VOXELS
+            );
+        }
         // Supersampling refines the export lattice by its cube, so the factor
         // that is harmless on a coarse grid is what runs a fine one out of
         // memory. The check belongs here because only the voxelization knows
@@ -1812,6 +1832,43 @@ g_mm_s2 = {second_g}
         let err = build(&text).unwrap_err().to_string();
         assert!(err.contains("step_mm"), "unexpected error: {err}");
         assert!(err.contains("voxel"), "unexpected error: {err}");
+    }
+
+    /// The flush depth is bounded in voxels, which is a question only the built
+    /// grid can answer: the same millimetre value is sane on one voxel size and
+    /// not on another, and both ends of the range are excluded.
+    #[test]
+    fn a_flush_depth_outside_the_voxel_range_is_rejected_and_the_default_is_inside_it() {
+        // The fixture is solved at a voxel size of 2 mm, so the range is
+        // (1 mm, 16 mm) exclusive.
+        for depth in ["0.5", "1.0", "16.0", "40.0"] {
+            let text = cantilever_config("").replace(
+                "stl_path = \"t.stl\"",
+                &format!("stl_path = \"t.stl\"\nflush_depth_mm = {depth}"),
+            );
+            let err = build(&text).unwrap_err().to_string();
+            assert!(err.contains("flush_depth_mm"), "unexpected error: {err}");
+            assert!(err.contains("voxel"), "unexpected error: {err}");
+        }
+        // Inside it, and the pass reads exactly what was written.
+        let text = cantilever_config("").replace(
+            "stl_path = \"t.stl\"",
+            "stl_path = \"t.stl\"\nflush = \"walls\"\nflush_depth_mm = 3.0",
+        );
+        let problem = build(&text).expect("build");
+        assert_eq!(problem.output.flush, crate::config::FlushPolicy::Walls);
+        assert_eq!(
+            crate::flush::depth_mm(problem.grid.h, problem.output.flush_depth_mm),
+            3.0
+        );
+        // And the derived default is inside it by construction, whatever the
+        // voxel size: a file that names no depth can never be refused for one.
+        let problem = build(&cantilever_config("")).expect("build");
+        assert_eq!(problem.output.flush_depth_mm, None);
+        assert_eq!(
+            crate::flush::depth_mm(problem.grid.h, None),
+            constants::FLUSH_DEPTH_VOXELS * problem.grid.h
+        );
     }
 
     #[test]

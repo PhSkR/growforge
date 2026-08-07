@@ -186,6 +186,12 @@ pub struct Progress {
     /// why a run ended and what the trim removed are two different things a
     /// panel says at once.
     pub trim: Vec<String>,
+    /// What the `[output] flush` pass said, once the run has finished; empty
+    /// while it is running and under the default `flush = "off"`. Separate from
+    /// `trim` for the reason `trim` is separate from `note`, and drawn between
+    /// the two: the passes over the field are as many statements as there are
+    /// passes, and the panel says all of them.
+    pub flush: Vec<String>,
     /// What the `[output] reinforce` pass said, once the run has finished; empty
     /// while it is running and under the default `reinforce = "off"`. Separate
     /// from `trim` for the same reason `trim` is separate from `note`, and drawn
@@ -254,6 +260,18 @@ impl ViewLink {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .trim = notes;
+    }
+
+    /// Record what the flush pass said, for the panel.
+    ///
+    /// Written once, where the pass ends, for the reason
+    /// [`ViewLink::set_trim_notes`] gives: it runs after the engine has handed
+    /// its field over, and the lines have to outlive the moment.
+    pub fn set_flush_notes(&self, notes: Vec<String>) {
+        self.progress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .flush = notes;
     }
 
     /// Record what the reinforcement pass said, for the panel.

@@ -206,7 +206,10 @@ pub fn squared_distances(grid: &Grid, part: &[bool]) -> Vec<f64> {
 /// asks: how far the nearest place that *does* meet the floor is. Nothing past
 /// the edge of the block is a seed here - there is no part out there to inscribe
 /// a ball in - which is the one thing that differs between the two.
-fn distances_to_seeds(grid: &Grid, seed: &[bool]) -> Vec<f64> {
+///
+/// [`crate::flush`] asks the same question of the material of a wall, which is
+/// why this is public: one exact transform, seeded differently by each pass.
+pub fn distances_to_seeds(grid: &Grid, seed: &[bool]) -> Vec<f64> {
     distances_to(grid, |cell| seed[cell], false)
 }
 

@@ -3,9 +3,9 @@
 //!
 //! The pipeline is
 //! `config -> voxel grid -> finite element model -> engine -> density field ->
-//! cavities -> stress report -> [trim -> reinforce -> both again] -> isosurface
-//! -> smoothing -> island culling -> boundary clamp -> validation -> binary
-//! STL`. Everything
+//! cavities -> stress report -> [trim -> flush -> reinforce -> both again] ->
+//! isosurface -> smoothing -> island culling -> boundary clamp -> validation ->
+//! binary STL`. Everything
 //! after the engine is engine agnostic, which is what lets the `growth` engine
 //! hand over a field it never solved for - and the `solid` engine one it never
 //! optimized - and still get an honest stress report on it.
@@ -20,6 +20,7 @@ pub mod config;
 pub mod constants;
 pub mod engine;
 pub mod fea;
+pub mod flush;
 pub mod geometry;
 pub mod grid;
 pub mod json;
@@ -41,6 +42,7 @@ use anyhow::{Context, Result};
 use crate::config::{BoundaryFidelity, Config};
 use crate::engine::DensityField;
 use crate::fea::CancelProbe;
+use crate::flush::FlushReport;
 use crate::mesh::clamp::ClampReport;
 use crate::mesh::islands::IslandReport;
 use crate::mesh::validate::MeshStats;
@@ -81,6 +83,10 @@ pub struct RunOutcome {
     /// What the `[output] trim` pass removed, or why it removed nothing;
     /// `None` under the default `trim = "off"`, where the pass never ran.
     pub trim: Option<TrimReport>,
+    /// What the `[output] flush` pass filled out to the surfaces the part's
+    /// walls rest on; `None` under the default `flush = "off"`, where the pass
+    /// never ran.
+    pub flush: Option<FlushReport>,
     /// What the `[output] reinforce` pass thickened, and what it could not;
     /// `None` under the default `reinforce = "off"`, where the pass never ran.
     pub reinforce: Option<ReinforceReport>,
@@ -101,8 +107,8 @@ pub struct RunOutcome {
     pub stl_path: PathBuf,
     /// Wall clock seconds spent optimizing.
     pub optimize_s: f64,
-    /// Wall clock seconds spent on the cavity pass, the stress solve, the trim
-    /// and reinforcement passes and - when either of them changed the field -
+    /// Wall clock seconds spent on the cavity pass, the stress solve, the trim,
+    /// flush and reinforcement passes and - when any of them changed the field -
     /// the second run of the first two over the field that ships.
     pub analysis_s: f64,
     /// Wall clock seconds spent extracting, smoothing and writing the mesh.
@@ -282,15 +288,15 @@ fn write_stress_json(problem: &Problem, analysis: &Analysis) -> Result<()> {
 ///
 /// The command line has nothing to say between them and never calls a run off;
 /// the viewer puts each stage on the window and may be asked to stop at any of
-/// them. Both go through this, so the sequence itself - analyse, trim,
+/// them. Both go through this, so the sequence itself - analyse, trim, flush,
 /// reinforce, analyse again, export - exists once rather than once per caller.
 /// Every method has a default, so [`Unwatched`] is the whole of the headless
 /// implementation.
 pub trait Stages {
     /// The cavity pass and the stress solve are starting. Called a second time
-    /// for the re-analysis the `[output] trim` and `[output] reinforce` passes
-    /// force between them, because that is the same work again - once, whether
-    /// one of them changed the field or both did.
+    /// for the re-analysis the `[output] trim`, `[output] flush` and
+    /// `[output] reinforce` passes force between them, because that is the same
+    /// work again - once, whichever of them changed the field.
     fn analysing(&self) {}
 
     /// The surface is being extracted, validated and written.
@@ -322,6 +328,9 @@ pub struct Completed {
     /// What the trim pass removed, or why it removed nothing; `None` under
     /// `trim = "off"`.
     pub trim: Option<TrimReport>,
+    /// What the flush pass filled out to the surfaces the walls rest on; `None`
+    /// under `flush = "off"`.
+    pub flush: Option<FlushReport>,
     /// What the reinforcement pass thickened, and what it could not; `None`
     /// under `reinforce = "off"`.
     pub reinforce: Option<ReinforceReport>,
@@ -334,37 +343,42 @@ pub struct Completed {
     /// What the boundary clamp moved; `None` under
     /// `[output] boundaries = "voxel"`.
     pub clamp: Option<ClampReport>,
-    /// Wall clock seconds spent analysing, trimming, reinforcing and analysing
-    /// again.
+    /// Wall clock seconds spent analysing, trimming, flushing, reinforcing and
+    /// analysing again.
     pub analysis_s: f64,
     /// Wall clock seconds spent extracting, smoothing and writing the mesh.
     pub export_s: f64,
 }
 
-/// The whole post-run pipeline: analyse, trim, reinforce, analyse the field
-/// those two left, and export it.
+/// The whole post-run pipeline: analyse, trim, flush, reinforce, analyse the
+/// field those three left, and export it.
 ///
 /// The one sequence both the command line and the viewer run, so the file, the
 /// tables printed beside it and the surface a window shows can never depend on
 /// which of them asked. `densities` is resolved in place - by the cavity policy,
-/// under `[output] trim` by the trim, and under `[output] reinforce` by the
-/// reinforcement - so what comes back describes the field the caller now holds.
+/// under `[output] trim` by the trim, under `[output] flush` by the flush and
+/// under `[output] reinforce` by the reinforcement - so what comes back
+/// describes the field the caller now holds.
 ///
-/// The two field passes are what make the analysis run twice, and they share
-/// that second run: it happens once if either of them changed anything, because
+/// The three field passes are what make the analysis run twice, and they share
+/// that second run: it happens once if any of them changed anything, because
 /// what it exists for is to describe the field that ships. The first analysis is
 /// the *only* stress field the trim's criterion could be read from and is thrown
 /// away with the cells it condemned; everything a run reports - the stress table,
 /// the safety factor, the cavity report, the JSON, the STL - comes from the
 /// second, so no deliverable ever describes material that is not in the file.
-/// With both passes off, or with neither finding anything to do, the analysis
-/// runs exactly once and the sequence is what it was before either existed.
+/// With every pass off, or with none of them finding anything to do, the
+/// analysis runs exactly once and the sequence is what it was before any of them
+/// existed.
 ///
-/// The order is trim, then reinforce, and nothing is trimmed afterwards. The
-/// trim reads the stresses of the field the engine produced, and reinforcement
-/// material is deliberately unloaded - it is there to be printable, not to carry
-/// anything - so trimming after it would remove exactly what it just added. See
-/// [`crate::reinforce`].
+/// The order is trim, then flush, then reinforce, and nothing is trimmed
+/// afterwards. The trim reads the stresses of the field the engine produced, so
+/// it goes first. The flush puts the walls back to the geometry they were drawn
+/// with before the reinforcement measures how thin anything is, because a
+/// rippled wall reads as a row of thin places and the fill spent on them is
+/// wasted - see [`crate::flush`]. And reinforcement material is deliberately
+/// unloaded - it is there to be printable, not to carry anything - so trimming
+/// after it would remove exactly what it just added. See [`crate::reinforce`].
 ///
 /// `Ok(None)` is [`Stages::stopped`] answering yes at one of the boundaries:
 /// nothing was written, and the caller is expected to unwind rather than export.
@@ -386,11 +400,13 @@ pub fn complete(
         return Ok(None);
     };
     // The criterion is the stresses of the field the engine produced, which is
-    // this analysis; the floor the pass after it holds the part to is geometry
-    // and needs no solve at all.
+    // this analysis; where a surface is and how thin a member is are geometry
+    // and need no solve at all.
     let trim = trim::resolve(problem, densities, &analysis.stress);
+    let flush = flush::resolve(problem, densities);
     let reinforce = reinforce::resolve(problem, densities);
     let changed = trim.as_ref().is_some_and(TrimReport::changed_the_field)
+        || flush.as_ref().is_some_and(FlushReport::changed_the_field)
         || reinforce
             .as_ref()
             .is_some_and(ReinforceReport::changed_the_field);
@@ -400,8 +416,8 @@ pub fn complete(
         }
         // The same stage over again, and the window says so again: what the
         // cavity pass and the stress solve describe has to be the structure the
-        // two passes left, because that is the one being exported. Once for the
-        // pair of them - there is one field, and it is analysed once.
+        // passes left, because that is the one being exported. Once for the
+        // three of them - there is one field, and it is analysed once.
         stages.analysing();
         let Some(reanalysed) = analysed(problem, densities, limits, CancelProbe::watching(&stop))?
         else {
@@ -440,6 +456,7 @@ pub fn complete(
         solids,
         stress,
         trim,
+        flush,
         reinforce,
         mesh,
         stats,
@@ -461,6 +478,7 @@ pub fn optimize_and_export(problem: &Problem, reporter: &dyn Reporter) -> Result
         solids,
         stress,
         trim,
+        flush,
         reinforce,
         mesh,
         stats,
@@ -482,6 +500,7 @@ pub fn optimize_and_export(problem: &Problem, reporter: &dyn Reporter) -> Result
         solids,
         stress,
         trim,
+        flush,
         reinforce,
         mesh,
         stats,
@@ -1036,21 +1055,22 @@ vector = [0.0, 0.0, -40.0]
         std::fs::remove_file(&off.output.stl_path).ok();
     }
 
-    /// The two field passes share one re-analysis, and neither of them is what
+    /// The three field passes share one re-analysis, and none of them is what
     /// the count of analyses depends on: it is whether the field changed.
     ///
-    /// Four runs of the same fixture - both passes, each alone, and neither -
-    /// counted through a scripted [`Stages`]. The pair is the case worth
-    /// pinning: a re-analysis per pass would solve the same field twice for
-    /// nothing, and no re-analysis at all would leave every number the run
+    /// Five runs of the same fixture - all three passes, each alone, and none -
+    /// counted through a scripted [`Stages`]. The set is the case worth
+    /// pinning: a re-analysis per pass would solve the same field three times
+    /// for nothing, and no re-analysis at all would leave every number the run
     /// reports describing a part that is not in the file.
     #[test]
-    fn the_trim_and_the_reinforcement_share_one_re_analysis() {
-        use crate::config::{ReinforcePolicy, TrimPolicy};
+    fn the_trim_the_flush_and_the_reinforcement_share_one_re_analysis() {
+        use crate::config::{FlushPolicy, ReinforcePolicy, TrimPolicy};
 
-        let run = |name: &str, trim: TrimPolicy, reinforce: ReinforcePolicy| {
+        let run = |name: &str, trim: TrimPolicy, flush: FlushPolicy, reinforce: ReinforcePolicy| {
             let (mut problem, densities, _) = spurred(name);
             problem.output.trim = trim;
+            problem.output.flush = flush;
             problem.output.reinforce = reinforce;
             let mut field = densities.clone();
             let stages = Scripted::default();
@@ -1061,47 +1081,86 @@ vector = [0.0, 0.0, -40.0]
             (problem, densities, field, completed, stages.counts())
         };
 
-        // Both: one analysis for the trim's criterion, one for the part that
-        // ships, and a single export.
-        let (problem, before, field, both, (_, analysing, exporting)) = run(
-            "reanalysis_both",
+        // All three: one analysis for the trim's criterion, one for the part
+        // that ships, and a single export.
+        let (problem, before, field, all, (_, analysing, exporting)) = run(
+            "reanalysis_all",
             TrimPolicy::Stress,
+            FlushPolicy::Walls,
             ReinforcePolicy::MinThickness,
         );
         assert_eq!((analysing, exporting), (2, 1));
-        let trimmed = both.trim.as_ref().expect("a trim report");
-        let reinforced = both.reinforce.as_ref().expect("a reinforce report");
+        let trimmed = all.trim.as_ref().expect("a trim report");
+        let flushed = all.flush.as_ref().expect("a flush report");
+        let reinforced = all.reinforce.as_ref().expect("a reinforce report");
         assert!(trimmed.changed_the_field(), "{trimmed:?}");
+        assert!(flushed.changed_the_field(), "{flushed:?}");
         assert!(reinforced.changed_the_field(), "{reinforced:?}");
         assert_eq!(
             reinforced.thickness_mm, problem.optimization.min_feature_mm,
             "the floor defaulted to something other than min_feature_mm"
         );
+        assert_eq!(
+            flushed.depth_mm,
+            constants::FLUSH_DEPTH_VOXELS * problem.grid.h,
+            "the depth defaulted to something other than the voxel multiple"
+        );
         // And what the run reports describes the field it wrote, which is the
-        // one both passes left: the stress table is taken over the reinforced
-        // cells, not the ones the criterion was read off.
-        let table = both.stress.report().expect("a stress table");
+        // one all three passes left: the stress table is taken over the filled
+        // and reinforced cells, not the ones the criterion was read off.
+        let table = all.stress.report().expect("a stress table");
         assert_eq!(table.evaluated_cells, evaluated(&problem, &field));
         assert!(
             evaluated(&problem, &field) > evaluated(&problem, &before),
-            "the reinforcement added no material at all"
+            "the two filling passes added no material at all"
         );
 
-        // Either one alone still forces the second analysis, and neither leaves
-        // the sequence exactly as it was before the two passes existed.
-        let (_, _, _, trim_only, (_, analysing, _)) =
-            run("reanalysis_trim", TrimPolicy::Stress, ReinforcePolicy::Off);
+        // Any one of them alone still forces the second analysis, and none of
+        // them leaves the sequence as it was before the passes existed.
+        let (_, _, _, trim_only, (_, analysing, _)) = run(
+            "reanalysis_trim",
+            TrimPolicy::Stress,
+            FlushPolicy::Off,
+            ReinforcePolicy::Off,
+        );
         assert_eq!(analysing, 2);
         assert!(trim_only.trim.expect("a report").changed_the_field());
+        assert!(trim_only.flush.is_none());
         assert!(trim_only.reinforce.is_none());
+
+        // The flush alone, which is also where the honesty of the second
+        // analysis is asserted on this pass by itself: the stress table counts
+        // the cells the fill left, and there are more of them than the field
+        // the pipeline was handed had.
+        let (flush_problem, before, flush_field, flush_only, (_, analysing, _)) = run(
+            "reanalysis_flush",
+            TrimPolicy::Off,
+            FlushPolicy::Walls,
+            ReinforcePolicy::Off,
+        );
+        assert_eq!(analysing, 2);
+        assert!(flush_only.trim.is_none());
+        assert!(flush_only.reinforce.is_none());
+        let flushed = flush_only.flush.expect("a report");
+        assert!(flushed.changed_the_field(), "{flushed:?}");
+        let table = flush_only.stress.report().expect("a stress table");
+        assert_eq!(
+            table.evaluated_cells,
+            evaluated(&flush_problem, &flush_field),
+            "the safety factor describes the field the fill was read off, not the one that shipped"
+        );
+        assert!(evaluated(&flush_problem, &flush_field) > evaluated(&flush_problem, &before));
+        report::print_flush_report(Some(&flushed));
 
         let (_, _, _, reinforce_only, (_, analysing, _)) = run(
             "reanalysis_reinforce",
             TrimPolicy::Off,
+            FlushPolicy::Off,
             ReinforcePolicy::MinThickness,
         );
         assert_eq!(analysing, 2);
         assert!(reinforce_only.trim.is_none());
+        assert!(reinforce_only.flush.is_none());
         assert!(
             reinforce_only
                 .reinforce
@@ -1109,19 +1168,25 @@ vector = [0.0, 0.0, -40.0]
                 .changed_the_field()
         );
 
-        let (_, _, _, neither, (_, analysing, exporting)) =
-            run("reanalysis_neither", TrimPolicy::Off, ReinforcePolicy::Off);
+        let (_, _, _, neither, (_, analysing, exporting)) = run(
+            "reanalysis_neither",
+            TrimPolicy::Off,
+            FlushPolicy::Off,
+            ReinforcePolicy::Off,
+        );
         assert_eq!((analysing, exporting), (1, 1));
         assert!(neither.trim.is_none() && neither.reinforce.is_none());
+        assert!(neither.flush.is_none());
 
-        // The part that came out of the pair is thicker than the one that came
-        // out of neither pass, and both are still parts.
-        assert!(both.stats.volume_mm3 > neither.stats.volume_mm3);
-        for completed in [&both, &neither] {
+        // The part that came out of the three is thicker than the one that came
+        // out of no pass at all, and both are still parts.
+        assert!(all.stats.volume_mm3 > neither.stats.volume_mm3);
+        for completed in [&all, &neither] {
             mesh::validate::validate(&completed.mesh).expect("watertight surface");
         }
-        report::print_reinforce_report(both.reinforce.as_ref());
+        report::print_reinforce_report(all.reinforce.as_ref());
         report::print_reinforce_report(neither.reinforce.as_ref());
+        report::print_flush_report(neither.flush.as_ref());
     }
 
     /// A solid block held on one face and pushed on the other, small enough and

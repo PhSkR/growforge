@@ -1,5 +1,81 @@
 # Changelog
 
+## 2026-08-06 - 0.36.0 - The wall reaches the shape it was drawn against
+
+From the user's ask: a smoothing pass that fills in material on the outer walls
+of an optimized part, out to the exact dimensions of the shape those walls rest
+against. 0.35.0 fixed the *mesh* side of this - the boundary clamp now seats a
+vertex resting up to half a voxel short of a surface onto it - and half a voxel
+is deliberately all it will reach, because a vertex further out than that rests
+on nothing and moving it would drag a free surface onto a wall it was never
+near. What is left is the field: an optimizer has little reason to resolve the
+last cells against a boundary, and it leaves them at 0.4, 0.6, 0.8 in a band
+that should be solid. Read at the iso level the wall dips inwards further than
+the clamp can capture, and the exported face ripples.
+
+- **`[output] flush = "walls"`**, a third pass over the finished density field,
+  `off` unless a configuration asks for it. A design cell is raised to full
+  density when it is not already there, its centre lies within `flush_depth_mm`
+  of a domain or keepout surface, and the part's own material *inside that band*
+  comes within `flush_depth_mm` of it. The third condition is what makes it a
+  correction rather than a coat of paint: a stretch of boundary with no wall on
+  it stays bare, and a member running clear of a face grows no detached plate on
+  it. The `Design` gate is the whole of the safety story, as it is for the
+  reinforcement - a keepout, a filled cavity and the space outside the domain are
+  all void cells - so the pass can only ever add material to the design space.
+- **`[output] flush_depth_mm`**, optional, default `FLUSH_DEPTH_VOXELS` (two) of
+  the run's own voxel size: the artefact is a sampling one and the voxel is its
+  scale. A written depth is checked for being a length at all with the rest of
+  the `[output]` table, and for being between `FLUSH_DEPTH_MIN_VOXELS` (half a
+  voxel, below which it cannot reach past the cells the surface already passes
+  through) and `FLUSH_DEPTH_MAX_VOXELS` (eight, above which it lays a skin over
+  every wall instead of seating the ones that rest on a surface) in
+  `Problem::build`, which is where the voxel size is known - the same seam
+  `[growth] step_mm` is checked at.
+- **The caveat, stated in the note the pass writes and in the README.** Within
+  that depth the fill cannot tell a pockmark in a wall from the end of one, so
+  material that stopped near a surface is joined to it and a wall's edge grows a
+  fringe of up to `flush_depth_mm`. That is the same reach that fills the ripple,
+  seen from the other side. The pass is opt-in for it.
+- **The order is trim, then flush, then reinforce**, and all three share the one
+  re-analysis. The flush goes before the reinforcement on purpose: a rippled wall
+  reads as a row of thin places, and the reinforcement would spend ball after
+  ball on them and then warn that it could not reach the floor against a
+  boundary. Flushed first, it measures a wall of even thickness. Everything the
+  run reports afterwards - the stress table, the safety factor, the JSON, the STL
+  - comes from the analysis over the filled field, so the fill is never free.
+- **Reported, never refused.** A fill-only pass cannot disconnect anything, so
+  there is no abort machinery here as there is in the trim: the report says how
+  many cells were filled and what that joined, and the only warning it has is for
+  a problem that described no surface to be flush with at all. The lines reach
+  the console and the editor's panel alike, between the trim's and the
+  reinforcement's.
+- **The editor.** A combo and a conditional depth row in the output section, the
+  section reset covering both keys, a format-preserving round trip through save,
+  and the switch to `engine = "solid"` clearing them - that engine exports
+  exactly the domain it was given, and refuses this pass by name as it refuses
+  the other two. **The depth goes wherever the policy goes**, unlike the trim's
+  fraction and the reinforcement's floor: switching the combo back to `off`
+  takes it out as the engine switch and the section reset do, in one undo step.
+  It is the one of the three whose legal range is measured in voxels, the row
+  that edits it exists only while the pass does, and a leftover under `off` could
+  be taken out of range by a later resolution edit and refuse the build with no
+  row on screen naming the key.
+- Tests: the predicate against a hand-computed brute force reference (the rippled
+  wall filled, the open stretch bare, a member clear of a surface growing
+  nothing, the interior untouched, void and solid cells never written, the depth
+  deciding the reach, a second pass over a filled band raising nothing, and the
+  no-surface warning); the config matrix both ways, the voxel range at both ends,
+  the solid rejection, the editor's rows, reset, engine switch, the combo's
+  switch to `off` taking the depth out of the config and the file in one undo
+  step, panel notes and file round trip; the shared re-analysis, now over five
+  runs; and end to end, a
+  wall lying on the floor of its own domain with its outermost layer under the
+  iso level - flushed, every vertex over it is on the analytic face to 1.0e-5 mm,
+  and unflushed the same fixture dimples **1.6214 mm**, 0.81 of a voxel, past the
+  1.0 mm the clamp captures.
+- Version 0.36.0.
+
 ## 2026-08-06 - 0.35.0 - The part that was drawn, not optimized
 
 From the user's bathtub plug: a cone shell with a cavity cut out of it and a

@@ -407,6 +407,8 @@ mod tests {
                 trim_stress_fraction: crate::constants::TRIM_STRESS_FRACTION,
                 reinforce: crate::config::ReinforcePolicy::Off,
                 reinforce_thickness_mm: 4.0,
+                flush: crate::config::FlushPolicy::Off,
+                flush_depth_mm: None,
                 stress_json: None,
             },
             // This fixture never exports, so it needs no analytic boundaries.

@@ -1524,8 +1524,9 @@ panel alike.
 **The mass shift.** Run with `trim = "stress"` the two passes are the two halves
 of one exchange: the trim frees the mass of the prongs that carry nothing, and
 this spends mass on the arms that carry something and cannot be printed. The
-notes sit beside each other so the trade reads directly. The order is trim, then
-reinforce, and **nothing is trimmed afterwards**: reinforcement material is
+notes sit beside each other so the trade reads directly. The order is trim,
+[flush](#flush-fill), then reinforce, and **nothing is trimmed afterwards**:
+reinforcement material is
 deliberately unloaded - it is there so the member can be printed, not so it can
 carry anything - and a second trim would remove exactly what was just added. A
 run in which either pass changed the field re-runs the cavity pass and the stress
@@ -1552,6 +1553,99 @@ Three smaller things worth knowing:
 * **`[optimization.local_volume]`** is a constraint on the *optimizer*. Cells
   this pass thickens may take a neighbourhood past the cap in the exported field,
   and the report says so: printability outranks the cap.
+
+## Flush fill
+
+```toml
+[output]
+flush = "off"        # "off" (default) | "walls"
+flush_depth_mm = 3.0 # optional, default 2 voxels of the grid
+```
+
+The walls that rest against a shape the configuration drew, but come out short
+of it. An optimizer has little reason to resolve the last cells of a wall
+pressed against the edge of the domain: they come out at 0.4, 0.6, 0.8 in a band
+that should be solid, because the compliance barely notices and the density
+filter smooths across the boundary as if there were design space on the far side
+of it. Read at `iso_level` that band is not a wall standing on a surface - it is
+a wall that dips inwards here and reaches the surface there, and the exported
+face ripples where a flat one was drawn.
+
+**The mesh side of this is already solved, and it is not enough.**
+[`boundaries = "exact"`](#exact-boundaries) seats every exported vertex resting
+within half a voxel of a surface exactly onto it. Half a voxel is the scale a
+cell-centre classification can be wrong by, and it is deliberately all the clamp
+will reach: a vertex further away than that rests on nothing - it is an
+optimizer's free surface through the middle of the domain - and moving it would
+drag that surface onto a wall it was never near. So where the field dips deeper,
+the clamp is right to leave the vertex alone and the ripple survives into the
+file. What is missing is material, and only the field can be given it.
+
+**The predicate is a band, grown from the wall inside it.** A design cell is
+raised to full density when all three hold:
+
+* it is not already there;
+* its centre lies within `flush_depth_mm` of a constraint surface - the domain's
+  own boundary or the wall of the nearest keepout, whichever is nearer - the
+  *band*;
+* the part's own material, **inside that band**, comes within `flush_depth_mm`
+  of it, by an exact Euclidean distance transform seeded on those cells.
+
+The third condition is what makes this a correction rather than a coat of paint.
+A stretch of boundary with no wall on it - the open face of a bracket, the mouth
+of a bore the design never reached - has no material in the band anywhere near
+it and comes through untouched. And it is the material *in the band* rather than
+the part's material anywhere, because a member running two voxels clear of a
+face is not a wall resting on it: seeded on the part at large, a bar through the
+middle of a domain would grow a detached plate on every face it passed near.
+
+Only design cells are ever written, which is the whole of the safety story: a
+keepout, the space outside the domain and a cavity the `voids` policy owns are
+all void cells, forced solid cells are already full. The pass can only ever add
+material, so there is nothing it can disconnect and no pass-level refusal here.
+
+**The caveat, which is inherent and is why the pass is opt-in.** Within
+`flush_depth_mm` the fill cannot tell a pockmark in a wall from the end of one.
+Material that stops inside the band gets joined to the surface it stopped near,
+and a wall's edge grows a fringe of up to `flush_depth_mm` along the boundary it
+rests on. That is the same reach that fills the ripple, seen from the other
+side. The note says so, and the depth is the knob:
+
+```text
+flush          filled 288 cells, 2.304 cm3, out to the surfaces the walls rest
+               on, 4.000 mm deep
+               material that stopped within 4.000 mm of one of those surfaces is
+               now joined to it: within that depth the fill cannot tell a
+               pockmark in a wall from the end of one
+```
+
+`flush_depth_mm` is a length, and absent it is two voxels of the grid the run is
+solved on - the artefact is a sampling one, and the voxel is its scale. Written,
+it has to stay between half a voxel (below which it cannot reach past the cells
+the surface already passes through) and eight (above which the pass lays a skin
+over every wall instead of seating the ones that rest on a surface), and the run
+is refused with both figures if it does not.
+
+**Where it sits.** The order is [trim](#trimming-unloaded-material), then flush,
+then [reinforce](#reinforcement-minimum-printable-thickness), and all three
+share one re-analysis. The flush goes before the reinforcement on purpose: a
+rippled wall reads as a row of thin places, and the reinforcement would spend
+ball after ball on them and then warn that it could not reach the floor against
+a boundary. Flushed first, it measures a wall of even thickness. Everything the
+run reports afterwards - the stress table, the safety factor, the JSON, the STL
+- comes from the analysis over the filled field, so the material the fill added
+is in the safety factor rather than beside it.
+
+The pass is applied **once**, to the field an engine produced, which is what the
+pipeline does and what the editor's generate button does (it works on a copy of
+the design it kept). A second application over its own output would extend that
+fringe again wherever the first one left material at the edge of the band.
+
+Measured on the shipped fixture - a wall lying on the floor of its own domain
+with its outermost layer under the iso level - the exported floor stands
+**1.6214 mm** off the face it was drawn against, 0.81 of a voxel and past the
+1.0 mm the clamp captures by itself; with `flush = "walls"` every vertex of it
+is on that face to 1.0e-5 mm, which is the clamp's own offset.
 
 ## Solver backend
 
@@ -2111,7 +2205,7 @@ switch the session to whatever comes back, without closing the window: see
 | properties          | exact numeric fields for whatever is selected, and its own extras (a domain entry's `op`, a support's fixed axes, a load's vector or torque) |
 | engine / resolution / material / optimization / growth / output | every scalar the configuration holds, each with its default shown when the key is absent; each section carries a `reset` button that puts its own keys back to those defaults |
 | problem             | grid size, cell, node and degree of freedom counts, per-region node counts and the memory estimate, refreshed on every edit |
-| show                | the same layer switches the viewer has, plus the editor's own selection, hover, gizmo, dimension, floor grid and placement preview overlays; under them, what the [trim](#trimming-unloaded-material) pass removed from the design on screen, or the warning that it was refused, what the [reinforcement](#reinforcement-minimum-printable-thickness) pass spent on its thin arms, or the warning that a member could not be thickened, and what the [boundary clamp](#exact-boundaries) moved onto the shapes |
+| show                | the same layer switches the viewer has, plus the editor's own selection, hover, gizmo, dimension, floor grid and placement preview overlays; under them, what the [trim](#trimming-unloaded-material) pass removed from the design on screen, or the warning that it was refused, what the [flush fill](#flush-fill) pass put back out to the surfaces the walls rest on, what the [reinforcement](#reinforcement-minimum-printable-thickness) pass spent on its thin arms, or the warning that a member could not be thickened, and what the [boundary clamp](#exact-boundaries) moved onto the shapes |
 | stress              | the [safety factor](#stress-report) of the part that was just written, first, with the peak von Mises stress of every load case under it; present after a full run and after `generate stl`, absent while one is running and absent when the stress solve produced no report |
 
 **Every labelled block above folds away**, and stays however you left it for the
@@ -2807,6 +2901,18 @@ reinforce = "off"            # optional, default "off"; "min_thickness" thickens
 reinforce_thickness_mm = 3.0 # optional, default [optimization] min_feature_mm;
                              # a positive length in millimetres. The floor the
                              # pass above holds every member to
+flush = "off"                # optional, default "off"; "walls" fills the design
+                             # cells within flush_depth_mm of a domain or keepout
+                             # surface that the part's own material already
+                             # reaches into, so a wall resting against a shape
+                             # the configuration drew comes out flush with it
+                             # rather than rippled. Material that stopped within
+                             # that depth of a surface is joined to it. Rejected
+                             # outright by engine = "solid" for the reason trim
+                             # is. See the flush fill section
+flush_depth_mm = 3.0         # optional, default two voxels of the grid; between
+                             # half a voxel and eight of them. How deep the pass
+                             # above fills
 # stress_json = "stress.json" # optional; writes the stress table as JSON,
                              # relative to the config file
 
@@ -3141,8 +3247,9 @@ could reach is reported, and the branches that were heading for it are removed.
 Rejected for a solid run specifically: `engine = "solid"` with
 `[optimization] mass_fraction` set (it fills the domain, so there is no share of
 it to target), with `[optimization.overhang]`, `[optimization.wireframe]` or
-`[optimization.local_volume]`, or with `[output] trim` or `reinforce` set to
-anything but `"off"` - both passes alter the very domain that engine exports.
+`[optimization.local_volume]`, or with `[output] trim`, `reinforce` or `flush`
+set to anything but `"off"` - every one of those passes alters the very domain
+that engine exports.
 `mass_fraction` is required for every other engine and refused for this one, so
 a file switching between them gains and loses the key.
 
@@ -3150,6 +3257,10 @@ Rejected for a symmetric growth run: a `[growth.symmetry]` table without
 `engine = "growth"`, a kind carrying the other kind's keys, no `planes` or more
 than two of them, the same plane twice, a missing `order` or one outside
 `[2, 12]`, and a fundamental domain holding no load region or no support region.
+
+Also rejected, whatever the engine: `[output] flush_depth_mm` outside half a
+voxel to eight voxels of the grid the run is solved on, which is a range only
+the voxel size can be measured against and so is checked once the grid is known.
 
 Warned about but allowed: `min_feature_mm` smaller than about three voxels (the
 density filter cannot resolve it), keepout/keepin overlap, an enclosed cavity
@@ -3223,14 +3334,17 @@ all, and a `hold_iterations` that outlasts `max_iterations`.
    once more, to remove the material of the part that carries none of the load -
    unless doing so would disconnect two declared regions, in which case the
    whole pass is refused and the run exports untrimmed. Under
-   `[output] reinforce` a Euclidean distance transform over the part then finds
-   the spine of every member, and the ones whose inscribed ball is thinner than
-   the floor are thickened into the design cells around them; a place the fill
-   could not reach is counted and warned about rather than refusing the pass.
-   If either pass changed the field, the cavity pass and the stress solve run
-   *again* over the result - once, for the pair of them - so every number the run
-   reports describes what was written. See the trimming and reinforcement
-   sections.
+   `[output] flush` the design cells within a depth of a domain or keepout
+   surface that the part's own material already reaches into are then filled, so
+   a wall standing against a shape the configuration drew reaches it. And under
+   `[output] reinforce` a Euclidean distance transform over the part finds the
+   spine of every member, and the ones whose inscribed ball is thinner than the
+   floor are thickened into the design cells around them; a place the fill could
+   not reach is counted and warned about rather than refusing the pass. If any
+   of the three changed the field, the cavity pass and the stress solve run
+   *again* over the result - once, for all of them - so every number the run
+   reports describes what was written. See the trimming, flush fill and
+   reinforcement sections.
 5. **Export.** Node values are the mean of the eight surrounding cell
    densities, wrapped in a layer of zeros. With `supersample = N > 1` that
    lattice is then resampled `N` times finer in every axis from its own

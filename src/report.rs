@@ -7,6 +7,7 @@
 use crate::bench::BenchReport;
 use crate::config::{IslandPolicy, SolverBackend, SolverParams, UpdateScheme, VoidPolicy};
 use crate::constants;
+use crate::flush::FlushReport;
 use crate::mesh::clamp::ClampReport;
 use crate::mesh::islands::{AnchorSet, IslandReport};
 use crate::mesh::validate::MeshStats;
@@ -516,6 +517,29 @@ pub fn print_trim_report(report: Option<&TrimReport>) {
     };
     for (index, note) in report.notes().iter().enumerate() {
         let label = if index == 0 { "trim" } else { "" };
+        println!("{label:<14} {note}");
+    }
+}
+
+/// Print what the `[output] flush` pass filled out to the surfaces the part's
+/// walls rest on.
+///
+/// `None` is the default `flush = "off"`, where the pass never ran and there is
+/// nothing to say; a run that found no wall standing short of anything under
+/// `flush = "walls"` is a different statement and is printed. So is the line
+/// that says what the fill joined to a surface, which is the pass's own caveat
+/// and not a defect in the result.
+///
+/// Printed between [`print_trim_report`] and [`print_reinforce_report`], which
+/// is the order the pipeline ran them in: what was freed, what was put back
+/// where the drawing had it, and what was spent on the arms that cannot be
+/// printed.
+pub fn print_flush_report(report: Option<&FlushReport>) {
+    let Some(report) = report else {
+        return;
+    };
+    for (index, note) in report.notes().iter().enumerate() {
+        let label = if index == 0 { "flush" } else { "" };
         println!("{label:<14} {note}");
     }
 }

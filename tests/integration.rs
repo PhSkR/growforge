@@ -3108,3 +3108,270 @@ fn the_solid_engine_exports_the_domain_it_was_given() {
     assert_eq!(triangles.len(), outcome.stats.triangles);
     std::fs::remove_file(&outcome.stl_path).ok();
 }
+
+/// A wall lying on the floor of its own domain, at the shape a density
+/// optimizer leaves one in.
+///
+/// Half the footprint of the block, held at one end and pushed at the other, so
+/// the field is a load path rather than a slab in mid air; the other half of
+/// that floor is deliberately bare. What the flush pass is measured on is the
+/// outermost layer of the wall, which the field below leaves under the iso
+/// level: the erosion a density filter produces against a boundary it has no
+/// design space on the far side of.
+const FLOOR_WALL: &str = r#"
+[project]
+name = "integration_flush"
+
+[resolution]
+voxel_size_mm = 2.0
+
+[material]
+preset = "petg"
+
+# The reproducible backend: this fixture's deviations are compared against the
+# boundary clamp's own offset.
+[solver]
+backend = "cpu"
+
+[optimization]
+mass_fraction = 0.4
+min_feature_mm = 8.0
+max_iterations = 1
+
+[output]
+stl_path = "growforge_integration_flush.stl"
+smoothing_iterations = 4
+flush = "walls"
+
+[[domain]]
+op = "add"
+shape = "box"
+min = [0.0, 0.0, 0.0]
+max = [48.0, 24.0, 24.0]
+
+[[supports]]
+region = { shape = "box", min = [-0.5, -0.5, -0.5], max = [0.5, 24.5, 6.5] }
+
+[[loadcases]]
+name = "tip"
+[[loadcases.loads]]
+type = "force"
+region = { shape = "box", min = [21.5, -0.5, -0.5], max = [24.5, 24.5, 6.5] }
+vector = [0.0, 0.0, -50.0]
+"#;
+
+/// The flush pass end to end: the same field exported twice, once as it stands
+/// and once with `flush = "walls"`, and the second file is the first one with
+/// its wall standing on the floor it was drawn against.
+///
+/// The field is written by hand rather than optimized, for the reason the
+/// pipeline fixtures in `lib.rs` are: what is under test is what the pass and
+/// the boundary clamp do with a *shape* - a wall whose outermost cells came out
+/// under the iso level - and not whether some engine converges on one. The
+/// densities below are what a run really leaves against a boundary: solid two
+/// cells in, eroded in the last one, and eroded by different amounts across the
+/// face, which is what makes the exported floor ripple rather than merely sit
+/// low.
+///
+/// Three claims, in the order they matter:
+///
+/// * with the pass on, every vertex of that floor is on the analytic face, to
+///   the same `2 x BOUNDARY_CLAMP_EPS_MM` the plug and the bore are held to -
+///   measured at 1.0e-5 mm, which is the clamp's own offset;
+/// * with it off, the same fixture dimples 1.6214 mm - 0.81 of a voxel, past
+///   the 1.0 mm the clamp captures - which is why the mesh side cannot fix this
+///   alone;
+/// * the bare half of the same floor grows nothing, a fringe of the fill's own
+///   depth past the end of the wall aside.
+#[test]
+fn a_wall_that_came_out_short_of_the_floor_is_exported_flush_with_it() {
+    use growforge::config::FlushPolicy;
+    use growforge::stress::StressLimits;
+    use growforge::{Unwatched, complete};
+
+    let directory = std::env::temp_dir();
+    let config = Config::parse(FLOOR_WALL).expect("parse");
+
+    let problem = |name: &str, flush: FlushPolicy| {
+        let mut problem = Problem::build(&config, &directory).expect("build");
+        problem.output.flush = flush;
+        problem.output.stl_path = directory.join(format!("growforge_integration_{name}.stl"));
+        problem
+    };
+    let flushed = problem("flush_on", FlushPolicy::Walls);
+    let plain = problem("flush_off", FlushPolicy::Off);
+    let grid = &flushed.grid;
+    assert_eq!((grid.nx, grid.ny, grid.nz), (24, 12, 12));
+    assert_eq!(flushed.output.flush, FlushPolicy::Walls);
+    assert_eq!(
+        flushed.output.flush_depth_mm, None,
+        "the fixture names no depth, so the pass runs at the derived default"
+    );
+    let depth = constants::FLUSH_DEPTH_VOXELS * grid.h;
+
+    // The field: a wall over the near half of the floor, solid from the second
+    // cell up and under the iso level in the first. The two levels in that
+    // layer are what make the exported face a ripple - each dips the isosurface
+    // inwards by a different fraction of a voxel - and both are below the level
+    // the surface is drawn at, so neither is part of the part.
+    let wall_columns = grid.nx / 2;
+    let mut densities = vec![0.1; grid.n_cells()];
+    for i in 0..wall_columns {
+        for j in 0..grid.ny {
+            densities[grid.cell_index(i, j, 0)] = if j < grid.ny / 2 { 0.2 } else { 0.45 };
+            for k in 1..3 {
+                densities[grid.cell_index(i, j, k)] = 1.0;
+            }
+        }
+    }
+    let before = densities.clone();
+
+    let mut flushed_field = densities.clone();
+    let with_flush = complete(
+        &flushed,
+        &mut flushed_field,
+        StressLimits::default(),
+        &Unwatched,
+    )
+    .expect("the flushed pipeline")
+    .expect("nothing asked it to stop");
+    let mut plain_field = densities.clone();
+    let without_flush = complete(
+        &plain,
+        &mut plain_field,
+        StressLimits::default(),
+        &Unwatched,
+    )
+    .expect("the plain pipeline")
+    .expect("nothing asked it to stop");
+    assert!(
+        without_flush.flush.is_none(),
+        "the pass ran with flush = \"off\""
+    );
+    assert_eq!(plain_field, before, "flush = \"off\" moved the field");
+
+    let report = with_flush.flush.expect("a flush report");
+    assert!(report.changed_the_field(), "{report:?}");
+    assert_eq!(report.depth_mm, depth);
+    assert!(report.any_surface);
+    assert!(
+        (report.volume_added_mm3 - report.cells_raised as f64 * grid.cell_volume()).abs() < 1e-12
+    );
+    let notes = report.notes();
+    assert!(notes[0].starts_with("filled"), "{notes:?}");
+    assert!(
+        notes[1].contains("joined to it"),
+        "the caveat is not stated: {notes:?}"
+    );
+
+    // The wall's outermost layer really is solid now, and nothing that was
+    // already material lost any.
+    for i in 0..wall_columns {
+        for j in 0..grid.ny {
+            let cell = grid.cell_index(i, j, 0);
+            assert_eq!(
+                flushed_field[cell], 1.0,
+                "the wall is still short of the floor at ({i}, {j}, 0)"
+            );
+        }
+    }
+    for cell in 0..grid.n_cells() {
+        assert!(
+            flushed_field[cell] >= before[cell],
+            "cell {cell} lost material"
+        );
+    }
+
+    // The bare half of the same floor. Everything past the fringe the fill is
+    // allowed - `flush_depth_mm` beyond the last material, which is the pass's
+    // own documented caveat - is untouched, at every height and not merely at
+    // the floor.
+    let bare = wall_columns + (depth / grid.h).ceil() as usize + 1;
+    let mut checked = 0;
+    for i in bare..grid.nx {
+        for j in 0..grid.ny {
+            for k in 0..grid.nz {
+                let cell = grid.cell_index(i, j, k);
+                assert_eq!(
+                    flushed_field[cell], before[cell],
+                    "the bare floor grew a skin at ({i}, {j}, {k})"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0, "the fixture leaves no bare floor to assert on");
+
+    // How far the exported floor sits from the face it was drawn against, over
+    // the vertices above the middle of the wall. The window is geometric rather
+    // than a distance to the boundary, deliberately: selecting the vertices that
+    // are already *near* the face would leave out exactly the ones the defect
+    // produces, which is the case this fixture exists to measure. Inside it the
+    // nearest face of the domain is the floor and nothing else, so the distance
+    // to the analytic surface is the height above it.
+    let domain = &flushed.boundaries.domain;
+    let floor_band = |vertices: &[[f64; 3]]| {
+        let mut worst: f64 = 0.0;
+        let mut counted = 0usize;
+        for vertex in vertices {
+            if !(6.0..=18.0).contains(&vertex[0])
+                || !(6.0..=18.0).contains(&vertex[1])
+                || vertex[2] > 3.0
+            {
+                continue;
+            }
+            counted += 1;
+            worst = worst.max(domain.signed_distance(*vertex).abs());
+        }
+        (counted, worst)
+    };
+    let eps = constants::BOUNDARY_CLAMP_EPS_MM;
+    let capture = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * grid.h;
+    let (plain_count, plain_worst) = floor_band(&without_flush.mesh.vertices);
+    let (flushed_count, flushed_worst) = floor_band(&with_flush.mesh.vertices);
+
+    // The defect, measured: the unflushed wall stands off its own floor by more
+    // than the clamp can reach, which is why the field is what has to be filled.
+    assert!(
+        plain_count > 0,
+        "the unflushed export has no vertex over the wall at all"
+    );
+    assert!(
+        plain_worst > capture,
+        "the unflushed floor is only {plain_worst} mm off the face, inside the {capture} mm the \
+         clamp seats by itself, so this fixture cannot show what the pass is for"
+    );
+    assert!(
+        plain_worst < grid.h,
+        "{plain_worst} mm is not a sampling artefact"
+    );
+    // And the fix, vertex by vertex against the analytic box.
+    assert!(
+        flushed_count > 0,
+        "the flushed export has no vertex over the wall, so the claim below is vacuous"
+    );
+    assert!(
+        flushed_worst <= 2.0 * eps,
+        "the flushed floor still stands {flushed_worst} mm off the face it rests on (the same \
+         fixture measures {plain_worst} mm unflushed)"
+    );
+
+    // Both files are parts, and they are not the same file.
+    for completed in [&with_flush, &without_flush] {
+        mesh::validate::validate(&completed.mesh).expect("watertight surface");
+        assert_eq!(completed.islands.bodies.len(), 1);
+    }
+    assert!(
+        with_flush.stats.volume_mm3 > without_flush.stats.volume_mm3,
+        "the flushed surface encloses {:.1} mm3 against the plain {:.1}",
+        with_flush.stats.volume_mm3,
+        without_flush.stats.volume_mm3
+    );
+    assert_ne!(
+        std::fs::read(&flushed.output.stl_path).expect("the flushed STL"),
+        std::fs::read(&plain.output.stl_path).expect("the plain STL"),
+        "the two settings wrote the same file"
+    );
+    std::fs::remove_file(&flushed.output.stl_path).ok();
+    std::fs::remove_file(&plain.output.stl_path).ok();
+}

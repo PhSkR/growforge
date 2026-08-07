@@ -1905,6 +1905,21 @@ impl Editor {
             .unwrap_or_default()
     }
 
+    /// What the `[output] flush` pass said about the run behind the window, for
+    /// the panel.
+    ///
+    /// Empty until a run that writes has finished one, and empty for good under
+    /// the default `flush = "off"`. The console gets the same lines from the
+    /// outcome, and the panel draws them between the trim's and the
+    /// reinforcement's: what a run freed, what it put back out to the surfaces
+    /// the walls rest on, and what it spent.
+    pub fn flush_notes(&self) -> Vec<String> {
+        self.worker
+            .progress()
+            .map(|progress| progress.flush)
+            .unwrap_or_default()
+    }
+
     /// What the `[output] reinforce` pass said about the run behind the window,
     /// for the panel.
     ///

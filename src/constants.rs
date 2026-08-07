@@ -1354,6 +1354,52 @@ pub const REINFORCE_SURFACE_OFFSET_VOXELS: f64 = 0.5;
 pub const REINFORCE_THICKNESS_EPS_VOXELS: f64 = 1e-6;
 
 // ---------------------------------------------------------------------------
+// Flush fill pass (`[output] flush`)
+// ---------------------------------------------------------------------------
+
+/// How deep `[output] flush = "walls"` fills, in voxels, when a configuration
+/// names no `flush_depth_mm`.
+///
+/// The defect the pass exists for is a sampling one, and its scale is the voxel:
+/// a cell is classified by its centre, so the modelled boundary can be wrong by
+/// half a cell ([`BOUNDARY_CLAMP_CAPTURE_VOXELS`]), and the intermediate
+/// densities an optimizer leaves in the last cells of a wall pull the extracted
+/// isosurface a further fraction of a voxel inwards. Two voxels is that scale
+/// with a margin: deep enough to reach the material of a wall whose outermost
+/// cells came out below the iso level and to fill the cells between it and the
+/// surface, and shallow enough that what it fills is still the wall rather than
+/// the part behind it. It is also twice the deepest correction the boundary
+/// clamp will make to a single vertex
+/// ([`BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS`]), which is the mesh-side reading
+/// of the same artefact.
+///
+/// A run that wants another depth writes `[output] flush_depth_mm`, which is a
+/// length rather than a count of voxels because that is what the rest of the
+/// table is; the two are related by the grid, and [`crate::flush::depth_mm`] is
+/// the one place that relation is stated.
+pub const FLUSH_DEPTH_VOXELS: f64 = 2.0;
+
+/// Shallowest depth `[output] flush_depth_mm` may name, in voxels.
+///
+/// Half a voxel is the distance from a cell centre to its own face, and the
+/// resolution a cell-centre classification has: below it the pass could only
+/// ever select cells the boundary already passes through, which is less than the
+/// artefact it is being asked to correct. Excluded rather than allowed, because a
+/// depth at exactly that scale is already a pass that cannot do its job, and a
+/// configuration that names one has misunderstood the key rather than tuned it.
+pub const FLUSH_DEPTH_MIN_VOXELS: f64 = 0.5;
+
+/// Deepest depth `[output] flush_depth_mm` may name, in voxels.
+///
+/// Four times [`FLUSH_DEPTH_VOXELS`], which is generous: the artefact is about
+/// one voxel deep and the default already carries a margin over it. Past this
+/// the pass stops seating the walls that rest on a surface and starts laying a
+/// solid skin over every one of them, taking the mass, the local volume cap and
+/// the design the optimizer produced with it - a different operation, asked for
+/// with the same key. Excluded at the end for the reason the shallow end is.
+pub const FLUSH_DEPTH_MAX_VOXELS: f64 = 8.0;
+
+// ---------------------------------------------------------------------------
 // Mesh extraction
 // ---------------------------------------------------------------------------
 

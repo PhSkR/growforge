@@ -14,8 +14,8 @@
 //! the call site, and the layer switches carry theirs in the layer table.
 
 use crate::config::{
-    Axis, BoundaryFidelity, BuildDirection, CsgOpSpec, GrowthConfig, IslandPolicy, LoadSpec,
-    LocalVolumeConfig, MaterialConfig, OptimizationConfig, OutputConfig, OverhangConfig,
+    Axis, BoundaryFidelity, BuildDirection, CsgOpSpec, FlushPolicy, GrowthConfig, IslandPolicy,
+    LoadSpec, LocalVolumeConfig, MaterialConfig, OptimizationConfig, OutputConfig, OverhangConfig,
     ReinforcePolicy, ShapeSpec, SolverBackend, SolverConfig, SymmetryConfig, SymmetryKind,
     TrimPolicy, UpdateScheme, VoidPolicy, WireframeConfig,
 };
@@ -1517,6 +1517,8 @@ impl Section {
                     trim_stress_fraction: None,
                     reinforce: None,
                     reinforce_thickness_mm: None,
+                    flush: None,
+                    flush_depth_mm: None,
                     stress_json,
                 };
             }
@@ -1568,9 +1570,9 @@ impl Section {
             Section::Output => {
                 "put every [output] control back to its default: the iso level, the \
                                 smoothing and the supersampling, and the void, island, boundary, \
-                                trim and reinforcement policies, which go back to warn, cull, \
-                                exact and off. Both paths stay as they are - the stl and the \
-                                stress report are where this project writes, which is not a \
+                                trim, reinforcement and flush policies, which go back to warn, \
+                                cull, exact and off. Both paths stay as they are - the stl and \
+                                the stress report are where this project writes, which is not a \
                                 property of the part. One click is one undo step"
                     .to_string()
             }
@@ -1669,10 +1671,17 @@ fn select_engine(config: &mut crate::config::Config, engine: &str) {
         config.optimization.overhang = None;
         config.optimization.wireframe = None;
         config.optimization.local_volume = None;
-        // Absent is off, and off is what these two have to be: the solid engine
-        // exports the domain exactly, and both passes alter it.
+        // Absent is off, and off is what these three have to be: the solid
+        // engine exports the domain exactly, and every one of the passes alters
+        // it. The flush depth goes with its policy, unlike the trim's fraction
+        // and the reinforcement's floor, because it is the one of the three
+        // whose legal range is measured in voxels: left behind on a file that
+        // shows no row for it, it can be taken out of range by a later
+        // resolution edit and refuse a build nothing on screen explains.
         config.output.trim = None;
         config.output.reinforce = None;
+        config.output.flush = None;
+        config.output.flush_depth_mm = None;
     } else if config.optimization.mass_fraction.is_none() {
         // The mass target the solid engine did without and every other engine
         // requires, at the value a brand new file is written with - the only
@@ -2518,6 +2527,27 @@ fn axis_options() -> [(Axis, &'static str); 3] {
     ]
 }
 
+/// Everything choosing a flush policy in the combo does to the `[output]` table.
+///
+/// Factored out of the row for the reason [`select_engine`] is: a dropdown
+/// cannot be opened in a headless frame, so this is what a test drives.
+///
+/// It is also the one statement of what switching the pass *off* carries with
+/// it. The depth goes, unlike the trim's fraction and the reinforcement's floor
+/// when those are switched off, because it is the one of the three whose legal
+/// range is measured in voxels: left behind under a policy that draws no row for
+/// it, a later `[resolution]` edit can take it out of that range and refuse a
+/// build with nothing on screen to name the key. The same reason
+/// [`select_engine`] takes both out on the way to the solid engine. Written into
+/// the caller's copy of the table, which the frame stores back in one go, so the
+/// two keys travel as one undo step.
+fn write_flush_policy(output: &mut OutputConfig, flush: FlushPolicy) {
+    output.flush = Some(flush);
+    if flush == FlushPolicy::Off {
+        output.flush_depth_mm = None;
+    }
+}
+
 /// The output controls. The STL path is shown but not editable here: where a
 /// run writes is a decision about the project, not about the geometry.
 fn output_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
@@ -2710,6 +2740,52 @@ fn output_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                      places are still thin",
                 );
             }
+            let mut flush = output.flush.unwrap_or_default();
+            if combo(
+                ui,
+                field,
+                "flush",
+                &mut flush,
+                &[
+                    (FlushPolicy::Off, FlushPolicy::Off.label()),
+                    (FlushPolicy::Walls, FlushPolicy::Walls.label()),
+                ],
+                "what to do about the walls that rest against a domain or keepout surface but came \
+                 out short of it, which is the rippled face an optimizer leaves where it had no \
+                 reason to resolve the last cells. off is the default and exports the field as it \
+                 came out; walls fills the design cells within the depth below that the part's own \
+                 material already reaches into, so the wall reaches the shape it was drawn \
+                 against and the boundary clamp can seat it there. It only ever adds material, \
+                 never into a keepout or out of the domain, and material that stopped within that \
+                 depth of a surface is joined to it",
+            ) {
+                write_flush_policy(&mut output, flush);
+                changed = true;
+            }
+            // The same rule the two rows above follow: a depth is a control over
+            // a pass, not over a file. Its default is this configuration's own
+            // voxel size rather than a constant - the artefact it corrects is a
+            // sampling one, and the voxel is its scale - and a configuration
+            // that gives its resolution as a cell target and has never built has
+            // no voxel size to show yet, which is the growth lengths' own case.
+            let flush_default = effective_voxel_mm(field.state)
+                .map(|voxel| constants::FLUSH_DEPTH_VOXELS * voxel)
+                .unwrap_or_default();
+            if flush != FlushPolicy::Off {
+                changed |= optional_row(
+                    ui,
+                    field,
+                    "flush mm",
+                    &mut output.flush_depth_mm,
+                    flush_default,
+                    constants::VIEW_EDIT_DRAG_SPEED_MM,
+                    "how deep the fill reaches from a domain or keepout surface, in millimetres, \
+                     absent two voxels of this run's own grid. It has to stay between half a voxel \
+                     and eight of them: shallower cannot reach past the cells the surface already \
+                     passes through, deeper lays a skin over every wall instead of seating the \
+                     ones that rest on a surface",
+                );
+            }
             if changed {
                 field.state.config_mut().output = output;
             }
@@ -2719,17 +2795,19 @@ fn output_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
 /// What the post-run passes did to the part, beside the switch that colours the
 /// surface by the stresses one of them judged the material on.
 ///
-/// Nothing at all until a run has finished: the `[output] trim` and
-/// `[output] reinforce` passes say nothing under their default `off`, and the
-/// `[output] boundaries` clamp says nothing under `voxel`. Each line carries the
-/// name of the pass that wrote it, and an outcome that needs saying loudly - a
-/// trim the connectivity guard refused, a member the fill could not thicken, a
-/// vertex the clamp could not correct - is drawn in the panel's warning colour.
-/// None of it is something to find out from the console afterwards.
+/// Nothing at all until a run has finished: the `[output] trim`,
+/// `[output] flush` and `[output] reinforce` passes say nothing under their
+/// default `off`, and the `[output] boundaries` clamp says nothing under
+/// `voxel`. Each line carries the name of the pass that wrote it, and an outcome
+/// that needs saying loudly - a trim the connectivity guard refused, a member
+/// the fill could not thicken, a vertex the clamp could not correct - is drawn
+/// in the panel's warning colour. None of it is something to find out from the
+/// console afterwards.
 ///
-/// The trim's line and the reinforcement's are adjacent on purpose: what the run
-/// freed and what it spent on the arms are the two halves of one exchange, and
-/// they read as one only side by side.
+/// The three field passes are adjacent on purpose, in the order the pipeline ran
+/// them: what the run freed, what it put back out to the surfaces the walls rest
+/// on, and what it spent on the arms. They read as one exchange only side by
+/// side.
 ///
 /// One wrapping label per line, and it has to stay that way: these rows only
 /// exist once a run has finished, so
@@ -2741,6 +2819,7 @@ fn output_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
 fn pass_notes(ui: &mut egui::Ui, editor: &Editor) {
     for (pass, notes) in [
         ("trim", editor.trim_notes()),
+        ("flush", editor.flush_notes()),
         ("reinforce", editor.reinforce_notes()),
         ("boundaries", editor.clamp_notes()),
     ] {
@@ -3229,6 +3308,8 @@ mod tests {
                 config.output.trim_stress_fraction = Some(0.02);
                 config.output.reinforce = Some(ReinforcePolicy::MinThickness);
                 config.output.reinforce_thickness_mm = Some(2.0);
+                config.output.flush = Some(FlushPolicy::Walls);
+                config.output.flush_depth_mm = Some(8.0);
                 config.output.stress_json = Some("fixture.stress.json".to_string());
                 config.growth = Some(GrowthConfig {
                     seed: Some(7),
@@ -3778,6 +3859,100 @@ mod tests {
         assert_eq!(ReinforcePolicy::MinThickness.label(), "min_thickness");
     }
 
+    /// The flush rows, in every state they have: the policy absent and on both
+    /// of its values, and the depth absent and pinned - a row that exists only
+    /// while the pass does, and whose shown default is two voxels of this
+    /// configuration's own grid rather than a fixed length.
+    #[test]
+    fn the_output_section_draws_the_flush_rows_in_every_state() {
+        let (_dir, path) = write_temp("panel_flush", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        assert_eq!(editor.state.config().output.flush, None);
+        for (flush, depth) in [
+            (None, None),
+            (Some(FlushPolicy::Off), None),
+            (Some(FlushPolicy::Walls), None),
+            (Some(FlushPolicy::Walls), Some(8.0)),
+        ] {
+            editor.state.edit(|config| {
+                config.output.flush = flush;
+                config.output.flush_depth_mm = depth;
+            });
+            let context = egui::Context::default();
+            let _ = context.run_ui(egui::RawInput::default(), |root| {
+                let mut field = Field::new(&mut editor.state, true);
+                output_section(root, &mut field);
+            });
+            assert_eq!(editor.state.config().output.flush, flush);
+            assert_eq!(editor.state.config().output.flush_depth_mm, depth);
+        }
+        assert_eq!(FlushPolicy::default(), FlushPolicy::Off);
+        assert_eq!(FlushPolicy::Off.label(), "off");
+        assert_eq!(FlushPolicy::Walls.label(), "walls");
+    }
+
+    /// Switching the flush combo back to `off` takes its depth with it, in one
+    /// undo step.
+    ///
+    /// The row that edits the depth exists only while the pass does, so a value
+    /// left behind under `off` is a key nothing on screen can reach - and it is
+    /// the one `[output]` number whose legal range is measured in voxels, so a
+    /// later resolution edit can push it out of range and refuse the build with
+    /// no row naming it. The switch to the solid engine already took both keys
+    /// out; the combo is the path a user actually takes.
+    #[test]
+    fn switching_the_flush_pass_off_takes_its_depth_with_it() {
+        let (_dir, path) = write_temp("panel_flush_off", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.edit(|config| {
+            config.output.flush = Some(FlushPolicy::Walls);
+            config.output.flush_depth_mm = Some(8.0);
+        });
+
+        // The combo's own edit, exactly as the frame applies it: the handler
+        // writes into the table the frame stores back in one go, and the
+        // interaction is opened and closed around the pair.
+        editor
+            .state
+            .edit(|config| write_flush_policy(&mut config.output, FlushPolicy::Off));
+        assert_eq!(editor.state.config().output.flush, Some(FlushPolicy::Off));
+        assert_eq!(
+            editor.state.config().output.flush_depth_mm,
+            None,
+            "a depth was left behind under a policy that draws no row for it"
+        );
+
+        // And the file it saves, which is where a leftover would go on to refuse
+        // a build: the policy it was told, and no depth under it.
+        editor.save();
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(saved.contains("flush = \"off\""), "{saved}");
+        assert!(
+            !saved.contains("flush_depth_mm"),
+            "a depth outlived the pass it belongs to, in the file: {saved}"
+        );
+
+        // One undo puts both back, which is what makes the pair one step.
+        assert!(editor.state.undo());
+        assert_eq!(editor.state.config().output.flush, Some(FlushPolicy::Walls));
+        assert_eq!(editor.state.config().output.flush_depth_mm, Some(8.0));
+
+        // And switching *on* leaves the table alone: the depth is absent until
+        // the row that owns it is ticked.
+        editor
+            .state
+            .edit(|config| write_flush_policy(&mut config.output, FlushPolicy::Walls));
+        assert_eq!(editor.state.config().output.flush_depth_mm, Some(8.0));
+        editor
+            .state
+            .edit(|config| config.output.flush_depth_mm = None);
+        editor
+            .state
+            .edit(|config| write_flush_policy(&mut config.output, FlushPolicy::Walls));
+        assert_eq!(editor.state.config().output.flush, Some(FlushPolicy::Walls));
+        assert_eq!(editor.state.config().output.flush_depth_mm, None);
+    }
+
     /// The boundary fidelity combo, in each of its states, and the value it
     /// leaves in the document.
     ///
@@ -3916,6 +4091,8 @@ mod tests {
                 trim_stress_fraction: Some(0.02),
                 reinforce: Some(ReinforcePolicy::MinThickness),
                 reinforce_thickness_mm: Some(2.5),
+                flush: Some(FlushPolicy::Walls),
+                flush_depth_mm: Some(8.0),
                 stress_json: Some("stress.json".to_string()),
             };
         });
@@ -4072,11 +4249,14 @@ mod tests {
             assert_eq!(output.trim_stress_fraction, None);
             assert_eq!(output.reinforce, None);
             assert_eq!(output.reinforce_thickness_mm, None);
+            assert_eq!(output.flush, None);
+            assert_eq!(output.flush_depth_mm, None);
             // The absent policies are the documented defaults, which is what
             // makes taking the keys out the same thing as resetting them.
             assert_eq!(BoundaryFidelity::default(), BoundaryFidelity::Exact);
             assert_eq!(TrimPolicy::default(), TrimPolicy::Off);
             assert_eq!(ReinforcePolicy::default(), ReinforcePolicy::Off);
+            assert_eq!(FlushPolicy::default(), FlushPolicy::Off);
         }
         assert!(editor.state.undo());
 
@@ -4329,6 +4509,8 @@ mod tests {
             config.optimization.update = Some(UpdateScheme::Mma);
             config.output.trim = Some(TrimPolicy::Stress);
             config.output.reinforce = Some(ReinforcePolicy::MinThickness);
+            config.output.flush = Some(FlushPolicy::Walls);
+            config.output.flush_depth_mm = Some(8.0);
         });
         editor.state.revalidate();
         assert!(editor.state.is_valid(), "{:?}", editor.state.error());
@@ -4345,6 +4527,12 @@ mod tests {
         assert_eq!(config.optimization.local_volume, None);
         assert_eq!(config.output.trim, None);
         assert_eq!(config.output.reinforce, None);
+        assert_eq!(config.output.flush, None);
+        assert_eq!(
+            config.output.flush_depth_mm, None,
+            "the depth of a pass that is gone is a control over nothing, and its range is measured \
+             in voxels of a grid a later edit can change"
+        );
         // The keys the solid engine merely never reads are left exactly as they
         // were: a switch is not a tidy-up.
         assert_eq!(config.optimization.update, Some(UpdateScheme::Mma));
@@ -4781,7 +4969,8 @@ mod tests {
     fn the_panel_shows_what_the_post_run_passes_did() {
         let trimming = growth_fixture().replace(
             "stl_path = \"fixture.stl\"",
-            "stl_path = \"fixture.stl\"\ntrim = \"stress\"\nreinforce = \"min_thickness\"",
+            "stl_path = \"fixture.stl\"\ntrim = \"stress\"\nreinforce = \"min_thickness\"\nflush = \
+             \"walls\"",
         );
         let (_dir, path) = write_temp("panel_trim", &trimming);
         let mut editor = Editor::open(&path).expect("open");
@@ -4790,6 +4979,7 @@ mod tests {
         // Nothing has run, so there is nothing to say and nothing is said.
         assert!(editor.trim_notes().is_empty());
         assert!(editor.reinforce_notes().is_empty());
+        assert!(editor.flush_notes().is_empty());
         draw(&mut editor, &mut scene);
 
         // Waited out rather than joined: joining collects the run and takes its
@@ -4815,6 +5005,15 @@ mod tests {
         assert!(
             reinforce.iter().all(|note| !note.is_empty()),
             "the panel was handed a blank line: {reinforce:?}"
+        );
+        let flush = editor.flush_notes();
+        assert!(
+            !flush.is_empty(),
+            "the flush ran and the panel was never told"
+        );
+        assert!(
+            flush.iter().all(|note| !note.is_empty()),
+            "the panel was handed a blank line: {flush:?}"
         );
         // The boundary clamp is on by default, so the same block carries its
         // line too - the notes block renders every pass, not one of them.

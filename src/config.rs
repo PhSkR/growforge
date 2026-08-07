@@ -744,6 +744,36 @@ impl ReinforcePolicy {
     }
 }
 
+/// What to do about the walls of the final field that stand against a surface
+/// the configuration drew but come out short of it.
+///
+/// Unrelated to `[output] boundaries`, which corrects the same defect on the
+/// *mesh* and can only reach what the field put within half a voxel of the
+/// surface. This runs after every engine, on the density field itself, and is
+/// what puts the material there for the clamp to seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlushPolicy {
+    /// Export the field the engine produced, however far short of its surfaces
+    /// the walls came out.
+    #[default]
+    Off,
+    /// Fill the design cells within `flush_depth_mm` of a domain or keepout
+    /// surface that the part's own material already reaches into, so a wall
+    /// resting against that surface reaches it.
+    Walls,
+}
+
+impl FlushPolicy {
+    /// Config spelling, for reports and for writing a configuration back out.
+    pub fn label(self) -> &'static str {
+        match self {
+            FlushPolicy::Off => "off",
+            FlushPolicy::Walls => "walls",
+        }
+    }
+}
+
 /// `[output]`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -775,6 +805,13 @@ pub struct OutputConfig {
     /// millimetres. Absent is `[optimization] min_feature_mm`, the smallest
     /// feature the run was asked to resolve.
     pub reinforce_thickness_mm: Option<f64>,
+    /// Flush wall policy of the final density field.
+    pub flush: Option<FlushPolicy>,
+    /// How deep the flush pass fills against a domain or keepout surface, in
+    /// millimetres. Absent is [`constants::FLUSH_DEPTH_VOXELS`] of the voxel
+    /// size, which is a property of the grid rather than of this table; see
+    /// [`crate::flush::depth_mm`].
+    pub flush_depth_mm: Option<f64>,
     /// Destination of the machine readable stress report; relative paths
     /// resolve against the config file. Absent writes no file.
     pub stress_json: Option<String>,
@@ -1448,6 +1485,19 @@ pub struct OutputParams {
     /// one resolved output control that is derived from another table; see
     /// [`Config::output_params`].
     pub reinforce_thickness_mm: f64,
+    /// What to do with the walls of the final field that stand short of the
+    /// surface they rest against.
+    pub flush: FlushPolicy,
+    /// How deep the flush pass fills, in millimetres, exactly as the file asked
+    /// - the one resolved output control that is **not** defaulted here.
+    ///
+    /// Its default is [`constants::FLUSH_DEPTH_VOXELS`] of the voxel size, and
+    /// the voxel size is a property of the grid: a `[resolution] target_cells`
+    /// derives one from the domain bounds, which this method does not have and
+    /// would have to build the whole CSG tree to get. [`crate::flush::depth_mm`]
+    /// is the one place the derivation happens, and both the pass and the
+    /// range check in `Problem::build` read it from there.
+    pub flush_depth_mm: Option<f64>,
     /// Absolute destination of the JSON stress report, when one was asked for.
     pub stress_json: Option<PathBuf>,
 }
@@ -2292,12 +2342,16 @@ impl Config {
                 constants::DEFAULT_ENGINE
             );
         }
-        // The two passes over the finished field. Both are legal for every other
-        // engine and both would take this one's whole point away: what the solid
+        // The three passes over the finished field. All are legal for every other
+        // engine and all would take this one's whole point away: what the solid
         // engine exports is the domain, exactly, and a pass that removes or adds
-        // material to it exports something else.
+        // material to it exports something else. The flush is refused for the
+        // same reason and not because it would be wrong: a fully dense domain
+        // already reaches its own surfaces, so the pass has nothing to correct
+        // there and the boundary clamp alone puts the mesh on them.
         let trim = self.output.trim.unwrap_or_default();
         let reinforce = self.output.reinforce.unwrap_or_default();
+        let flush = self.output.flush.unwrap_or_default();
         for (key, asked, label, off) in [
             (
                 "trim",
@@ -2311,14 +2365,20 @@ impl Config {
                 reinforce.label(),
                 ReinforcePolicy::Off.label(),
             ),
+            (
+                "flush",
+                flush != FlushPolicy::Off,
+                flush.label(),
+                FlushPolicy::Off.label(),
+            ),
         ] {
             if asked {
                 bail!(
                     "engine = \"{}\" cannot be combined with [output] {key} = \"{label}\": the \
                      solid engine exports exactly the domain that was described, and this pass \
                      would alter it - {key} is for a part an optimizer produced, where some of the \
-                     material carries nothing or came out too thin. Set {key} = \"{off}\", or run \
-                     this problem with engine = \"{}\"",
+                     material carries nothing, came out too thin, or came out short of a surface \
+                     it rests on. Set {key} = \"{off}\", or run this problem with engine = \"{}\"",
                     constants::SOLID_ENGINE,
                     constants::DEFAULT_ENGINE
                 );
@@ -2553,6 +2613,21 @@ impl Config {
                  member of the part to, and absent it is [optimization] min_feature_mm"
             );
         }
+        // Only that it is a length at all. How deep a flush may sensibly be is
+        // measured in voxels of the grid the run is solved on, and the voxel
+        // size is not known here; `Problem::build` holds that end of it, the
+        // way it holds `[growth] step_mm`'s. Checked whichever policy is in
+        // force, for the reason the two above are.
+        if let Some(depth) = out.flush_depth_mm
+            && (!depth.is_finite() || depth <= 0.0)
+        {
+            bail!(
+                "[output]: flush_depth_mm must be a positive length in millimetres (got {depth}); \
+                 it is how deep the flush pass fills against a domain or keepout surface, and \
+                 absent it is {} voxels of the grid",
+                constants::FLUSH_DEPTH_VOXELS
+            );
+        }
         let stress_json = match &out.stress_json {
             Some(path) if path.trim().is_empty() => {
                 bail!("[output]: stress_json must not be empty; remove the key to write no file")
@@ -2574,6 +2649,8 @@ impl Config {
             trim_stress_fraction,
             reinforce: out.reinforce.unwrap_or_default(),
             reinforce_thickness_mm,
+            flush: out.flush.unwrap_or_default(),
+            flush_depth_mm: out.flush_depth_mm,
             stress_json,
         })
     }
@@ -4454,6 +4531,74 @@ vector = [0.0, 0.0, -10.0]
         }
     }
 
+    /// The flush policy and its depth, which is the one `[output]` key this
+    /// method deliberately does **not** default: how deep two voxels is, is a
+    /// property of the grid, and `Problem::build` is where that is known.
+    #[test]
+    fn the_output_table_resolves_the_flush_policy_and_carries_its_depth_as_asked() {
+        let default = Config::parse(MINIMAL)
+            .unwrap()
+            .output_params(Path::new("/cfg"))
+            .unwrap();
+        assert_eq!(
+            default.flush,
+            FlushPolicy::Off,
+            "flush must be off by default"
+        );
+        assert_eq!(
+            default.flush_depth_mm, None,
+            "an absent depth stays absent here; the grid is what resolves it"
+        );
+
+        for policy in [FlushPolicy::Off, FlushPolicy::Walls] {
+            let text = MINIMAL.replace(
+                "stl_path = \"out.stl\"",
+                &format!(
+                    "stl_path = \"out.stl\"\nflush = \"{}\"\nflush_depth_mm = 2.5",
+                    policy.label()
+                ),
+            );
+            let resolved = Config::parse(&text)
+                .unwrap()
+                .output_params(Path::new("/cfg"))
+                .unwrap();
+            assert_eq!(resolved.flush, policy);
+            assert_eq!(resolved.flush_depth_mm, Some(2.5));
+        }
+
+        // A depth is a length: finite and above zero, checked whatever the
+        // policy is. How many voxels of it is sane is checked where the voxel
+        // size is; see `Problem::build`.
+        for value in ["0.0", "-1.0", "nan", "inf"] {
+            let text = MINIMAL.replace(
+                "stl_path = \"out.stl\"",
+                &format!("stl_path = \"out.stl\"\nflush_depth_mm = {value}"),
+            );
+            let error = Config::parse(&text)
+                .unwrap()
+                .output_params(Path::new("/cfg"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("flush_depth_mm") && error.contains("positive length"),
+                "unexpected error for {value}: {error}"
+            );
+        }
+
+        // An unknown policy and a misspelled key are both rejected. "exact" in
+        // particular: it is what `[output] boundaries` calls the mesh side of
+        // the same defect, and a configuration that reached for it here has to
+        // be told.
+        for (key, value) in [("flush", "exact"), ("flush_walls", "walls")] {
+            let text = MINIMAL.replace(
+                "stl_path = \"out.stl\"",
+                &format!("stl_path = \"out.stl\"\n{key} = \"{value}\""),
+            );
+            let error = Config::parse(&text).unwrap_err().to_string();
+            assert!(error.contains(key), "unexpected error: {error}");
+        }
+    }
+
     #[test]
     fn the_supersample_factor_defaults_to_one_and_is_bounded() {
         let default = Config::parse(MINIMAL)
@@ -4773,6 +4918,7 @@ max_steps = 25
         for (body, needle) in [
             ("trim = \"stress\"", "trim"),
             ("reinforce = \"min_thickness\"", "reinforce"),
+            ("flush = \"walls\"", "flush"),
         ] {
             let text = solid("").replace(
                 "stl_path = \"out.stl\"",
@@ -4789,10 +4935,10 @@ max_steps = 25
                 "{body}: the error has to say why: {err}"
             );
         }
-        // Both explicitly off is what the engine asks for, and is accepted.
+        // All three explicitly off is what the engine asks for, and is accepted.
         let off = solid("").replace(
             "stl_path = \"out.stl\"",
-            "stl_path = \"out.stl\"\ntrim = \"off\"\nreinforce = \"off\"",
+            "stl_path = \"out.stl\"\ntrim = \"off\"\nreinforce = \"off\"\nflush = \"off\"",
         );
         Config::parse(&off)
             .expect("parse")
@@ -5228,6 +5374,14 @@ max_steps = 25
             );
             let parsed = Config::parse(&text).expect("parse");
             assert_eq!(parsed.output.reinforce, Some(policy));
+        }
+        for policy in [FlushPolicy::Off, FlushPolicy::Walls] {
+            let text = MINIMAL.replace(
+                "stl_path = \"out.stl\"",
+                &format!("stl_path = \"out.stl\"\nflush = \"{}\"", policy.label()),
+            );
+            let parsed = Config::parse(&text).expect("parse");
+            assert_eq!(parsed.output.flush, Some(policy));
         }
         for op in [CsgOpSpec::Add, CsgOpSpec::Subtract] {
             let text = MINIMAL.replace("op = \"add\"", &format!("op = \"{}\"", op.label()));

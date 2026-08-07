@@ -10,9 +10,10 @@ use growforge::config::Config;
 use growforge::constants;
 use growforge::problem::Problem;
 use growforge::report::{
-    ConsoleReporter, print_bench_report, print_clamp_report, print_island_report, print_mesh_stats,
-    print_problem_summary, print_reinforce_report, print_self_weight, print_solid_report,
-    print_stress_report, print_trim_report, print_void_report, print_warnings,
+    ConsoleReporter, print_bench_report, print_clamp_report, print_flush_report,
+    print_island_report, print_mesh_stats, print_problem_summary, print_reinforce_report,
+    print_self_weight, print_solid_report, print_stress_report, print_trim_report,
+    print_void_report, print_warnings,
 };
 use growforge::{RunOutcome, load_config_and_problem};
 
@@ -224,7 +225,9 @@ fn dispatch() -> Result<()> {
             }
             print_trim_report(outcome.trim.as_ref());
             // Beside the trim, in the order the pipeline ran them: what was
-            // freed, then what was spent.
+            // freed, what was put back out to the surfaces the walls rest on,
+            // then what was spent.
+            print_flush_report(outcome.flush.as_ref());
             print_reinforce_report(outcome.reinforce.as_ref());
             print_void_report(&outcome.voids);
             print_solid_report(&outcome.solids);

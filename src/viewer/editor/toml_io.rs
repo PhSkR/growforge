@@ -360,6 +360,8 @@ impl Document {
             "reinforce_thickness_mm",
             config.output.reinforce_thickness_mm,
         );
+        set_opt_str(output, "flush", config.output.flush.map(|f| f.label()));
+        set_opt_float(output, "flush_depth_mm", config.output.flush_depth_mm);
         set_opt_str(output, "stress_json", config.output.stress_json.as_deref());
 
         sync_array(root, List::Domain.key(), &config.domain, |table, entry| {
@@ -2154,6 +2156,60 @@ mod tests {
                 .expect("resolve")
                 .reinforce_thickness_mm,
             reparsed.optimization.min_feature_mm
+        );
+    }
+
+    /// And the same for the flush pass. Its depth is the one of the three whose
+    /// absent value is not a constant and not another table's key either: it is
+    /// two voxels of the grid, so what a save has to preserve is the *absence*.
+    #[test]
+    fn the_flush_policy_and_its_depth_round_trip_through_a_save() {
+        let (mut config, mut document) = open(fixture());
+        assert_eq!(config.output.flush, None);
+        assert_eq!(config.output.flush_depth_mm, None);
+
+        config.output.flush = Some(crate::config::FlushPolicy::Walls);
+        config.output.flush_depth_mm = Some(2.5);
+        document.sync(&config).expect("sync");
+        let saved = document.render();
+        assert!(saved.contains("flush = \"walls\""), "{saved}");
+        assert!(saved.contains("flush_depth_mm = 2.5"), "{saved}");
+        let reparsed = Config::parse(&saved).expect("reparse");
+        assert_eq!(
+            reparsed.output.flush,
+            Some(crate::config::FlushPolicy::Walls)
+        );
+        assert_eq!(reparsed.output.flush_depth_mm, Some(2.5));
+
+        // Switched off through the panel, which takes the depth with it: the
+        // file keeps the policy it was told and loses the control over a pass
+        // that is no longer running. See `ui::write_flush_policy`.
+        config.output.flush = Some(crate::config::FlushPolicy::Off);
+        config.output.flush_depth_mm = None;
+        document.sync(&config).expect("sync");
+        let saved = document.render();
+        assert!(saved.contains("flush = \"off\""), "{saved}");
+        assert!(
+            !saved.contains("flush_depth_mm"),
+            "a depth outlived the pass it belongs to: {saved}"
+        );
+        let reparsed = Config::parse(&saved).expect("reparse");
+        assert_eq!(reparsed.output.flush, Some(crate::config::FlushPolicy::Off));
+        assert_eq!(reparsed.output.flush_depth_mm, None);
+
+        config.output.flush = None;
+        config.output.flush_depth_mm = None;
+        document.sync(&config).expect("sync");
+        let saved = document.render();
+        assert!(!saved.contains("flush"), "{saved}");
+        let reparsed = Config::parse(&saved).expect("still valid TOML");
+        assert_eq!(
+            reparsed
+                .output_params(std::path::Path::new("."))
+                .expect("resolve")
+                .flush_depth_mm,
+            None,
+            "an absent depth has to stay absent through the resolver as well"
         );
     }
 
