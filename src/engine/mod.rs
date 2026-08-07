@@ -1,9 +1,10 @@
 //! Optimization engines.
 //!
 //! An engine takes a discrete [`Problem`] and returns a converged density
-//! field. Two are registered below: `simp`, the finite element driven topology
-//! optimizer, and `growth`, a fast deterministic growth heuristic. The registry
-//! is the seam they plug into; neither the CLI, the post-processing nor the mesh
+//! field. Three are registered below: `simp`, the finite element driven topology
+//! optimizer, `growth`, a fast deterministic growth heuristic, and `solid`,
+//! which optimizes nothing and hands back the domain itself. The registry is the
+//! seam they plug into; neither the CLI, the post-processing nor the mesh
 //! pipeline knows which one ran.
 //!
 //! [`wireframe`] is a setup stage of the SIMP engine rather than an engine of its
@@ -20,6 +21,7 @@ pub mod mma;
 pub mod objective;
 pub mod oc;
 pub mod simp;
+pub mod solid;
 pub mod stall;
 pub mod update;
 pub mod wireframe;
@@ -244,10 +246,15 @@ fn make_growth() -> Box<dyn Engine> {
     Box::new(growth::GrowthEngine)
 }
 
+fn make_solid() -> Box<dyn Engine> {
+    Box::new(solid::SolidEngine)
+}
+
 /// All engines growforge knows about, keyed by their config value.
 const REGISTRY: &[(&str, EngineFactory)] = &[
     (constants::DEFAULT_ENGINE, make_simp),
     (constants::GROWTH_ENGINE, make_growth),
+    (constants::SOLID_ENGINE, make_solid),
 ];
 
 /// Registered engine keys, in registration order.
@@ -293,9 +300,21 @@ mod tests {
     fn the_growth_engine_is_registered() {
         let engine = create(constants::GROWTH_ENGINE).expect("growth engine");
         assert_eq!(engine.name(), constants::GROWTH_ENGINE);
+    }
+
+    #[test]
+    fn the_solid_engine_is_registered() {
+        let engine = create(constants::SOLID_ENGINE).expect("solid engine");
+        assert_eq!(engine.name(), constants::SOLID_ENGINE);
+        // The whole registry, in registration order: the combo box of the
+        // editor and every "available engines are ..." message read it.
         assert_eq!(
             available(),
-            vec![constants::DEFAULT_ENGINE, constants::GROWTH_ENGINE]
+            vec![
+                constants::DEFAULT_ENGINE,
+                constants::GROWTH_ENGINE,
+                constants::SOLID_ENGINE
+            ]
         );
     }
 
@@ -306,6 +325,7 @@ mod tests {
             err.contains("nope")
                 && err.contains(constants::DEFAULT_ENGINE)
                 && err.contains(constants::GROWTH_ENGINE)
+                && err.contains(constants::SOLID_ENGINE)
         );
     }
 }

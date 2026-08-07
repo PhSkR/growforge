@@ -25,6 +25,17 @@ pub const DEFAULT_ENGINE: &str = "simp";
 /// Name of the growth heuristic engine.
 pub const GROWTH_ENGINE: &str = "growth";
 
+/// Name of the engine that exports the domain itself.
+///
+/// It optimizes nothing: every design cell is filled and the part that ships is
+/// the design space the configuration described, held to its analytic surfaces
+/// by the same export the other engines go through. What it is for is the part
+/// that was never a topology problem - a plug, a housing, a fixture drawn as
+/// CSG - which before it had to be faked through SIMP at a mass fraction just
+/// under one, where the optimizer redistributes material it was not asked to
+/// move and the density filter erodes the boundary cells.
+pub const SOLID_ENGINE: &str = "solid";
+
 /// Backend the linear solves run on when `[solver] backend` is absent.
 ///
 /// The compute device, because that is what the machine in front of the user
@@ -1516,6 +1527,35 @@ pub const BOUNDARY_CLAMP_TOLERANCE_MM: f64 = 1e-7;
 /// the iteration can oscillate instead of settling; a vertex that reaches the
 /// ceiling is left where it was and counted.
 pub const BOUNDARY_CLAMP_MAX_STEPS: usize = 64;
+
+/// How near an analytic surface a **legal** vertex has to sit, in voxels, for
+/// the gap to count as a sampling artefact and be closed.
+///
+/// The clamp's first job is the vertex that is *proud* of a boundary, and that
+/// one is decided by legality: it is on the wrong side, so it is moved. This
+/// decides the other half of the same artefact. Marching cubes puts a vertex
+/// within about half a voxel of the crossing it interpolates, Taubin smoothing
+/// then rounds the staircase that sampling produces, and the two together
+/// scatter a wall's vertices to *both* sides of the surface the wall really is.
+/// Correcting only the outward half leaves the inward half as dimples - measured
+/// at up to a third of a voxel on a 0.5 mm plug, and visible as scalloping on a
+/// surface that was supposed to be a cone.
+///
+/// Half a voxel is the artefact's own scale, and it is the figure the module
+/// header already names: a cell is classified by its **centre**, so the modelled
+/// solid and the analytic one differ by at most half a voxel anywhere. Nothing
+/// further away than that is a sampling error, and nothing further away is
+/// touched - an optimizer's free surface running through the middle of the
+/// domain is not near a boundary at all, and the smoothing that shaped it is
+/// left alone.
+///
+/// What it costs, stated plainly: a free surface that runs *within* half a voxel
+/// of a boundary is treated as resting on it and is seated onto it. That is a
+/// gap the voxel field cannot resolve anyway - a void channel that thin is below
+/// what one cell centre can carry - and the correction is always onto the legal
+/// side, so it can add a sliver of material inside the domain and can never put
+/// any outside it or inside a keepout.
+pub const BOUNDARY_CLAMP_CAPTURE_VOXELS: f64 = 0.5;
 
 /// Half-step of the central difference the domain projection reads its gradient
 /// from, in millimetres.

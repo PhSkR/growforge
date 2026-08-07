@@ -262,121 +262,132 @@ pub fn print_problem_summary(problem: &Problem) {
         }
     }
     let solid_volume = problem.counts.active() as f64 * problem.cell_volume_mm3();
-    println!(
-        "domain volume  {:.1} mm3 fully solid, target {:.1} mm3 at mass_fraction {}",
-        solid_volume,
-        (problem.counts.solid as f64
-            + problem.counts.design as f64 * problem.optimization.mass_fraction)
-            * problem.cell_volume_mm3(),
-        problem.optimization.mass_fraction
-    );
-    match &problem.growth {
-        // The density filter and the self-supporting filter are stages of the
-        // SIMP density chain; a growth run has neither, and reports the knobs it
-        // does have in their place.
-        Some(growth) => {
-            println!(
-                "growth seed    {} (same seed and config, same STL)",
-                growth.seed
-            );
-            println!(
-                "growth strut   {:.3} .. {:.3} mm radius from min_feature_mm {:.3}, Murray n = {}",
-                0.5 * problem.optimization.min_feature_mm,
-                growth.max_radius_mm,
-                problem.optimization.min_feature_mm,
-                growth.murray_exponent
-            );
-            println!(
-                "growth field   {:.3} mm step, {:.3} mm kill, {:.3} mm attraction, {:.2} attractors/cm3, {} steps max",
-                growth.step_mm,
-                growth.kill_radius_mm,
-                growth.attraction_radius_mm,
-                growth.attractor_per_cm3,
-                growth.max_steps
-            );
-            println!(
-                "growth pruning {}",
-                if growth.prune {
-                    "on, branches that end on nothing are removed"
-                } else {
-                    "off, branches that end on nothing are kept"
-                }
-            );
-            println!(
-                "growth symmetry {}",
-                match growth.symmetry {
-                    Some(symmetry) => format!(
-                        "{}, {} sectors about the domain centre [{:.3}, {:.3}, {:.3}]; one is \
+    if problem.is_solid() {
+        // No mass target was set and none is invented: the domain is the target,
+        // which is the whole of what this engine is.
+        println!("domain volume  {solid_volume:.1} mm3 fully solid, which is what is exported");
+    } else {
+        println!(
+            "domain volume  {:.1} mm3 fully solid, target {:.1} mm3 at mass_fraction {}",
+            solid_volume,
+            (problem.counts.solid as f64
+                + problem.counts.design as f64 * problem.optimization.mass_fraction)
+                * problem.cell_volume_mm3(),
+            problem.optimization.mass_fraction
+        );
+    }
+    // The density filter, the self-supporting filter and the update scheme are
+    // stages of the SIMP density chain. A growth run has none of them and reports
+    // the knobs it does have in their place; a solid run has nothing to report at
+    // all, and says so in one line rather than echoing defaults nothing will read.
+    if problem.is_solid() {
+        println!("solid          every design cell fully dense; nothing is optimized");
+    } else {
+        match &problem.growth {
+            Some(growth) => {
+                println!(
+                    "growth seed    {} (same seed and config, same STL)",
+                    growth.seed
+                );
+                println!(
+                    "growth strut   {:.3} .. {:.3} mm radius from min_feature_mm {:.3}, Murray n = {}",
+                    0.5 * problem.optimization.min_feature_mm,
+                    growth.max_radius_mm,
+                    problem.optimization.min_feature_mm,
+                    growth.murray_exponent
+                );
+                println!(
+                    "growth field   {:.3} mm step, {:.3} mm kill, {:.3} mm attraction, {:.2} attractors/cm3, {} steps max",
+                    growth.step_mm,
+                    growth.kill_radius_mm,
+                    growth.attraction_radius_mm,
+                    growth.attractor_per_cm3,
+                    growth.max_steps
+                );
+                println!(
+                    "growth pruning {}",
+                    if growth.prune {
+                        "on, branches that end on nothing are removed"
+                    } else {
+                        "off, branches that end on nothing are kept"
+                    }
+                );
+                println!(
+                    "growth symmetry {}",
+                    match growth.symmetry {
+                        Some(symmetry) => format!(
+                            "{}, {} sectors about the domain centre [{:.3}, {:.3}, {:.3}]; one is \
                          grown and copied",
-                        symmetry.describe(),
-                        symmetry.sectors(),
-                        0.5 * (bounds.min[0] + bounds.max[0]),
-                        0.5 * (bounds.min[1] + bounds.max[1]),
-                        0.5 * (bounds.min[2] + bounds.max[2])
-                    ),
-                    None => "off, the whole domain is grown".to_string(),
-                }
-            );
-        }
-        None => {
-            println!(
-                "filter radius  {:.3} mm ({:.2} voxels) from min_feature_mm {:.3}",
-                problem.optimization.filter_radius_mm,
-                problem.optimization.filter_radius_mm / g.h,
-                problem.optimization.min_feature_mm
-            );
-            println!(
-                "overhang       {}",
-                match problem.optimization.overhang {
-                    Some(direction) => format!(
-                        "self-supporting filter, build direction {}, 45 degree limit",
-                        direction.label()
-                    ),
-                    None => "off".to_string(),
-                }
-            );
-            println!(
-                "update         {}",
-                match problem.optimization.update {
-                    UpdateScheme::Oc => "oc, optimality criteria (the reproducible default)",
-                    UpdateScheme::Mma => "mma, method of moving asymptotes",
-                }
-            );
-            println!(
-                "local volume   {}",
-                match problem.optimization.local_volume {
-                    Some(cap) => format!(
-                        "no neighbourhood of radius {:.3} mm may hold more than {:.3} of its \
+                            symmetry.describe(),
+                            symmetry.sectors(),
+                            0.5 * (bounds.min[0] + bounds.max[0]),
+                            0.5 * (bounds.min[1] + bounds.max[1]),
+                            0.5 * (bounds.min[2] + bounds.max[2])
+                        ),
+                        None => "off, the whole domain is grown".to_string(),
+                    }
+                );
+            }
+            None => {
+                println!(
+                    "filter radius  {:.3} mm ({:.2} voxels) from min_feature_mm {:.3}",
+                    problem.optimization.filter_radius_mm,
+                    problem.optimization.filter_radius_mm / g.h,
+                    problem.optimization.min_feature_mm
+                );
+                println!(
+                    "overhang       {}",
+                    match problem.optimization.overhang {
+                        Some(direction) => format!(
+                            "self-supporting filter, build direction {}, 45 degree limit",
+                            direction.label()
+                        ),
+                        None => "off".to_string(),
+                    }
+                );
+                println!(
+                    "update         {}",
+                    match problem.optimization.update {
+                        UpdateScheme::Oc => "oc, optimality criteria (the reproducible default)",
+                        UpdateScheme::Mma => "mma, method of moving asymptotes",
+                    }
+                );
+                println!(
+                    "local volume   {}",
+                    match problem.optimization.local_volume {
+                        Some(cap) => format!(
+                            "no neighbourhood of radius {:.3} mm may hold more than {:.3} of its \
                          material, aggregated by a p-mean of exponent {}",
-                        cap.radius_mm,
-                        cap.max_fraction,
-                        constants::LOCAL_VOLUME_AGGREGATION_EXPONENT
-                    ),
-                    None => "off".to_string(),
-                }
-            );
-            println!(
-                "wireframe      {}",
-                match problem.optimization.wireframe {
-                    Some(wire) => format!(
-                        "guide of radius {:.3} mm seeded at density {:.3}, held as a floor for {} \
+                            cap.radius_mm,
+                            cap.max_fraction,
+                            constants::LOCAL_VOLUME_AGGREGATION_EXPONENT
+                        ),
+                        None => "off".to_string(),
+                    }
+                );
+                println!(
+                    "wireframe      {}",
+                    match problem.optimization.wireframe {
+                        Some(wire) => format!(
+                            "guide of radius {:.3} mm seeded at density {:.3}, held as a floor for {} \
                          iterations{}",
-                        wire.radius_mm,
-                        wire.seed_density,
-                        wire.hold_iterations,
-                        // The claim the summary must not make is the one this
-                        // configuration cannot keep: a floor that outlasts the
-                        // budget is never released, and the design carries the
-                        // wire as forced material.
-                        if wire.hold_iterations < problem.optimization.max_iterations {
-                            " then released"
-                        } else {
-                            ", which is the whole iteration budget, so it is never released"
-                        }
-                    ),
-                    None => "off".to_string(),
-                }
-            );
+                            wire.radius_mm,
+                            wire.seed_density,
+                            wire.hold_iterations,
+                            // The claim the summary must not make is the one this
+                            // configuration cannot keep: a floor that outlasts the
+                            // budget is never released, and the design carries the
+                            // wire as forced material.
+                            if wire.hold_iterations < problem.optimization.max_iterations {
+                                " then released"
+                            } else {
+                                ", which is the whole iteration budget, so it is never released"
+                            }
+                        ),
+                        None => "off".to_string(),
+                    }
+                );
+            }
         }
     }
     println!("solver         {}", solver_line(&problem.solver));

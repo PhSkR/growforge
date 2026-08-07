@@ -85,12 +85,18 @@ fn status_label(status: &RunStatus) -> String {
 
 /// Draw the side panel. `progress` is `None` in a setup view, where nothing is
 /// running.
+///
+/// `engine` is the key of the engine behind the run, and it is here for one
+/// line: an engine that never reports an iteration - the solid one - has to be
+/// told apart from one whose first iteration has not landed yet, and the field
+/// cannot say which it is because there is no field yet either.
 pub fn panel(
     root: &mut egui::Ui,
     title: &str,
     adapter: &str,
     scene: &mut Scene,
     progress: Option<&Progress>,
+    engine: Option<&str>,
     frame: Option<FrameKind>,
 ) {
     // Fixed width: the 3D viewport is sized against it, so it may not be
@@ -147,6 +153,16 @@ pub fn panel(
                                 ui.monospace(format!("elapsed     {:.2} s", stats.elapsed_s));
                             }
                         }
+                    } else if engine == Some(constants::SOLID_ENGINE) {
+                        ui.monospace("no iterations");
+                        ui.label(
+                            egui::RichText::new(
+                                "the solid engine fills the domain and optimizes nothing, so there \
+                                 is no progress to show",
+                            )
+                            .small()
+                            .weak(),
+                        );
                     } else {
                         ui.monospace("waiting for the first iteration");
                     }

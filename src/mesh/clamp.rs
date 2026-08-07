@@ -25,6 +25,19 @@
 //! agrees. Where the part meets a bore, the bore becomes the cylinder that was
 //! asked for.
 //!
+//! **The scatter goes both ways, and so does the correction.** The sampling
+//! above does not put a wall's vertices reliably outside the surface: it puts
+//! them on *both* sides of it, and the smoothing that rounds the staircase pulls
+//! the corners inward. Correcting only the vertices that are proud of a
+//! boundary, which are the ones legality can see, leaves the inward half as
+//! dimples: a third to a half of a voxel, measured, and visible as scalloping on
+//! what was supposed to be a cone. So a vertex that is legal but sits within
+//! [`constants::BOUNDARY_CLAMP_CAPTURE_VOXELS`] of the boundary it rests on is
+//! seated onto it as well, by the same projection onto the same legal side. A
+//! vertex further away than that rests on nothing - it is an
+//! optimizer's free surface through the middle of the domain - and is left
+//! exactly where the smoothing put it.
+//!
 //! Three things bound it, because a projection that is allowed to do anything is
 //! a projection that can wreck a surface:
 //!
@@ -68,7 +81,8 @@ use crate::mesh::Mesh;
 /// What the boundary clamp found and did.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClampReport {
-    /// Vertices that were moved onto a boundary.
+    /// Vertices that were moved onto a boundary: the ones that were proud of
+    /// one, and the ones that were resting a sampling error short of one.
     pub vertices_moved: usize,
     /// The furthest any one of them travelled, in millimetres. Zero when none
     /// moved.
@@ -130,17 +144,20 @@ enum Correction {
     GaveUp,
 }
 
-/// Move every vertex of `mesh` that violates `boundaries` onto the surface it
-/// violates. `voxel_mm` is the grid spacing the field was sampled on, which is
-/// what the displacement cap is measured in.
+/// Move every vertex of `mesh` onto the boundary it belongs on: the ones that
+/// violate one, and the ones resting a sampling error short of one.
+///
+/// `voxel_mm` is the grid spacing the field was sampled on, which is what both
+/// the displacement cap and the capture band are measured in.
 pub fn resolve(mesh: &mut Mesh, boundaries: &Boundaries, voxel_mm: f64) -> ClampReport {
     let cap = constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS * voxel_mm;
+    let capture = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * voxel_mm;
     // Decided in parallel and applied in order, so the report counts the same
     // vertices in the same order however many threads ran.
     let corrections: Vec<Correction> = mesh
         .vertices
         .par_iter()
-        .map(|vertex| corrected(*vertex, boundaries, cap))
+        .map(|vertex| corrected(*vertex, boundaries, cap, capture))
         .collect();
 
     let mut report = ClampReport {
@@ -179,9 +196,9 @@ fn legal(p: Vec3, boundaries: &Boundaries) -> bool {
 }
 
 /// Where one vertex belongs, or that it has to be left alone.
-fn corrected(vertex: Vec3, boundaries: &Boundaries, cap: f64) -> Correction {
+fn corrected(vertex: Vec3, boundaries: &Boundaries, cap: f64, capture: f64) -> Correction {
     if legal(vertex, boundaries) {
-        return Correction::Legal;
+        return seated(vertex, boundaries, cap, capture);
     }
     let mut at = vertex;
     for _ in 0..constants::BOUNDARY_CLAMP_MAX_PASSES {
@@ -200,6 +217,68 @@ fn corrected(vertex: Vec3, boundaries: &Boundaries, cap: f64) -> Correction {
     Correction::GaveUp
 }
 
+/// The other half of the same artefact: a vertex that is already legal, but is
+/// resting a sampling error short of the surface it belongs on.
+///
+/// A wall's vertices come out of marching cubes and Taubin smoothing scattered
+/// to *both* sides of the surface the wall really is. The proud ones are
+/// corrected by [`corrected`] because they are illegal; these are not illegal at
+/// all - they are a dimple, and left alone they are what makes an exported cone
+/// scallop instead of being a cone.
+///
+/// Two things bound it, and between them they are why this cannot deform a
+/// surface. **The capture band**: only a vertex within
+/// [`constants::BOUNDARY_CLAMP_CAPTURE_VOXELS`] of a boundary is seated on it,
+/// which is the scale a cell-centre classification can be wrong by and nothing
+/// larger; an optimizer's free surface running through the middle of the domain
+/// is nowhere near one and is never touched. **Legality of the result**: the
+/// seated position is tested exactly as an incoming vertex is, so a correction
+/// that would put a vertex proud of another boundary - the seam where a keepout
+/// meets the domain wall - is dropped and the vertex stays where it legally
+/// already was. Nothing here can produce a vertex that is proud of anything, and
+/// a seat that cannot be made exactly is not made at all: `GaveUp` means "still
+/// crosses a boundary", which is never true of these.
+fn seated(vertex: Vec3, boundaries: &Boundaries, cap: f64, capture: f64) -> Correction {
+    // The boundary this vertex is nearest to, whichever side of it the vertex
+    // sits on: a keepout member, or the domain as a whole.
+    let mut nearest: Option<(f64, Option<&Shape>)> = None;
+    for shape in boundaries.keepout.shapes() {
+        let distance = shape.signed_distance(vertex).abs();
+        if nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, Some(shape)));
+        }
+    }
+    if !boundaries.domain.is_empty() {
+        let distance = boundaries.domain.signed_distance(vertex).abs();
+        if nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, None));
+        }
+    }
+    let Some((distance, which)) = nearest else {
+        return Correction::Legal;
+    };
+    // Too far away to be a sampling artefact, or already on the surface: the
+    // offset a correction lands on is the width of "already there".
+    if !(distance.is_finite() && distance <= capture && distance > constants::BOUNDARY_CLAMP_EPS_MM)
+    {
+        return Correction::Legal;
+    }
+    let target = match which {
+        Some(shape) => onto(vertex, shape),
+        None => pull_in(vertex, &boundaries.domain),
+    };
+    match target {
+        Some(to)
+            if legal(to, boundaries)
+                && length(difference(to, vertex)).is_finite()
+                && length(difference(to, vertex)) <= cap =>
+        {
+            Correction::Moved(to)
+        }
+        _ => Correction::Legal,
+    }
+}
+
 /// One correction: out of the keepout the point is deepest inside, or - when it
 /// is clear of them all - back inside the domain.
 ///
@@ -215,7 +294,7 @@ fn one_pass(at: Vec3, boundaries: &Boundaries) -> Option<Vec3> {
         }
     }
     if let Some((_, shape)) = deepest {
-        return push_out(at, shape);
+        return onto(at, shape);
     }
     if !boundaries.domain.is_empty() && boundaries.domain.signed_distance(at) > 0.0 {
         return pull_in(at, &boundaries.domain);
@@ -223,25 +302,34 @@ fn one_pass(at: Vec3, boundaries: &Boundaries) -> Option<Vec3> {
     Some(at)
 }
 
-/// The point on `shape`'s surface that `at` belongs on, a hair further out.
+/// The point on `shape`'s surface that `at` belongs on, a hair outside it.
 ///
-/// The offset is along the direction the projection travelled, which for a point
-/// inside the shape is its outward normal, so the result clears the surface by
-/// [`constants::BOUNDARY_CLAMP_EPS_MM`] whatever the shape.
-fn push_out(at: Vec3, shape: &Shape) -> Option<Vec3> {
+/// Outside is the legal side of a keepout, so that is the side the offset of
+/// [`constants::BOUNDARY_CLAMP_EPS_MM`] is taken on whichever side `at` came
+/// from: the direction of travel for a vertex being pushed out of the shape,
+/// and the reverse of it for one being seated onto the surface from outside.
+/// The sign is read from the field rather than from the caller, so one statement
+/// of where a vertex belongs serves both.
+fn onto(at: Vec3, shape: &Shape) -> Option<Vec3> {
     let surface = shape.nearest_surface_point(at)?;
-    let outward = difference(surface, at);
-    let reach = length(outward);
+    let travelled = difference(surface, at);
+    let reach = length(travelled);
     if reach <= 0.0 || !reach.is_finite() {
         return None;
     }
+    let outward = match shape.signed_distance(at) < 0.0 {
+        true => travelled,
+        false => difference(at, surface),
+    };
     Some(sum(
         surface,
         scale(outward, constants::BOUNDARY_CLAMP_EPS_MM / reach),
     ))
 }
 
-/// The point just inside the domain that `at` belongs on.
+/// The point just inside the domain that `at` belongs on, from either side of
+/// it: the descent below is signed, so it seats a vertex that fell short of the
+/// surface exactly as it pulls in one that overshot it.
 ///
 /// The domain is an ordered CSG tree, whose field is a composition of minima and
 /// maxima with non-differentiable seams and no nearest-point formula, so this is
@@ -292,7 +380,7 @@ fn descend(start: Vec3, target: f64, field: impl Fn(Vec3) -> f64) -> Option<Vec3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::ShapeUnion;
+    use crate::geometry::{CsgOp, ShapeUnion};
 
     /// A mesh of loose vertices: this pass reads no triangle, so a fixture does
     /// not need to be a surface to exercise it.
@@ -428,7 +516,9 @@ mod tests {
             center: [0.0; 3],
             radius: 4.0,
         };
-        let outside = [9.0, 1.0, -2.0];
+        // Well clear of the capture band as well as of the shape: what this
+        // asserts is the vertex the pass has no business with at all.
+        let outside = [19.0, 1.0, -2.0];
         let mut mesh = loose(vec![outside]);
         let report = resolve(&mut mesh, &forbidden(vec![shape]), VOXEL_MM);
         assert_eq!(report.vertices_moved, 0);
@@ -442,6 +532,63 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    /// The other half of the sampling artefact: a vertex that violates nothing
+    /// but sits a fraction of a voxel short of the surface it belongs on is
+    /// seated onto it, from either side and against either kind of boundary.
+    ///
+    /// This is the dimple. Marching cubes and the smoothing that follows it
+    /// scatter a wall's vertices to both sides of the surface; correcting only
+    /// the illegal side leaves the legal side scalloped, which is what an
+    /// exported cone came out as before this existed.
+    #[test]
+    fn a_vertex_resting_short_of_a_surface_is_seated_onto_it() {
+        let eps = constants::BOUNDARY_CLAMP_EPS_MM;
+        let band = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * VOXEL_MM;
+        let sphere = Shape::Sphere {
+            center: [0.0; 3],
+            radius: 20.0,
+        };
+
+        // A keepout, from the legal side: 2 mm clear of a surface it should be
+        // on, which at this voxel size is well inside the band.
+        let short = [22.0, 0.0, 0.0];
+        let mut mesh = loose(vec![short]);
+        let report = resolve(&mut mesh, &forbidden(vec![sphere]), VOXEL_MM);
+        assert_eq!(report.vertices_moved, 1, "{report:?}");
+        assert_eq!(report.gave_up, 0, "{report:?}");
+        let seated = mesh.vertices[0];
+        let distance = sphere.signed_distance(seated);
+        assert!(
+            distance > 0.0 && distance <= 2.0 * eps,
+            "seated at {distance} mm from the surface, on the wrong side or short of it"
+        );
+
+        // And the domain, from inside it: the same gap, the same seat, and the
+        // result is still strictly inside.
+        let domain = Csg::new(vec![(CsgOp::Add, sphere)]);
+        let boundaries = Boundaries {
+            domain,
+            keepout: ShapeUnion::new(Vec::new()),
+        };
+        let mut mesh = loose(vec![[18.0, 0.0, 0.0]]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.vertices_moved, 1, "{report:?}");
+        let distance = boundaries.domain.signed_distance(mesh.vertices[0]);
+        assert!(
+            distance < 0.0 && distance.abs() <= 2.0 * eps,
+            "seated at {distance} mm inside the domain surface"
+        );
+
+        // Past the band nothing is touched: a free surface running through the
+        // middle of the domain is not a sampling artefact, and the smoothing
+        // that shaped it is left alone.
+        let far = [20.0 + 2.0 * band, 0.0, 0.0];
+        let mut mesh = loose(vec![far]);
+        let report = resolve(&mut mesh, &forbidden(vec![sphere]), VOXEL_MM);
+        assert_eq!(report.vertices_moved, 0, "{report:?}");
+        assert_eq!(mesh.vertices[0], far);
     }
 
     /// The ellipsoid has no closed form, so its projection is iterated - and it
@@ -532,7 +679,7 @@ mod tests {
         // projection - out of the deeper one - lands inside the second.
         let start = [2.0, 0.5, 0.0];
         assert!(first.signed_distance(start) < 0.0 && second.signed_distance(start) < 0.0);
-        let once = push_out(start, &first).expect("a projection");
+        let once = onto(start, &first).expect("a projection");
         assert!(
             second.signed_distance(once) < 0.0,
             "the fixture no longer needs a second pass"
@@ -632,7 +779,7 @@ mod tests {
         // Through the pass: the vertex is left exactly where it was, counted,
         // and given up on in one round rather than eight.
         let boundaries = forbidden(vec![overlapping]);
-        assert_eq!(push_out(inside, &overlapping), None);
+        assert_eq!(onto(inside, &overlapping), None);
         assert_eq!(
             one_pass(inside, &boundaries),
             None,
@@ -714,7 +861,7 @@ mod tests {
         // And through the pass: one round to the give-up, vertex untouched.
         let boundaries = forbidden(vec![shape]);
         let vertex = [5.909, 0.3, 0.0];
-        assert_eq!(push_out(vertex, &shape), None);
+        assert_eq!(onto(vertex, &shape), None);
         assert_eq!(one_pass(vertex, &boundaries), None);
         let mut mesh = loose(vec![vertex]);
         let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
@@ -792,8 +939,6 @@ mod tests {
     /// with a seam rather than a single shape.
     #[test]
     fn a_vertex_outside_the_domain_is_pulled_back_onto_it() {
-        use crate::geometry::CsgOp;
-
         let domain = Csg::new(vec![
             (
                 CsgOp::Add,

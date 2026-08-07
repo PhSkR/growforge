@@ -256,17 +256,21 @@ pub fn preview_voxel_size(cells: usize, voxel_mm: f64, budget: usize) -> f64 {
 
 /// The configuration a fast preview of `config` runs.
 ///
-/// Growth grows a whole design in milliseconds, so it previews at the real
-/// configuration and the only difference is that nothing is exported. SIMP is
-/// capped at [`constants::VIEW_EDIT_PREVIEW_MAX_ITERATIONS`] iterations on a
-/// grid coarsened to [`constants::VIEW_EDIT_PREVIEW_CELL_BUDGET`] cells. The
-/// solver backend is left alone: the whole `[solver]` table is carried over
-/// untouched, so a configuration that asked for the GPU still gets it and one
-/// that asked for nothing gets the same default a full run would - including
-/// the fallback, which is the machine's business rather than the preview's.
+/// Growth grows a whole design in milliseconds and the solid engine fills a
+/// field in one pass, so both preview at the real configuration and the only
+/// difference is that nothing is exported. Coarsening the solid engine's grid
+/// would be worse than pointless besides: the surface it produces *is* the
+/// domain, so a preview at a different voxel size would be a preview of a
+/// different part. SIMP is capped at
+/// [`constants::VIEW_EDIT_PREVIEW_MAX_ITERATIONS`] iterations on a grid
+/// coarsened to [`constants::VIEW_EDIT_PREVIEW_CELL_BUDGET`] cells. The solver
+/// backend is left alone: the whole `[solver]` table is carried over untouched,
+/// so a configuration that asked for the GPU still gets it and one that asked
+/// for nothing gets the same default a full run would - including the fallback,
+/// which is the machine's business rather than the preview's.
 pub fn preview_config(config: &Config, problem: &Problem) -> Config {
     let mut preview = config.clone();
-    if config.is_growth() {
+    if config.is_growth() || config.is_solid() {
         return preview;
     }
     let cap = constants::VIEW_EDIT_PREVIEW_MAX_ITERATIONS;
@@ -901,7 +905,7 @@ fn preview(retention: &Retention, link: &ViewLink, cancel: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::viewer::editor::tests::{fixture, growth_fixture, write_temp};
+    use crate::viewer::editor::tests::{fixture, growth_fixture, solid_fixture, write_temp};
     use std::time::{Duration, Instant};
 
     fn problem_of(config: &Config) -> Problem {
@@ -1052,6 +1056,18 @@ vector = [0.0, 0.0, -20.0]
             previewed.optimization.max_iterations,
             growth.optimization.max_iterations
         );
+
+        // And neither is the solid engine's, which has an extra reason: its
+        // surface is the domain itself, so a coarsened preview would be a
+        // preview of a different part.
+        let solid = Config::parse(solid_fixture()).expect("parse");
+        let solid_problem = problem_of(&solid);
+        let previewed = preview_config(&solid, &solid_problem);
+        assert_eq!(
+            previewed.resolution.voxel_size_mm, solid.resolution.voxel_size_mm,
+            "the solid engine previews at the real resolution"
+        );
+        assert_eq!(&previewed, &solid, "a solid preview is the configuration");
     }
 
     #[test]
@@ -1675,7 +1691,7 @@ vector = [0.0, 0.0, -20.0]
     #[test]
     fn a_run_that_cannot_be_built_reports_why_and_starts_nothing() {
         let mut config = Config::parse(fixture()).expect("parse");
-        config.optimization.mass_fraction = 5.0;
+        config.optimization.mass_fraction = Some(5.0);
         let mut worker = Worker::new();
         let error = worker
             .start(&config, &std::env::temp_dir(), RunKind::Preview)

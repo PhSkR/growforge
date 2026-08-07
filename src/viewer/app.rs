@@ -137,6 +137,10 @@ pub struct ViewerApp<'a> {
     /// The editing session, when this window is `growforge edit`. `None` leaves
     /// every path below exactly as `view` and `run --view` have them.
     editor: Option<Editor>,
+    /// Engine key of the run behind the window, for the stats block: an engine
+    /// that reports no iterations has to be told apart from one whose first
+    /// iteration has not landed yet. `None` for a window with no run.
+    engine: Option<String>,
     /// Set once the window and its GPU resources have been released.
     torn_down: bool,
     summary_printed: bool,
@@ -168,9 +172,17 @@ impl<'a> ViewerApp<'a> {
             error: None,
             still_running: None,
             editor: None,
+            engine: None,
             torn_down: false,
             summary_printed: false,
         }
+    }
+
+    /// Name the engine the run behind this window is using, so the stats block
+    /// can say what a run that reports no iterations at all is doing.
+    pub fn running(mut self, engine: &str) -> ViewerApp<'a> {
+        self.engine = Some(engine.to_string());
+        self
     }
 
     /// Tell the window how to find out whether the run behind it is still
@@ -938,6 +950,7 @@ impl<'a> ViewerApp<'a> {
         let progress = self.link.map(ViewLink::progress);
         let context = self.egui_ctx.clone();
         let title = self.title.clone();
+        let engine = self.engine.clone();
         let frame_kind = self.frame_kind;
         let output = {
             let scene = &mut self.scene;
@@ -946,7 +959,15 @@ impl<'a> ViewerApp<'a> {
                 Some(editor) => {
                     editor.draw(root, scene, &adapter);
                 }
-                None => ui::panel(root, &title, &adapter, scene, progress.as_ref(), frame_kind),
+                None => ui::panel(
+                    root,
+                    &title,
+                    &adapter,
+                    scene,
+                    progress.as_ref(),
+                    engine.as_deref(),
+                    frame_kind,
+                ),
             })
         };
         if let Some(editor) = self.editor.as_mut() {
@@ -2937,7 +2958,7 @@ mod tests {
         let mut editor = Editor::open(&path).expect("open");
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.42);
+            .edit(|config| config.optimization.mass_fraction = Some(0.42));
         let mut app = ViewerApp::new("test".to_string(), scene_with_a_box(), None).editing(editor);
 
         // What `WindowEvent::CloseRequested` asks, and what it does with the
@@ -2969,7 +2990,7 @@ mod tests {
         let mut editor = Editor::open(&path).expect("open");
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.42);
+            .edit(|config| config.optimization.mass_fraction = Some(0.42));
         let recovered = editor.state.recovery_path();
         let mut app = ViewerApp::new("test".to_string(), scene_with_a_box(), None).editing(editor);
 

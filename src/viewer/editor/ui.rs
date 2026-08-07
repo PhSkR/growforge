@@ -1429,6 +1429,16 @@ impl Section {
                 // A `[growth]` table is only legal under that engine, and the
                 // default engine is not it.
                 config.growth = None;
+                // The mass target the default engine this lands on requires and
+                // the solid engine does without, exactly as the engine combo
+                // gives it back. Asked of the key rather than of the engine the
+                // file was on: what makes the restore necessary is that the key
+                // is missing and the engine being landed on needs it, and a file
+                // can be missing it under any engine - a solid one switched back
+                // by hand is on `simp` and does not build either.
+                if config.optimization.mass_fraction.is_none() {
+                    config.optimization.mass_fraction = Some(constants::STARTER_MASS_FRACTION);
+                }
                 if config.solver.is_some() {
                     config.solver = Some(SolverConfig {
                         backend: None,
@@ -1525,8 +1535,9 @@ impl Section {
             Section::Engine => format!(
                 "put the engine section back to its defaults: the {} engine, and the solver \
                  backend and tolerance a run picks for itself. Leaving the growth engine takes \
-                 the [growth] table with it, exactly as switching engine by hand does, so what a \
-                 reset lands on still builds. One click is one undo step",
+                 the [growth] table with it and leaving the solid engine gives the mass fraction \
+                 back, exactly as switching engine by hand does, so what a reset lands on still \
+                 builds. One click is one undo step",
                 constants::DEFAULT_ENGINE
             ),
             Section::Resolution => format!(
@@ -1629,6 +1640,47 @@ fn reset_row(ui: &mut egui::Ui, field: &mut Field<'_>, section: Section) {
     });
 }
 
+/// Everything choosing `engine` in the combo does to the configuration.
+///
+/// Factored out of the row for the reason [`write_solver_backend`] is: a
+/// dropdown cannot be opened in a headless frame, so this is what a test drives.
+/// It is also the one statement of what a switch carries with it, and it exists
+/// because every engine refuses some of the keys the others need: a switch that
+/// left them behind would land the session on a configuration that does not
+/// build, halfway through an edit the user has not finished making.
+///
+/// What goes and what comes back is exactly the set
+/// [`crate::config::Config::growth_params`] and
+/// [`crate::config::Config::check_solid`] refuse, and nothing else - a switch
+/// puts the file on another engine, it does not tidy it up.
+fn select_engine(config: &mut crate::config::Config, engine: &str) {
+    // The key is written where the file already keeps it.
+    if config.project.engine.is_some() {
+        config.project.engine = Some(engine.to_string());
+    } else {
+        config.engine = Some(engine.to_string());
+    }
+    if engine != constants::GROWTH_ENGINE {
+        // A `[growth]` table is only legal with that engine.
+        config.growth = None;
+    }
+    if engine == constants::SOLID_ENGINE {
+        config.optimization.mass_fraction = None;
+        config.optimization.overhang = None;
+        config.optimization.wireframe = None;
+        config.optimization.local_volume = None;
+        // Absent is off, and off is what these two have to be: the solid engine
+        // exports the domain exactly, and both passes alter it.
+        config.output.trim = None;
+        config.output.reinforce = None;
+    } else if config.optimization.mass_fraction.is_none() {
+        // The mass target the solid engine did without and every other engine
+        // requires, at the value a brand new file is written with - the only
+        // one this program has an opinion about.
+        config.optimization.mass_fraction = Some(constants::STARTER_MASS_FRACTION);
+    }
+}
+
 /// Engine choice and, with it, whether a `[growth]` table is legal.
 fn engine_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
     egui::CollapsingHeader::new("engine")
@@ -1651,19 +1703,11 @@ fn engine_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                 "which engine builds the part. simp optimizes a density field and is the default; \
                  growth routes every load to a support and grows a branching skeleton in a \
                  fraction of the time, and is a heuristic - read the stress report before you \
-                 print one",
+                 print one; solid optimizes nothing at all and exports the design space itself, \
+                 for a part that was drawn rather than optimized. Switching engine takes the keys \
+                 the new one cannot mean with it, so what you land on still builds",
             ) {
-                let config = field.state.config_mut();
-                // The key is written where the file already keeps it.
-                if config.project.engine.is_some() {
-                    config.project.engine = Some(selected.clone());
-                } else {
-                    config.engine = Some(selected.clone());
-                }
-                if selected != constants::GROWTH_ENGINE {
-                    // A `[growth]` table is only legal with that engine.
-                    config.growth = None;
-                }
+                select_engine(field.state.config_mut(), &selected);
             }
             let mut chosen = shown_backend(field.state.config());
             if combo(
@@ -1923,17 +1967,24 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
             // the rows below it then show.
             reset_row(ui, field, Section::Optimization);
             let mut optimization = field.state.config().optimization.clone();
-            let mut changed = number_row(
-                ui,
-                field,
-                "mass fraction",
-                &mut optimization.mass_fraction,
-                constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
-                "how much of the design space ends up as material, between 0 and 1, measured on \
-                 the printed densities. It is the weight target the whole run is held to: less \
-                 material is a lighter part and a lower safety factor. The growth engine \
-                 normalizes its strut radii to it",
-            );
+            let mut changed = false;
+            // The row exists exactly while the key does, as the material's
+            // custom property rows do: the solid engine refuses a mass target
+            // and the engine combo takes the key out when it is chosen, so there
+            // is nothing here to drag under it.
+            if let Some(mass_fraction) = &mut optimization.mass_fraction {
+                changed |= number_row(
+                    ui,
+                    field,
+                    "mass fraction",
+                    mass_fraction,
+                    constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
+                    "how much of the design space ends up as material, between 0 and 1, measured \
+                     on the printed densities. It is the weight target the whole run is held to: \
+                     less material is a lighter part and a lower safety factor. The growth engine \
+                     normalizes its strut radii to it",
+                );
+            }
             changed |= length_row(
                 ui,
                 field,
@@ -1954,7 +2005,8 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                 "the exponent p of E(x) = Emin + x^p (E0 - Emin), which is what prices \
                  intermediate density out of the design. At least 1, and 2 to 5 is the useful \
                  range: higher drives the field black and white at the cost of more local \
-                 minima. Every shipped example is at the default 3. simp only",
+                 minima. Every shipped example is at the default 3. simp only: the growth and \
+                 solid engines never read it",
             );
             changed |= optional_value_row(
                 ui,
@@ -1968,7 +2020,8 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                  stiffness contrast across the load path, and that contrast is what the solver's \
                  iteration count grows with - raise it when a run exhausts its budget still short \
                  of the tolerance. 1e-6 costs a part nothing it could be measured for; by 1e-3 the \
-                 void is carrying the design. simp only",
+                 void is carrying the design. simp only: the growth and solid engines never read \
+                 it",
                 stiffness_floor_widget,
             );
             changed |= optional_integer_row(
@@ -1978,7 +2031,8 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                 &mut optimization.max_iterations,
                 constants::DEFAULT_MAX_ITERATIONS,
                 "a budget rather than a target: a run stops on convergence, or because it \
-                 stopped making progress, long before it. simp only",
+                 stopped making progress, long before it. simp only: growth has its own step cap \
+                 and the solid engine runs no loop at all",
             );
             changed |= optional_row(
                 ui,
@@ -1988,7 +2042,7 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                 constants::DEFAULT_CONVERGENCE_TOL,
                 constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
                 "stop once the largest design variable change of an iteration falls below this. \
-                 simp only",
+                 simp only: neither the growth engine nor the solid one has a design variable",
             );
             let mut update = optimization.update.unwrap_or_default();
             if combo(
@@ -2003,7 +2057,8 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                 "which scheme moves the design variables under the volume constraint. oc, the \
                  optimality criteria step, is the default and the reference; mma damps exactly \
                  the variables that keep crossing the box, which is what a run that will not \
-                 settle needs. simp only",
+                 settle needs. simp only: neither the growth engine nor the solid one moves a \
+                 design variable",
             ) {
                 optimization.update = Some(update);
                 changed = true;
@@ -2016,7 +2071,7 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                     "make the design self-supporting as it is optimized, so what the analysis, \
                      the volume target and the STL all see is already printable. The 45 degree \
                      angle is fixed by the filter's stencil, so there is no angle to set. simp \
-                     only: the growth engine rejects it",
+                     only: the growth and solid engines reject the table",
                 );
             if field.apply(&toggle) {
                 optimization.overhang = overhang.then_some(OverhangConfig {
@@ -2057,7 +2112,8 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                     "start the run from a thin wire routed through every load, support and keepin \
                  region instead of from a uniform field, held as a density floor for the first \
                  iterations and then let go. It is a guide and never a constraint: afterwards the \
-                 optimizer may keep it, thicken it or dissolve it. simp only",
+                 optimizer may keep it, thicken it or dissolve it. simp only: the growth and solid \
+                 engines reject the table",
                 );
             if field.apply(&toggle) {
                 optimization.wireframe = wireframe.then_some(WireframeConfig {
@@ -2110,7 +2166,8 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                      members and flush surfaces; with it the optimizer has to spread the same \
                      material over many thinner ones, which is what makes a part bone-like. \
                      REQUIRES update = \"mma\": the cap is a second constraint and the optimality \
-                     criteria step prices one. simp only",
+                     criteria step prices one. simp only: the growth and solid engines reject the \
+                     table",
                 );
             if field.apply(&toggle) {
                 optimization.local_volume = local_volume.then_some(LocalVolumeConfig {
@@ -2985,7 +3042,7 @@ pub fn guard_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::viewer::editor::tests::{fixture, growth_fixture, write_temp};
+    use crate::viewer::editor::tests::{fixture, growth_fixture, solid_fixture, write_temp};
 
     /// Draw one frame of the panel into a context with no window behind it.
     ///
@@ -3262,7 +3319,7 @@ mod tests {
             // the sections is a row of the panel too.
             editor
                 .state
-                .edit(|config| config.optimization.mass_fraction = 4.0);
+                .edit(|config| config.optimization.mass_fraction = Some(4.0));
             editor.state.revalidate();
             assert!(!editor.state.is_valid());
             let overflow = panel_overflow(&mut editor, &mut scene);
@@ -3814,7 +3871,7 @@ mod tests {
                 yield_strength_mpa: Some(40.0),
             };
             config.optimization = OptimizationConfig {
-                mass_fraction: 0.42,
+                mass_fraction: Some(0.42),
                 min_feature_mm: 30.0,
                 penalty: Some(4.0),
                 stiffness_floor: Some(1e-6),
@@ -4241,6 +4298,198 @@ mod tests {
             editor.state.config(),
             "the file and the configuration on screen came apart"
         );
+    }
+
+    /// Switching to the solid engine has to land a configuration that still
+    /// builds, and switching away from it has to land one too.
+    ///
+    /// Both directions, because they are different edits: one takes away the
+    /// four keys `Config::check_solid` refuses plus the two output passes that
+    /// would alter the very domain the engine exports, and the other gives back
+    /// the one key every other engine requires. A switch that did only its half
+    /// would leave the session on a file that cannot run, in the middle of an
+    /// edit the user has not finished making.
+    #[test]
+    fn switching_to_the_solid_engine_and_back_keeps_the_configuration_valid() {
+        let (_dir, path) = write_temp("engine_solid_switch", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.edit(|config| {
+            config.optimization.overhang = Some(OverhangConfig {
+                build_direction: BuildDirection::ZPlus,
+            });
+            config.optimization.wireframe = Some(WireframeConfig {
+                radius_mm: Some(3.0),
+                hold_iterations: None,
+                seed_density: None,
+            });
+            config.optimization.local_volume = Some(LocalVolumeConfig {
+                max_fraction: Some(0.55),
+                radius_mm: None,
+            });
+            config.optimization.update = Some(UpdateScheme::Mma);
+            config.output.trim = Some(TrimPolicy::Stress);
+            config.output.reinforce = Some(ReinforcePolicy::MinThickness);
+        });
+        editor.state.revalidate();
+        assert!(editor.state.is_valid(), "{:?}", editor.state.error());
+
+        editor
+            .state
+            .edit(|config| select_engine(config, constants::SOLID_ENGINE));
+        editor.state.revalidate();
+        let config = editor.state.config();
+        assert!(config.is_solid());
+        assert_eq!(config.optimization.mass_fraction, None);
+        assert_eq!(config.optimization.overhang, None);
+        assert_eq!(config.optimization.wireframe, None);
+        assert_eq!(config.optimization.local_volume, None);
+        assert_eq!(config.output.trim, None);
+        assert_eq!(config.output.reinforce, None);
+        // The keys the solid engine merely never reads are left exactly as they
+        // were: a switch is not a tidy-up.
+        assert_eq!(config.optimization.update, Some(UpdateScheme::Mma));
+        assert!(
+            editor.state.is_valid(),
+            "the switch landed on a configuration that does not build: {:?}",
+            editor.state.error()
+        );
+
+        // And back, which is the direction that has to give something back.
+        editor
+            .state
+            .edit(|config| select_engine(config, constants::DEFAULT_ENGINE));
+        editor.state.revalidate();
+        assert_eq!(
+            editor.state.config().optimization.mass_fraction,
+            Some(constants::STARTER_MASS_FRACTION)
+        );
+        assert!(
+            editor.state.is_valid(),
+            "the switch back landed on a configuration that does not build: {:?}",
+            editor.state.error()
+        );
+
+        // A file that already carries a mass fraction keeps its own value: the
+        // starter's is what fills a gap, not what a switch imposes.
+        editor
+            .state
+            .edit(|config| config.optimization.mass_fraction = Some(0.42));
+        editor
+            .state
+            .edit(|config| select_engine(config, constants::GROWTH_ENGINE));
+        assert_eq!(editor.state.config().optimization.mass_fraction, Some(0.42));
+        assert!(editor.state.config().is_growth());
+    }
+
+    /// The engine reset is the other way onto the default engine, and it has the
+    /// same obligation: a reset that took a solid configuration off its engine
+    /// without giving the mass target back would leave one that cannot run.
+    #[test]
+    fn an_engine_reset_gives_a_solid_configuration_its_mass_fraction_back() {
+        let (_dir, path) = write_temp("engine_reset_solid", solid_fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        assert!(editor.state.config().is_solid());
+        assert_eq!(editor.state.config().optimization.mass_fraction, None);
+
+        click_reset(&mut editor, Section::Engine);
+        editor.state.revalidate();
+        let config = editor.state.config();
+        assert_eq!(
+            config.engine_name().expect("an engine"),
+            constants::DEFAULT_ENGINE
+        );
+        assert_eq!(
+            config.optimization.mass_fraction,
+            Some(constants::STARTER_MASS_FRACTION)
+        );
+        assert!(
+            editor.state.is_valid(),
+            "the reset landed on a configuration that does not build: {:?}",
+            editor.state.error()
+        );
+    }
+
+    /// And the same of a file that is missing the key under an engine that
+    /// requires it, which is the state the button has to be right about however
+    /// it was arrived at.
+    ///
+    /// A hand-edited file, or a solid one switched back by hand, opens on the
+    /// "mass_fraction is required" error with the reset button *enabled* - the
+    /// engine key is there to take out - so a reset that only gave the key back
+    /// when it was leaving the solid engine would promise a configuration that
+    /// builds and hand back the same error. What decides the restore is the
+    /// missing key and the engine being landed on, never the engine being left.
+    #[test]
+    fn an_engine_reset_gives_any_configuration_missing_the_mass_fraction_one() {
+        let text = format!(
+            "engine = \"{}\"\n{}",
+            constants::DEFAULT_ENGINE,
+            fixture().replace("mass_fraction = 0.3  # keep this comment\n", "")
+        );
+        let (_dir, path) = write_temp("engine_reset_no_mass", &text);
+        let mut editor = Editor::open(&path).expect("open");
+        assert!(!editor.state.config().is_solid());
+        assert_eq!(editor.state.config().optimization.mass_fraction, None);
+        assert!(
+            !editor.state.is_valid(),
+            "the fixture builds, so it is not the state under test"
+        );
+
+        click_reset(&mut editor, Section::Engine);
+        editor.state.revalidate();
+        assert_eq!(
+            editor.state.config().optimization.mass_fraction,
+            Some(constants::STARTER_MASS_FRACTION)
+        );
+        assert!(
+            editor.state.is_valid(),
+            "the reset landed on a configuration that does not build: {:?}",
+            editor.state.error()
+        );
+    }
+
+    /// The row of a key one engine refuses exists exactly while the key does.
+    #[test]
+    fn the_optimization_section_draws_no_mass_fraction_row_under_the_solid_engine() {
+        let (_dir, path) = write_temp("panel_solid", solid_fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        assert_eq!(editor.state.config().optimization.mass_fraction, None);
+        // The section is drawn for every engine; what changes is which rows are
+        // in it. Nothing here may add the key back.
+        draw_section(&mut editor, Section::Optimization);
+        assert_eq!(
+            editor.state.config().optimization.mass_fraction,
+            None,
+            "the panel wrote a key the engine refuses"
+        );
+        draw_section(&mut editor, Section::Engine);
+        draw_section(&mut editor, Section::Output);
+    }
+
+    /// A solid configuration round-trips through the projection: the engine key
+    /// is written and the mass fraction stays out of the file.
+    #[test]
+    fn a_solid_configuration_round_trips_through_the_file() {
+        let (_dir, path) = write_temp("engine_solid_save", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor
+            .state
+            .edit(|config| select_engine(config, constants::SOLID_ENGINE));
+        editor.save();
+        assert!(!editor.state.is_dirty());
+
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            saved.contains(&format!("engine = \"{}\"", constants::SOLID_ENGINE)),
+            "{saved}"
+        );
+        assert!(
+            !saved.contains("mass_fraction"),
+            "the key the engine refuses stayed in the file: {saved}"
+        );
+        let reparsed = crate::config::Config::parse(&saved).expect("the saved file parses");
+        reparsed.validate_static().expect("the saved file builds");
+        assert_eq!(&reparsed, editor.state.config());
     }
 
     /// The two ways a reset leaves a table behind, in the file itself: the
@@ -4824,7 +5073,7 @@ mod tests {
         // lights up on it.
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.2);
+            .edit(|config| config.optimization.mass_fraction = Some(0.2));
         editor.on_edited();
         std::thread::sleep(std::time::Duration::from_secs_f64(
             constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
@@ -5021,7 +5270,7 @@ mod tests {
         // where the user finds out why.
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 4.0);
+            .edit(|config| config.optimization.mass_fraction = Some(4.0));
         editor.state.revalidate();
         assert!(!editor.state.is_valid());
         draw(&mut editor, &mut scene);
@@ -5050,7 +5299,7 @@ mod tests {
         let mut scene = editor.initial_scene();
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.44);
+            .edit(|config| config.optimization.mass_fraction = Some(0.44));
 
         let intents = [
             Intent::CloseWindow,

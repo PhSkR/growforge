@@ -14,6 +14,26 @@ use growforge::problem::Problem;
 use growforge::report::SilentReporter;
 use growforge::{load_problem, optimize_and_export};
 
+/// A fixture text as `engine` needs to be given it.
+///
+/// One engine takes a key out rather than adding one: the solid engine refuses
+/// `[optimization] mass_fraction`, because it fills the domain instead of
+/// targeting a share of it, so a fixture written for the optimizing engines is
+/// handed to it without that line. Everything else - the geometry, the regions,
+/// the loads, the resolution - is the same problem, which is the point of
+/// running one fixture on more than one engine at all.
+fn for_engine(engine: &str, fixture: &str) -> String {
+    let body: String = match engine == constants::SOLID_ENGINE {
+        true => fixture
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("mass_fraction"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        false => fixture.to_string(),
+    };
+    format!("engine = \"{engine}\"\n{body}")
+}
+
 /// One hexahedron under uniform axial traction, restrained on three
 /// perpendicular faces so it may contract laterally. A trilinear hex reproduces
 /// a uniform strain state exactly, so the tip displacement must match the
@@ -1499,14 +1519,20 @@ region = { shape = "ellipsoid", center = [61.0, 16.0, 16.0], radii = [3.0, 4.0, 
 vector = [0.0, 0.0, -50.0]
 "#;
 
-/// Both engines have to route around an ellipsoid keepout and export a
-/// watertight part, and neither may leave a scrap of material inside it.
+/// Every engine has to route around an ellipsoid keepout and export a
+/// watertight part, and none may leave a scrap of material inside it.
+///
+/// The solid engine runs it too, because what is asserted here is engine
+/// agnostic: a carved cell is void for every engine, and the part that comes out
+/// of one is watertight and spans the domain whoever built it. What is *not*
+/// asserted of it is anything about optimization - it fills the design cells the
+/// other two spend.
 ///
 /// The keepout is turned, so a run that read its bounding box instead of its
 /// field would carve a visibly different volume - and one that read the field
 /// on the wrong axis would carve the wrong one.
 #[test]
-fn an_ellipsoid_keepout_runs_on_both_engines_and_is_left_empty() {
+fn an_ellipsoid_keepout_runs_on_every_engine_and_is_left_empty() {
     use growforge::geometry::Shape;
 
     let directory = std::env::temp_dir();
@@ -1515,8 +1541,8 @@ fn an_ellipsoid_keepout_runs_on_both_engines_and_is_left_empty() {
         radii: [14.0, 6.0, 6.0],
         rotation_deg: [0.0, 0.0, 30.0],
     };
-    for engine in ["simp", "growth"] {
-        let text = format!("engine = \"{engine}\"\n{ELLIPSOID_KEEPOUT}");
+    for engine in ["simp", "growth", constants::SOLID_ENGINE] {
+        let text = for_engine(engine, ELLIPSOID_KEEPOUT);
         let config = Config::parse(&text).unwrap_or_else(|e| panic!("{engine}: {e:#}"));
         let mut problem = Problem::build(&config, &directory)
             .unwrap_or_else(|e| panic!("{engine} failed to build: {e:#}"));
@@ -1694,14 +1720,14 @@ region = { shape = "tube", p1 = [61.0, 14.0, 16.0], p2 = [61.0, 18.0, 16.0], ben
 vector = [0.0, 0.0, -50.0]
 "#;
 
-/// Both engines have to route around a bent tube keepout and export a
-/// watertight part, and neither may leave a scrap of material inside it.
+/// Every engine has to route around a bent tube keepout and export a
+/// watertight part, and none may leave a scrap of material inside it.
 ///
 /// The keepout curves, so a run that read its bounding box - or mistook it for
 /// the cylinder between its two ends - would carve a visibly different volume,
 /// and this fixture has enough cells either side of the difference to say so.
 #[test]
-fn a_tube_keepout_runs_on_both_engines_and_is_left_empty() {
+fn a_tube_keepout_runs_on_every_engine_and_is_left_empty() {
     use growforge::geometry::Shape;
 
     let directory = std::env::temp_dir();
@@ -1711,8 +1737,8 @@ fn a_tube_keepout_runs_on_both_engines_and_is_left_empty() {
         bend: Some([32.0, 16.0, 20.0]),
         radius: 5.0,
     };
-    for engine in ["simp", "growth"] {
-        let text = format!("engine = \"{engine}\"\n{TUBE_KEEPOUT}");
+    for engine in ["simp", "growth", constants::SOLID_ENGINE] {
+        let text = for_engine(engine, TUBE_KEEPOUT);
         let config = Config::parse(&text).unwrap_or_else(|e| panic!("{engine}: {e:#}"));
         let mut problem = Problem::build(&config, &directory)
             .unwrap_or_else(|e| panic!("{engine} failed to build: {e:#}"));
@@ -1947,8 +1973,8 @@ region = { shape = "triangle", a = [61.0, 12.0, 16.0], b = [61.0, 20.0, 16.0], c
 vector = [0.0, 0.0, -50.0]
 "#;
 
-/// Both engines have to route around each of the two new shapes and export a
-/// watertight part, and neither may leave a scrap of material inside one.
+/// Every engine has to route around each of the two new shapes and export a
+/// watertight part, and none may leave a scrap of material inside one.
 ///
 /// The keepouts taper and slope, so a run that read a bounding box - or, for
 /// the cone, mistook it for the cylinder between its two caps - would carve a
@@ -1957,7 +1983,7 @@ vector = [0.0, 0.0, -50.0]
 /// of the same kind, so every position a shape can appear in is exercised on a
 /// problem that really runs.
 #[test]
-fn a_cone_and_a_triangle_keepout_run_on_both_engines_and_are_left_empty() {
+fn a_cone_and_a_triangle_keepout_run_on_every_engine_and_are_left_empty() {
     use growforge::geometry::Shape;
 
     let directory = std::env::temp_dir();
@@ -1984,9 +2010,9 @@ fn a_cone_and_a_triangle_keepout_run_on_both_engines_and_are_left_empty() {
         ),
     ];
     for (name, fixture, keepout) in cases {
-        for engine in ["simp", "growth"] {
+        for engine in ["simp", "growth", constants::SOLID_ENGINE] {
             let what = format!("{name}/{engine}");
-            let text = format!("engine = \"{engine}\"\n{fixture}");
+            let text = for_engine(engine, fixture);
             let config = Config::parse(&text).unwrap_or_else(|e| panic!("{what}: {e:#}"));
             let mut problem = Problem::build(&config, &directory)
                 .unwrap_or_else(|e| panic!("{what} failed to build: {e:#}"));
@@ -2752,13 +2778,50 @@ fn a_bore_is_exported_as_the_cylinder_that_was_asked_for() {
         let (_, triangles) = mesh::stl::read(path).expect("read back the STL");
         assert_eq!(triangles.len(), stats.triangles);
     }
-    // The clamp only ever takes material away here: out of the bore, and off the
-    // outside of the block.
+    // The clamp moves the surface onto the boundaries in **both** directions,
+    // which is what "exact" has to mean: out of the bore and off the outside of
+    // the block where the sampling overshot, and back out onto the block's faces
+    // and the bore wall where it fell short. Correcting only the overshoot would
+    // leave the undershoot as dimples - the same sub-voxel scatter, on the legal
+    // side, where nothing about legality can see it.
+    //
+    // Stated as the defect and its absence, over the vertices that rest on a
+    // boundary at all: an optimizer's free surface through the middle of the
+    // domain rests on nothing and is left where the smoothing put it.
+    let capture = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * exact.grid.h;
+    let resting = |vertices: &[[f64; 3]]| {
+        let mut worst: f64 = 0.0;
+        let mut counted = 0usize;
+        for vertex in vertices {
+            // The nearest boundary, whichever it is: this part rests on the
+            // block's faces and on the bore wall, and the clamp seats a vertex
+            // onto the one it is nearest to.
+            let distance = exact
+                .boundaries
+                .domain
+                .signed_distance(*vertex)
+                .abs()
+                .min(exact.boundaries.keepout.signed_distance(*vertex).abs());
+            if distance <= capture {
+                counted += 1;
+                worst = worst.max(distance);
+            }
+        }
+        (counted, worst)
+    };
+    let (raw_resting, raw_worst) = resting(&raw.mesh.vertices);
+    let (clamped_resting, clamped_worst) = resting(&clamped.mesh.vertices);
     assert!(
-        clamped.stats.volume_mm3 < raw.stats.volume_mm3,
-        "the clamped part encloses {:.3} mm3 against the unclamped {:.3}",
-        clamped.stats.volume_mm3,
-        raw.stats.volume_mm3
+        raw_resting > 0 && raw_worst > 2.0 * eps,
+        "the unclamped surface has no vertex resting off a boundary ({raw_resting} within the          band, worst {raw_worst}), so this fixture cannot show what the seating is for"
+    );
+    assert!(
+        clamped_resting > 0,
+        "no clamped vertex rests on a boundary, so the claim below is vacuous"
+    );
+    assert!(
+        clamped_worst <= 2.0 * eps,
+        "the clamped surface still sits {clamped_worst} mm off the boundary it rests on"
     );
     assert_ne!(
         std::fs::read(&exact.output.stl_path).expect("the clamped STL"),
@@ -2790,4 +2853,258 @@ fn a_bore_is_exported_as_the_cylinder_that_was_asked_for() {
 
     std::fs::remove_file(&exact.output.stl_path).ok();
     std::fs::remove_file(&voxel.output.stl_path).ok();
+}
+
+/// The user's bathtub plug, in the shape it was drawn: a tapered cone shell
+/// hollowed out from above and a handle standing out of the mouth.
+///
+/// Nothing here is a topology problem. There is no mass fraction, because the
+/// engine that runs it fills the domain: what should come out of the export is
+/// the CSG tree itself, held to the analytic cone, the analytic cavity and the
+/// analytic cylinder.
+const PLUG: &str = r#"
+engine = "solid"
+
+[project]
+name = "integration_plug"
+
+[resolution]
+voxel_size_mm = 1.5
+
+[material]
+preset = "petg"
+
+# The reproducible backend: the stress solve of a fully dense part is what says
+# whether the handle holds, and the default backend is the machine's device.
+[solver]
+backend = "cpu"
+
+[optimization]
+min_feature_mm = 4.5
+
+[output]
+stl_path = "growforge_integration_plug.stl"
+
+# The plug body: a frustum, wider at the bottom so it seats in the drain.
+[[domain]]
+op = "add"
+shape = "cone"
+p1 = [24.0, 24.0, 0.0]
+p2 = [24.0, 24.0, 20.0]
+radius1 = 14.0
+radius2 = 11.0
+
+# Hollowed out from above: a wall and a floor, open at the top.
+[[domain]]
+op = "subtract"
+shape = "cone"
+p1 = [24.0, 24.0, 4.0]
+p2 = [24.0, 24.0, 26.0]
+radius1 = 9.0
+radius2 = 7.0
+
+# The handle, rooted in that floor and standing out of the mouth.
+[[domain]]
+op = "add"
+shape = "cylinder"
+p1 = [24.0, 24.0, 2.0]
+p2 = [24.0, 24.0, 26.0]
+radius = 3.5
+
+[[supports]]
+region = { shape = "box", min = [9.0, 9.0, -0.5], max = [39.0, 39.0, 0.5] }
+
+[[loadcases]]
+name = "pull"
+[[loadcases.loads]]
+type = "force"
+region = { shape = "box", min = [19.0, 19.0, 24.0], max = [29.0, 29.0, 26.5] }
+vector = [0.0, 0.0, 30.0]
+"#;
+
+/// What the solid engine is for, end to end: a part that was drawn rather than
+/// optimized comes out of the pipeline as the shapes it was drawn from.
+///
+/// The claim is the one the SIMP workaround it replaces cannot make. At
+/// `mass_fraction` just under one the optimizer still redistributes material and
+/// the density filter still erodes the boundary cells, so the walls of this plug
+/// ripple by a fraction of a voxel; here every design cell is filled and the only
+/// thing between the CSG tree and the file is the isosurface and the clamp that
+/// holds it to those same shapes. So this test asks the *mesh* about the
+/// *shapes*, the way `a_bore_is_exported_as_the_cylinder_that_was_asked_for`
+/// does, and to the same tolerance: no exported vertex is proud of the domain,
+/// and the vertices that sit on a surface are on it exactly.
+///
+/// It is also the whole pipeline over a zero-iteration field: the cavity pass,
+/// the stress solve, the island cull, the clamp, the validation and the STL all
+/// run exactly as they do after an optimization.
+#[test]
+fn the_solid_engine_exports_the_domain_it_was_given() {
+    let directory = std::env::temp_dir();
+    let config = Config::parse(PLUG).expect("parse");
+    let mut problem = Problem::build(&config, &directory).expect("build");
+    problem.output.stl_path = directory.join("growforge_integration_plug_solid.stl");
+    assert_eq!(problem.engine, constants::SOLID_ENGINE);
+    assert!(problem.warnings.is_empty(), "{:?}", problem.warnings);
+    assert_eq!(
+        problem.output.boundaries,
+        BoundaryFidelity::Exact,
+        "the clamp has to be what a configuration gets without asking"
+    );
+
+    let outcome = optimize_and_export(&problem, &SilentReporter).expect("the solid run");
+
+    // The field is the classification: nothing was optimized, and nothing
+    // iterated.
+    assert_eq!(outcome.field.iterations, 0);
+    assert_eq!(outcome.field.volume_fraction, 1.0);
+    for (e, kind) in problem.grid.cells.iter().enumerate() {
+        let expected = match kind {
+            CellKind::Void => 0.0,
+            _ => 1.0,
+        };
+        assert_eq!(
+            outcome.field.densities[e], expected,
+            "cell {e} of kind {kind:?} came out at {}",
+            outcome.field.densities[e]
+        );
+    }
+
+    // One part, in one piece, with nothing floating and no cavity sealed inside
+    // it: a cup that is open at the top has none to find.
+    mesh::validate::validate(&outcome.mesh).expect("watertight surface");
+    assert_eq!(outcome.islands.bodies.len(), 1);
+    assert_eq!(outcome.islands.culled_fragments, 0);
+    assert!(
+        outcome.islands.unserved.is_empty(),
+        "{:?}",
+        outcome.islands.unserved
+    );
+    assert_eq!(
+        outcome.voids.voids.len(),
+        0,
+        "an open cup has no enclosed cavity: {:?}",
+        outcome.voids.voids
+    );
+    assert_eq!(outcome.voids.filled_cells, 0);
+
+    // The exactness claim, vertex by vertex against the analytic tree.
+    let eps = constants::BOUNDARY_CLAMP_EPS_MM;
+    let domain = &problem.boundaries.domain;
+    let worst = outcome
+        .mesh
+        .vertices
+        .iter()
+        .fold(f64::NEG_INFINITY, |worst, v| {
+            worst.max(domain.signed_distance(*v))
+        });
+    assert!(
+        worst <= eps,
+        "the exported surface stands {worst} mm proud of the domain it was drawn from"
+    );
+    // And the other half of the same claim, which is the one that says the wall
+    // is a cone rather than merely not proud of one: no vertex is *short* of the
+    // surface either. Marching cubes and the smoothing after it scatter a wall's
+    // vertices to both sides; correcting only the proud ones leaves inward
+    // dimples of a third to a half of a voxel, which is what scallops an
+    // exported cone. Measured on this fixture before the clamp seated them: the
+    // worst vertex sat 0.7018 mm - 0.47 voxels - inside the wall.
+    //
+    // Every vertex of this part rests on a boundary, because the part *is* the
+    // domain, so the claim is made over all of them rather than over a band.
+    let capture = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * problem.grid.h;
+    let (mut off_the_surface, mut adrift) = (0.0f64, 0usize);
+    for vertex in &outcome.mesh.vertices {
+        let distance = domain.signed_distance(*vertex).abs();
+        if distance > capture {
+            // Further out than a sampling artefact can be: the clamp is right
+            // not to touch it, and this fixture has none.
+            adrift += 1;
+            continue;
+        }
+        off_the_surface = off_the_surface.max(distance);
+    }
+    assert_eq!(
+        adrift,
+        0,
+        "{adrift} of {} vertices sit further than the capture band ({capture} mm) from the domain          they were drawn from",
+        outcome.mesh.vertices.len()
+    );
+    assert!(
+        off_the_surface <= 2.0 * eps,
+        "the exported surface dimples {off_the_surface} mm inside the domain it was drawn from"
+    );
+
+    let report = outcome.clamp.expect("a clamp report");
+    assert!(report.vertices_moved > 0, "{report:?}");
+    assert_eq!(report.gave_up, 0, "{report:?}");
+    assert!(
+        report.max_displacement_mm <= problem.grid.h,
+        "{report:?} moved a vertex further than a voxel"
+    );
+
+    // And the vertices that sit on a surface sit on it exactly, on each of the
+    // three shapes the part was drawn from - the outer cone, the cavity that was
+    // cut out of it and the handle - rather than on a voxel quantization of one.
+    use growforge::geometry::Shape;
+    for (what, shape) in [
+        (
+            "the outer cone",
+            Shape::Cone {
+                p1: [24.0, 24.0, 0.0],
+                p2: [24.0, 24.0, 20.0],
+                radius1: 14.0,
+                radius2: 11.0,
+            },
+        ),
+        (
+            "the cavity",
+            Shape::Cone {
+                p1: [24.0, 24.0, 4.0],
+                p2: [24.0, 24.0, 26.0],
+                radius1: 9.0,
+                radius2: 7.0,
+            },
+        ),
+        (
+            "the handle",
+            Shape::Cylinder {
+                p1: [24.0, 24.0, 2.0],
+                p2: [24.0, 24.0, 26.0],
+                radius: 3.5,
+            },
+        ),
+    ] {
+        let near: Vec<[f64; 3]> = outcome
+            .mesh
+            .vertices
+            .iter()
+            .copied()
+            .filter(|v| shape.signed_distance(*v).abs() < 0.5 * problem.grid.h)
+            .collect();
+        assert!(
+            !near.is_empty(),
+            "no exported vertex is anywhere near {what}"
+        );
+        let on_it = near
+            .iter()
+            .filter(|v| shape.signed_distance(**v).abs() <= 2.0 * eps)
+            .count();
+        assert!(
+            on_it > 0,
+            "{} vertices are near {what} and not one is on it",
+            near.len()
+        );
+    }
+
+    // The part holds together well enough to be analysed: the stress pass ran
+    // over the field that shipped, as it does after any other engine.
+    assert!(
+        outcome.stress.is_available(),
+        "the stress pass said nothing"
+    );
+    assert!(outcome.stats.triangles > 0 && outcome.stats.volume_mm3 > 0.0);
+    let (_, triangles) = mesh::stl::read(&outcome.stl_path).expect("read back the STL");
+    assert_eq!(triangles.len(), outcome.stats.triangles);
+    std::fs::remove_file(&outcome.stl_path).ok();
 }

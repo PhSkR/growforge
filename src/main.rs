@@ -22,8 +22,9 @@ use growforge::{RunOutcome, load_config_and_problem};
     version,
     about = "Grows strong, weight-optimized 3D structures with FEA based topology optimization",
     long_about = "growforge reads a TOML problem definition, voxelizes the design domain, runs \
-                  either SIMP topology optimization with a real finite element solve or the fast \
-                  growth heuristic, reports the von Mises stresses of the result and exports a \
+                  SIMP topology optimization with a real finite element solve, the fast growth \
+                  heuristic, or no optimization at all when the part was drawn rather than \
+                  optimized, reports the von Mises stresses of the result and exports a \
                   watertight binary STL. Units are millimetres, newtons, MPa and N*mm."
 )]
 struct Cli {
@@ -123,84 +124,95 @@ fn dispatch() -> Result<()> {
             };
 
             println!();
-            match &outcome.field.growth {
-                // A growth run has no compliance to report; what it grew, and
-                // the stress report further down, are what describe it.
-                Some(growth) => {
-                    println!(
-                        "growth steps   {} ({})",
-                        outcome.field.iterations,
-                        if outcome.field.stop.converged() {
-                            "growth complete"
-                        } else {
-                            "step cap"
-                        }
-                    );
-                    println!(
-                        "skeleton       {} backbones, {} segments, radius {:.2} .. {:.2} mm",
-                        growth.backbones,
-                        growth.segments,
-                        growth.radius_range_mm.0,
-                        growth.radius_range_mm.1
-                    );
-                    println!(
-                        "attractors     {} scattered, {} consumed",
-                        growth.attractors, growth.consumed
-                    );
-                    println!(
-                        "connections    {} surface targets, {} unreached, {} fused branch tips \
-                         carrying load",
-                        growth.surface_targets, growth.unreached_surfaces, growth.fused_tips
-                    );
-                    if let Some(symmetry) = growth.symmetry {
+            if problem.is_solid() {
+                // No iterations, no compliance, and neither is printed as a
+                // zero: what a solid run has to say is what it filled. The
+                // stress report further down is what says how good it is.
+                println!(
+                    "solid          {} design cells filled, {} already solid; nothing was \
+                     optimized",
+                    problem.counts.design, problem.counts.solid
+                );
+            } else {
+                match &outcome.field.growth {
+                    // A growth run has no compliance to report; what it grew, and
+                    // the stress report further down, are what describe it.
+                    Some(growth) => {
                         println!(
-                            "symmetry       {}, {} sectors; grown in {} of the {} design cells \
-                             and copied{}",
-                            symmetry.params.describe(),
-                            symmetry.params.sectors(),
-                            symmetry.fundamental_design_cells,
-                            problem.counts.design,
-                            // A transform that does not land on cell centres
-                            // gives an exact skeleton and a field resampled a
-                            // fraction of a voxel off, so the run says so
-                            // rather than letting "symmetric" be read as more
-                            // than it is.
-                            if symmetry.exact_on_the_voxel_lattice {
-                                ""
+                            "growth steps   {} ({})",
+                            outcome.field.iterations,
+                            if outcome.field.stop.converged() {
+                                "growth complete"
                             } else {
-                                " (skeleton exact, rasterized surface approximate to within a \
-                                 voxel)"
+                                "step cap"
                             }
                         );
-                    }
-                    if growth.pruned_nodes > 0 {
                         println!(
-                            "pruned         {} branch nodes that ended on nothing",
-                            growth.pruned_nodes
+                            "skeleton       {} backbones, {} segments, radius {:.2} .. {:.2} mm",
+                            growth.backbones,
+                            growth.segments,
+                            growth.radius_range_mm.0,
+                            growth.radius_range_mm.1
                         );
-                    }
-                    if let Some(achievable) = growth.clamped_volume_fraction {
                         println!(
-                            "volume clamp   the radius limits allow {achievable:.4}, not the \
+                            "attractors     {} scattered, {} consumed",
+                            growth.attractors, growth.consumed
+                        );
+                        println!(
+                            "connections    {} surface targets, {} unreached, {} fused branch tips \
+                         carrying load",
+                            growth.surface_targets, growth.unreached_surfaces, growth.fused_tips
+                        );
+                        if let Some(symmetry) = growth.symmetry {
+                            println!(
+                                "symmetry       {}, {} sectors; grown in {} of the {} design cells \
+                             and copied{}",
+                                symmetry.params.describe(),
+                                symmetry.params.sectors(),
+                                symmetry.fundamental_design_cells,
+                                problem.counts.design,
+                                // A transform that does not land on cell centres
+                                // gives an exact skeleton and a field resampled a
+                                // fraction of a voxel off, so the run says so
+                                // rather than letting "symmetric" be read as more
+                                // than it is.
+                                if symmetry.exact_on_the_voxel_lattice {
+                                    ""
+                                } else {
+                                    " (skeleton exact, rasterized surface approximate to within a \
+                                 voxel)"
+                                }
+                            );
+                        }
+                        if growth.pruned_nodes > 0 {
+                            println!(
+                                "pruned         {} branch nodes that ended on nothing",
+                                growth.pruned_nodes
+                            );
+                        }
+                        if let Some(achievable) = growth.clamped_volume_fraction {
+                            println!(
+                                "volume clamp   the radius limits allow {achievable:.4}, not the \
                              requested {:.4}",
-                            problem.optimization.mass_fraction
+                                problem.optimization.mass_fraction
+                            );
+                        }
+                    }
+                    None => {
+                        // Three outcomes, named apart: an answer, an iterate the
+                        // problem will not improve on, and whatever the budget ended
+                        // on. The engine has already printed the sentence that says
+                        // what to do about the middle one.
+                        println!(
+                            "iterations     {} ({})",
+                            outcome.field.iterations,
+                            outcome.field.stop.label()
+                        );
+                        println!(
+                            "compliance     {:.6e} N*mm (first iteration {:.6e})",
+                            outcome.field.compliance, outcome.field.initial_compliance
                         );
                     }
-                }
-                None => {
-                    // Three outcomes, named apart: an answer, an iterate the
-                    // problem will not improve on, and whatever the budget ended
-                    // on. The engine has already printed the sentence that says
-                    // what to do about the middle one.
-                    println!(
-                        "iterations     {} ({})",
-                        outcome.field.iterations,
-                        outcome.field.stop.label()
-                    );
-                    println!(
-                        "compliance     {:.6e} N*mm (first iteration {:.6e})",
-                        outcome.field.compliance, outcome.field.initial_compliance
-                    );
                 }
             }
             println!("volume frac    {:.4}", outcome.field.volume_fraction);

@@ -1,5 +1,80 @@
 # Changelog
 
+## 2026-08-06 - 0.35.0 - The part that was drawn, not optimized
+
+From the user's bathtub plug: a cone shell with a cavity cut out of it and a
+handle on top. Nothing about it is a topology problem, and until now the only way
+to get it out of growforge was to fake one - `mass_fraction = 0.99` through SIMP,
+where the optimizer still redistributes material it was not asked to move and the
+density filter still erodes the cells at the boundary, so the walls come out
+rippled by a fraction of a voxel.
+
+- **`engine = "solid"`**, a third registered engine that optimizes nothing:
+  every design cell is filled, `Reporter::iteration` is never called, and the
+  field handed over is the cell classification read as a density. Everything
+  downstream is untouched and runs exactly as it does after the other two - the
+  cavity pass, the stress solve, the island cull, the boundary clamp, the STL -
+  so the surface that ships is the configuration's own CSG held to its analytic
+  shapes - to `2e-5 mm` on the shipped fixture, which is the boundary clamp's own
+  offset rather than anything about the voxel size.
+- **What the engine refuses, and why.** `[optimization] mass_fraction` is not
+  required by it and is **rejected** when set (there is no share of a domain it
+  fills completely); `[optimization.overhang]`, `.wireframe` and `.local_volume`
+  are rejected in the style `growth_params` set, each saying why a fully dense
+  part has no such concept; and `[output] trim` and `reinforce` are rejected
+  unless off - both alter the very domain this engine exports. `penalty`,
+  `stiffness_floor`, `min_feature_mm`, `max_iterations`, `convergence_tol` and
+  `update` stay legal and unused, as they are under `growth`. Supports and load
+  cases are still required: the stress report is what says whether the part
+  holds.
+- **The boundary clamp now corrects the artefact in both directions**, which is
+  what makes "the domain itself" true rather than nearly true, and it is engine
+  agnostic - a SIMP or growth wall standing against a keepout or a domain face
+  gains exactly the same. Marching cubes and the Taubin smoothing after it
+  scatter a wall's vertices to *both* sides of the surface; the pass only ever
+  corrected the side legality could see, so the proud vertices were pulled back
+  exactly onto the analytic surface and the ones that fell short stayed where
+  they were. Measured on the plug fixture: worst deviation +0.0000 mm outward,
+  **-0.70 mm inward** - half a voxel of dimple, which is the scalloping the
+  render showed. A legal vertex within `BOUNDARY_CLAMP_CAPTURE_VOXELS` (half a
+  voxel, the scale a cell-centre classification can be wrong by) of the boundary
+  it rests on is now seated onto it by the same projection onto the same legal
+  side; anything further away rests on nothing - an optimizer's free surface
+  through the middle of the domain - and is left where the smoothing put it, and
+  a seat that would land proud of another boundary is dropped. After it, every
+  vertex of that fixture is on an analytic surface to within
+  `2 x BOUNDARY_CLAMP_EPS_MM` (2e-5 mm), and no vertex is proud of one.
+- **The reports say what ran.** Keyed on the engine rather than on the field, so
+  no summary infers "solid" from a field of ones: `growforge check` prints
+  *"solid          every design cell fully dense; nothing is optimized"* in place
+  of the filter, overhang, update, local volume and wireframe rows, and names the
+  domain volume as the target rather than inventing a mass fraction; the run
+  summary prints what was filled instead of a zero iteration count and a zero
+  compliance; and the viewer's panel says a solid run has no progress to show
+  rather than waiting for a first iteration that is never coming.
+- **The editor switches valid by construction.** Choosing `solid` takes the mass
+  fraction, the three SIMP-only tables and the two output passes out; choosing
+  another engine gives the mass fraction back at `STARTER_MASS_FRACTION`, and so
+  does the engine section's reset. The mass fraction row exists exactly while the
+  key does, previews run at the real resolution and configuration (a coarsened
+  preview of this engine would be a preview of a different part), and the
+  optimization tooltips now name both engines that ignore or reject each key.
+- `OptimizationConfig::mass_fraction` is `Option<f64>` in the schema, resolved by
+  `Config::optimization_params` to the value it always had for every other engine
+  and to `DENSITY_MAX` for this one; a file that omits it under `simp` or
+  `growth` is refused by name, where before serde said "missing field".
+- Tests: the registry and `available()`; the config matrix in both directions
+  (absent, present, out of range, each rejected table, each output pass, the
+  unused knobs); the field's shape and its zero progress lines; the editor's
+  switch, reset, row, preview and file round trip; and end to end, the plug
+  itself - one body, no enclosed cavity, and every exported vertex on the cone,
+  the cavity or the handle to `2 x BOUNDARY_CLAMP_EPS_MM`, from *both* sides
+  (that assertion fails at 0.70 mm without the seating above). The bore fixture
+  makes the same two-sided claim on a SIMP export, in place of a "the clamp only
+  ever removes material" assertion that was true only of the one-sided pass. The
+  three keepout fixtures now run on all three engines.
+- Version 0.35.0.
+
 ## 2026-08-06 - 0.34.0 - A rejected frame is not the end of the session
 
 From an incident: 40 000 GPU compute iterations on the physical GPU the window

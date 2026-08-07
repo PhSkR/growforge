@@ -128,6 +128,7 @@ pub fn run_with_view(
             let still_running = || !worker.is_finished();
             ViewerApp::new(title, scene, Some(&link))
                 .watching(&still_running)
+                .running(&problem.engine)
                 .run()
         };
         link.detach();

@@ -749,6 +749,17 @@ impl Problem {
         self.grid.cell_volume()
     }
 
+    /// True when the solid engine is the one that will run this problem.
+    ///
+    /// The engine identity rather than anything about the field, which is what
+    /// every report that has to describe a solid run keys on: a field of all
+    /// ones is a legitimate answer from any engine, and "no iterations" is not a
+    /// property a summary may infer an engine from. A growth run is recognised
+    /// the same way, through [`Problem::growth`] being resolved.
+    pub fn is_solid(&self) -> bool {
+        self.engine == constants::SOLID_ENGINE
+    }
+
     /// True when any load case carries self weight.
     pub fn has_gravity(&self) -> bool {
         self.load_cases.iter().any(|c| c.gravity.is_some())

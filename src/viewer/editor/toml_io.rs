@@ -216,7 +216,10 @@ impl Document {
         }
 
         let optimization = sub_table(root, "optimization", Style::Table);
-        set_float(
+        // Optional in the schema because one engine refuses it, so the key
+        // leaves the file when the solid engine is chosen and comes back with
+        // its value when it is left.
+        set_opt_float(
             optimization,
             "mass_fraction",
             config.optimization.mass_fraction,
@@ -1345,7 +1348,7 @@ mod tests {
     fn editing_one_value_leaves_every_other_byte_alone() {
         let text = fixture();
         let (mut config, mut document) = open(text);
-        config.optimization.mass_fraction = 0.42;
+        config.optimization.mass_fraction = Some(0.42);
         document.sync(&config).expect("sync");
         let saved = document.render();
 
@@ -1364,7 +1367,7 @@ mod tests {
         assert_eq!(saved, expected);
         // What it reparses to is what the editor was holding.
         let reparsed = Config::parse(&saved).expect("reparse");
-        assert!((reparsed.optimization.mass_fraction - 0.42).abs() < 1e-12);
+        assert!((reparsed.optimization.mass_fraction.expect("a mass target") - 0.42).abs() < 1e-12);
     }
 
     /// The rotation key is optional, and an editor may not add noise to a file:
@@ -1848,7 +1851,7 @@ mod tests {
         document.sync(&config).expect("sync");
         assert_eq!(document.render(), text);
 
-        config.optimization.mass_fraction = 0.42;
+        config.optimization.mass_fraction = Some(0.42);
         document.sync(&config).expect("sync");
         let saved = document.render();
         assert_eq!(saved.matches("\r\n").count(), text.matches("\r\n").count());

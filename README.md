@@ -1,15 +1,16 @@
 # growforge
 
 growforge grows strong, weight-optimized 3D structures. It reads a TOML problem
-definition, voxelizes the design domain, runs one of two engines over it, and
+definition, voxelizes the design domain, runs one of three engines over it, and
 exports a watertight binary STL ready for slicing.
 
 | engine     | what it does                                                    | cost           |
 | ---------- | --------------------------------------------------------------- | -------------- |
 | `simp`     | topology optimization driven by a real finite element solve      | minutes        |
 | `growth`   | a deterministic growth heuristic: route, branch, thicken         | a fraction of a second |
+| `solid`    | no optimization at all: fills the domain and exports what was drawn | instant     |
 
-Scope so far: both engines, static linear elasticity, compliance minimization
+Scope so far: all three engines, static linear elasticity, compliance minimization
 under a volume constraint, a 45 degree self-supporting (overhang) constraint, an
 optional guide wireframe that seeds a SIMP run with a load path joining every
 region it has to reach and then lets go of it,
@@ -1152,6 +1153,22 @@ analytic surface it violates - the surface the configuration described, not the
 grid's idea of it - and left a documented ten nanometres on the legal side so a
 containment test agrees. Where the part meets a bore, the bore **is** the
 cylinder.
+
+The scatter goes both ways, so the correction does too. The sampling does not put
+a wall's vertices reliably *outside* the surface - it puts them on both sides of
+it, and the smoothing that rounds the staircase pulls the corners inward - so
+correcting only the vertices that are proud of a boundary leaves the inward half
+as **dimples**: measured at 0.70 mm, half a voxel, on this project's plug
+fixture, and visible as scalloping on what was drawn as a cone. A vertex that
+violates nothing but rests within `BOUNDARY_CLAMP_CAPTURE_VOXELS` (half a voxel,
+the scale a cell-centre classification can be wrong by) of a boundary is
+therefore seated onto it as well, by the same projection onto the same legal
+side. Anything further away rests on nothing - an optimizer's free surface
+through the middle of the domain - and is left exactly where the smoothing put
+it, and a seat that would land a vertex proud of another boundary is dropped.
+What that costs is stated plainly: a free surface running *within* half a voxel
+of a boundary is treated as resting on it, which is a gap the voxel field cannot
+resolve anyway, and the correction is always onto the legal side.
 
 | shape                          | how it is projected                         |
 | ------------------------------ | ------------------------------------------- |
@@ -2635,10 +2652,10 @@ silently ignored.
 [project]
 name = "cantilever"        # required, used in reports
 
-engine = "simp"            # optional, default "simp"; "simp" | "growth". May
-                           # also be written as project.engine (a bare key after
-                           # [project] belongs to that table in TOML), but not in
-                           # both places
+engine = "simp"            # optional, default "simp"; "simp" | "growth" |
+                           # "solid". May also be written as project.engine (a
+                           # bare key after [project] belongs to that table in
+                           # TOML), but not in both places
 
 [resolution]               # exactly one of the two keys must be present
 voxel_size_mm = 2.0        # cubic voxel edge length
@@ -2652,19 +2669,22 @@ preset = "pla"             # "pla" | "petg" | "abs"
 # yield_strength_mpa = 50.0  # optional; the stress report's safety factor needs it
 
 [optimization]
-mass_fraction = 0.3        # required, open interval (0, 1); fraction of the
+mass_fraction = 0.3        # required except under engine = "solid", which
+                           # REJECTS it; open interval (0, 1); fraction of the
                            # DESIGN cells kept, measured on the PRINTED densities.
                            # The growth engine normalizes its strut radii to it
 min_feature_mm = 4.0       # required; the density filter radius is half of this.
                            # For the growth engine it is the smallest strut
                            # DIAMETER, and the scale of every [growth] default
-penalty = 3.0              # optional, default 3.0; simp only. The exponent p of
+penalty = 3.0              # optional, default 3.0; simp only (the growth and
+                           # solid engines never read it). The exponent p of
                            # E(x) = Emin + x^p (E0 - Emin). At least 1, and 2 to
                            # 5 is the useful range: higher prices intermediate
                            # density harder and drives the field black and white,
                            # at the cost of more local minima. Every recorded
                            # trajectory and every shipped example is at 3
 stiffness_floor = 1e-9     # optional, default 1e-9, 1e-12 .. 1e-3; simp only.
+                           # The growth and solid engines never read it.
                            # The Emin of that formula: what an emptied DESIGN
                            # cell still carries, as a fraction of E0. The
                            # default is nine decades of stiffness contrast
@@ -2672,13 +2692,16 @@ stiffness_floor = 1e-9     # optional, default 1e-9, 1e-12 .. 1e-3; simp only.
                            # iteration count grows with - raise it when a run
                            # exhausts its budget short of the tolerance. Forced
                            # void cells carry a literal zero either way
-max_iterations = 150       # optional, default 1000; simp only. A budget, not a
+max_iterations = 150       # optional, default 1000; simp only - growth has its
+                           # own step cap and solid runs no loop. A budget, not a
                            # target: a run stops on convergence, or on the stall
                            # criterion, long before it here. See "When a run
                            # stops" above
 convergence_tol = 0.01     # optional, default 0.01; simp only, stop once the
-                           # largest design variable change falls below it
-update = "oc"              # optional, default "oc"; "oc" | "mma". simp only.
+                           # largest design variable change falls below it.
+                           # Neither other engine has a design variable
+update = "oc"              # optional, default "oc"; "oc" | "mma". simp only:
+                           # neither other engine moves a design variable.
                            # "mma" is the method of moving asymptotes, for runs
                            # the optimality criteria step cannot settle. See the
                            # update scheme section above
@@ -2686,14 +2709,15 @@ update = "oc"              # optional, default "oc"; "oc" | "mma". simp only.
 # [optimization.overhang]  # optional; absent means no printability constraint
 # build_direction = "z+"   # required inside the table: x+ | x- | y+ | y- | z+ | z-
                            # the 45 degree angle is fixed by the filter stencil.
-                           # simp only: engine = "growth" rejects this table
+                           # simp only: engine = "growth" and engine = "solid"
+                           # reject this table
 
 # [optimization.wireframe] # optional; absent means no guide. Present seeds a
 # radius_mm = 2.5          # thin wire through every load, support and keepin
 # hold_iterations = 40     # region and holds it as a density floor for the first
 # seed_density = 1.0       # iterations, then lets go. Every key optional; simp
-                           # only: engine = "growth" rejects this table. See the
-                           # guide wireframe section above
+                           # only: engine = "growth" and engine = "solid" reject
+                           # this table. See the guide wireframe section above
 
 # [optimization.local_volume] # optional; absent means the global volume target
 # max_fraction = 0.6       # alone. Present caps the material any NEIGHBOURHOOD
@@ -2703,7 +2727,8 @@ update = "oc"              # optional, default "oc"; "oc" | "mma". simp only.
                            # above mass_fraction, radius_mm to three density
                            # filter radii (3 x min_feature_mm / 2) and must sit
                            # above one. NEEDS update = "mma"; engine = "growth"
-                           # rejects this table. See the local volume section
+                           # and engine = "solid" reject this table. See the
+                           # local volume section
 
 # [solver]                 # optional; absent means the compute backend, falling
 # backend = "gpu"          # back to the cpu when this build or this machine has
@@ -2752,11 +2777,13 @@ islands = "cull"             # optional, default "cull"; removes the components
                              # load or keepin region, before it is validated and
                              # written. "keep" exports the extracted surface,
                              # fragments and all. See the islands section above
-boundaries = "exact"         # optional, default "exact"; projects every exported
+boundaries = "exact"         # optional, default "exact"; puts every exported
                              # vertex that lies inside a keepout or outside the
                              # domain back onto the analytic surface it violates,
-                             # so a bore in the STL is the cylinder that was
-                             # asked for. "voxel" exports the isosurface exactly
+                             # and seats the ones resting up to half a voxel
+                             # short of a boundary onto it too, so a bore in the
+                             # STL is the cylinder that was asked for and a wall
+                             # does not scallop. "voxel" exports the isosurface exactly
                              # as the voxel field produced it - the behaviour
                              # before 0.22.0. See the exact boundaries section
 trim = "off"                 # optional, default "off"; "stress" removes the
@@ -2764,7 +2791,9 @@ trim = "off"                 # optional, default "off"; "stress" removes the
                              # every load case, is a negligible fraction of the
                              # part's peak - and refuses the whole pass if that
                              # would disconnect two declared regions. Nothing to
-                             # do with [growth] prune. See the trimming section
+                             # do with [growth] prune, and rejected outright by
+                             # engine = "solid", which exports the domain exactly.
+                             # See the trimming section
 trim_stress_fraction = 0.01  # optional, default 0.01; open interval (0, 1). The
                              # fraction of the peak that counts as negligible
 reinforce = "off"            # optional, default "off"; "min_thickness" thickens
@@ -2772,8 +2801,9 @@ reinforce = "off"            # optional, default "off"; "min_thickness" thickens
                              # than reinforce_thickness_mm up to it, into the
                              # design space around it and never into a keepout
                              # or out of the domain. Nothing to do with the
-                             # growth engine's own thickening. See the
-                             # reinforcement section
+                             # growth engine's own thickening, and rejected
+                             # outright by engine = "solid" for the reason trim
+                             # is. See the reinforcement section
 reinforce_thickness_mm = 3.0 # optional, default [optimization] min_feature_mm;
                              # a positive length in millimetres. The floor the
                              # pass above holds every member to
@@ -3091,8 +3121,9 @@ with no design cells left, a triangle whose three points lie on one line (it has
 no area, and no thickness gives it a solid), a cone whose wide end has no radius,
 no supports, no load cases, a load case with no
 loads, a support or load region that selects no node touching material, a load
-case whose loaded degrees of freedom are all constrained, `mass_fraction`
-outside (0, 1), both or neither resolution key, a resolution that would lay out
+case whose loaded degrees of freedom are all constrained, a missing
+`mass_fraction` (except under `engine = "solid"`) or one outside (0, 1), both or
+neither resolution key, a resolution that would lay out
 more than `constants::MAX_GRID_CELLS` cells (either key can ask for one: a huge
 `target_cells` or a tiny `voxel_size_mm`; the message names the key, the grid it
 derives and the budget), a torque whose selected nodes all lie on its axis, a
@@ -3106,6 +3137,14 @@ Rejected for a growth run specifically: a `[growth]` table without
 section), a problem whose only loads are gravity, and a load region with no path
 to any support. Nothing about pruning is ever a rejection: a surface no branch
 could reach is reported, and the branches that were heading for it are removed.
+
+Rejected for a solid run specifically: `engine = "solid"` with
+`[optimization] mass_fraction` set (it fills the domain, so there is no share of
+it to target), with `[optimization.overhang]`, `[optimization.wireframe]` or
+`[optimization.local_volume]`, or with `[output] trim` or `reinforce` set to
+anything but `"off"` - both passes alter the very domain that engine exports.
+`mass_fraction` is required for every other engine and refused for this one, so
+a file switching between them gains and loses the key.
 
 Rejected for a symmetric growth run: a `[growth.symmetry]` table without
 `engine = "growth"`, a kind carrying the other kind's keys, no `planes` or more
@@ -3165,6 +3204,18 @@ all, and a `hold_iterations` that outlasts `max_iterations`.
    space colonization for the canopy, Murray's law over the accumulated flow for
    the radii, and capsules unioned with a smooth minimum for the field. No
    finite element solve is involved at all. See the growth engine section.
+
+   **Or hold solid** (`engine = "solid"`). Steps 2 and 3 do not happen at all:
+   every design cell is filled and the field handed on is the cell
+   classification itself, so the part that ships is the design space that was
+   drawn. There is no mass fraction to set (the key is rejected), no progress
+   line to print and no compliance to quote; step 4 onwards runs exactly as it
+   does after either optimizer, and the boundary clamp of step 5 is what makes
+   the exported surface the analytic shapes rather than a voxelization of them.
+   For the part that was never a topology problem - a plug, a housing, a
+   fixture - which before this had to be faked at a mass fraction just under
+   one, where the optimizer moves material it was not asked to move and the
+   density filter erodes the boundary cells.
 4. **Post-process.** Enclosed cavities are resolved under the `[output] voids`
    policy, and the resulting field is solved once more per load case to recover
    the von Mises stresses. Neither can move the optimization, which is over.

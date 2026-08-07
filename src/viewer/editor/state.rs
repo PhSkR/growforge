@@ -1576,7 +1576,7 @@ mod tests {
         let mut state = EditorState::open(&path).expect("open");
         assert!(!state.is_dirty());
 
-        state.edit(|config| config.optimization.mass_fraction = 0.44);
+        state.edit(|config| config.optimization.mass_fraction = Some(0.44));
         assert!(state.is_dirty());
         assert!(state.undo());
         assert!(
@@ -1731,7 +1731,7 @@ mod tests {
         let (_dir, path) = write_temp("rescue", fixture());
         let before = std::fs::read(&path).expect("read");
         let mut state = EditorState::open(&path).expect("open");
-        state.edit(|config| config.optimization.mass_fraction = 0.44);
+        state.edit(|config| config.optimization.mass_fraction = Some(0.44));
         state.edit(|config| config.optimization.min_feature_mm = 20.0);
 
         let recovered = state.write_recovery().expect("the rescue writes");
@@ -1779,7 +1779,7 @@ mod tests {
         let recovered = state.recovery_path();
         std::fs::write(&recovered, "# whatever was here before\n").expect("write");
 
-        state.edit(|config| config.optimization.mass_fraction = 0.44);
+        state.edit(|config| config.optimization.mass_fraction = Some(0.44));
         assert_eq!(
             state.write_recovery().expect("the rescue writes"),
             recovered
@@ -1794,7 +1794,7 @@ mod tests {
                 .expect("parse")
                 .optimization
                 .mass_fraction,
-            0.44
+            Some(0.44)
         );
     }
 
@@ -1805,7 +1805,7 @@ mod tests {
     fn an_emergency_save_that_cannot_be_written_reports_it() {
         let (_dir, path) = write_temp("rescue_blocked", fixture());
         let mut state = EditorState::open(&path).expect("open");
-        state.edit(|config| config.optimization.mass_fraction = 0.44);
+        state.edit(|config| config.optimization.mass_fraction = Some(0.44));
 
         // A directory in the way of the file, which is a write that fails on
         // every platform without needing permissions arranged.
@@ -2166,16 +2166,25 @@ mod tests {
         let widget = 7;
         for value in [0.31, 0.32, 0.33] {
             state.begin_edit(widget);
-            state.config_mut().optimization.mass_fraction = value;
+            state.config_mut().optimization.mass_fraction = Some(value);
         }
         state.end_edit(widget);
         assert_eq!(state.undo_depth(), 1, "a drag is one step, not three");
         assert!(state.undo());
-        assert!((state.config().optimization.mass_fraction - 0.3).abs() < 1e-12);
+        assert!(
+            (state
+                .config()
+                .optimization
+                .mass_fraction
+                .expect("a mass target")
+                - 0.3)
+                .abs()
+                < 1e-12
+        );
 
         // A second widget taking over closes the first interaction.
         state.begin_edit(1);
-        state.config_mut().optimization.mass_fraction = 0.4;
+        state.config_mut().optimization.mass_fraction = Some(0.4);
         state.begin_edit(2);
         state.config_mut().optimization.min_feature_mm = 9.0;
         state.end_edit(2);
@@ -2188,7 +2197,7 @@ mod tests {
         let mut state = EditorState::open(&path).expect("open");
         let cells = state.problem().expect("a problem").grid.n_cells();
 
-        state.edit(|config| config.optimization.mass_fraction = 1.5);
+        state.edit(|config| config.optimization.mass_fraction = Some(1.5));
         state.revalidate();
         assert!(!state.is_valid() || state.error().is_some());
         let error = state.error().expect("a reason");

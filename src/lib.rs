@@ -7,8 +7,8 @@
 //! -> smoothing -> island culling -> boundary clamp -> validation -> binary
 //! STL`. Everything
 //! after the engine is engine agnostic, which is what lets the `growth` engine
-//! hand over a field it never solved for and still get an honest stress report
-//! on it.
+//! hand over a field it never solved for - and the `solid` engine one it never
+//! optimized - and still get an honest stress report on it.
 //!
 //! Units are millimetres, newtons, megapascals (N/mm^2), newton-millimetres for
 //! torque and g/cm^3 for mass density.

@@ -95,7 +95,12 @@ pub struct MaterialConfig {
 #[serde(deny_unknown_fields)]
 pub struct OptimizationConfig {
     /// Fraction of the design cells to keep, in the open interval (0, 1).
-    pub mass_fraction: f64,
+    ///
+    /// Required by every engine that has a mass target to meet, and **refused**
+    /// by the one that has none: `engine = "solid"` fills the domain completely,
+    /// so a fraction of it is not a thing that configuration can ask for. See
+    /// [`Config::check_solid`].
+    pub mass_fraction: Option<f64>,
     /// Smallest structural feature the result should contain, in millimetres.
     pub min_feature_mm: f64,
     /// SIMP penalization exponent. Defaults to [`constants::SIMP_PENALTY`].
@@ -1839,7 +1844,11 @@ impl Config {
         }
 
         let o = &self.optimization;
-        finite("[optimization]", "mass_fraction", o.mass_fraction)?;
+        finite(
+            "[optimization]",
+            "mass_fraction",
+            o.mass_fraction.unwrap_or_default(),
+        )?;
         finite("[optimization]", "min_feature_mm", o.min_feature_mm)?;
         finite("[optimization]", "penalty", o.penalty.unwrap_or_default())?;
         finite(
@@ -2019,14 +2028,44 @@ impl Config {
     }
 
     /// Resolve optimization controls and apply defaults.
+    ///
+    /// Two of the keys are resolved against the engine rather than on their own,
+    /// because the solid engine has no use for either and refuses both by name
+    /// in [`Config::check_solid`]: `mass_fraction`, which it fills the domain
+    /// rather than targeting a share of, and `[optimization.local_volume]`,
+    /// which prices a density field it does not have. Resolving them here anyway
+    /// would fail first and say something else - a range, or an infeasible cap -
+    /// in place of the message that says why the key is not this engine's to
+    /// set.
     pub fn optimization_params(&self) -> Result<OptimizationParams> {
         let o = &self.optimization;
-        if !(o.mass_fraction > 0.0 && o.mass_fraction < 1.0) {
-            bail!(
-                "[optimization]: mass_fraction must lie strictly between 0 and 1 (got {})",
-                o.mass_fraction
-            );
-        }
+        let solid = self.is_solid();
+        let mass_fraction = match solid {
+            // Every design cell is filled, so the fraction of them that ends up
+            // as material is one. It is what the summary lines, the self weight
+            // estimate and the stress pass read, and it is the truth about the
+            // field the engine returns rather than a stand-in for a missing key.
+            true => constants::DENSITY_MAX,
+            false => {
+                let engine = self.engine_name()?;
+                let mass = o.mass_fraction.ok_or_else(|| {
+                    anyhow!(
+                        "[optimization]: mass_fraction is required with engine = \"{engine}\": it \
+                         is the fraction of the design cells that ends up as material, strictly \
+                         between 0 and 1. Only engine = \"{}\", which fills the domain completely, \
+                         does without it",
+                        constants::SOLID_ENGINE
+                    )
+                })?;
+                if !(mass > 0.0 && mass < 1.0) {
+                    bail!(
+                        "[optimization]: mass_fraction must lie strictly between 0 and 1 (got \
+                         {mass})"
+                    );
+                }
+                mass
+            }
+        };
         if o.min_feature_mm <= 0.0 || o.min_feature_mm.is_nan() {
             bail!(
                 "[optimization]: min_feature_mm must be positive (got {})",
@@ -2076,10 +2115,11 @@ impl Config {
         let filter_radius_mm = o.min_feature_mm / constants::FILTER_RADIUS_DIVISOR;
         let update = o.update.unwrap_or_default();
         // The scheme gate. It is asked here, where `update` is resolved, and
-        // skipped for the growth engine - which has no update scheme at all and
-        // rejects the table outright with its own message in `growth_params`,
-        // where "set update = \"mma\"" would be advice to nowhere.
-        if o.local_volume.is_some() && update != UpdateScheme::Mma && !self.is_growth() {
+        // skipped for the two engines that have no update scheme at all - the
+        // growth engine and the solid one - both of which reject the table
+        // outright with a message of their own, where "set update = \"mma\""
+        // would be advice to nowhere.
+        if o.local_volume.is_some() && update != UpdateScheme::Mma && !self.is_growth() && !solid {
             bail!(
                 "[optimization.local_volume] needs update = \"{}\" (this configuration uses \
                  \"{}\"): the local cap is a second constraint, and the optimality criteria step \
@@ -2090,13 +2130,19 @@ impl Config {
                 UpdateScheme::Mma.label()
             );
         }
-        let local_volume = o
-            .local_volume
-            .as_ref()
-            .map(|spec| local_volume_params(spec, o.mass_fraction, filter_radius_mm))
-            .transpose()?;
+        let local_volume = match solid {
+            // Refused by name in `check_solid`; a cap priced against a mass
+            // fraction of one is infeasible by construction and would fail here
+            // with that arithmetic instead of with the reason.
+            true => None,
+            false => o
+                .local_volume
+                .as_ref()
+                .map(|spec| local_volume_params(spec, mass_fraction, filter_radius_mm))
+                .transpose()?,
+        };
         Ok(OptimizationParams {
-            mass_fraction: o.mass_fraction,
+            mass_fraction,
             min_feature_mm: o.min_feature_mm,
             filter_radius_mm,
             penalty,
@@ -2174,6 +2220,111 @@ impl Config {
     /// True when the configuration selected the growth engine.
     pub fn is_growth(&self) -> bool {
         matches!(self.engine_name(), Ok(name) if name == constants::GROWTH_ENGINE)
+    }
+
+    /// True when the configuration selected the solid engine.
+    pub fn is_solid(&self) -> bool {
+        matches!(self.engine_name(), Ok(name) if name == constants::SOLID_ENGINE)
+    }
+
+    /// Reject everything `engine = "solid"` cannot mean.
+    ///
+    /// The rejecting half of a `*_params` pass with nothing to resolve: the
+    /// solid engine has no controls of its own, so what it needs from the
+    /// configuration is that nothing in it describes an optimization that is not
+    /// going to happen. Six things do - a mass target, a build direction, a
+    /// guide, a porosity cap, and either of the two passes over the finished
+    /// field - and each is refused by name rather than ignored, because a
+    /// configuration that asks for one is a configuration whose author expects
+    /// something this engine does not do.
+    ///
+    /// The keys that are merely *unused* are left alone, exactly as the growth
+    /// engine leaves them: `penalty`, `stiffness_floor`, `min_feature_mm`,
+    /// `max_iterations`, `convergence_tol` and `update` resolve to their
+    /// defaults and cost nothing, and `[[supports]]` and `[[loadcases]]` are
+    /// still required - the post-run stress report is what says whether the part
+    /// holds.
+    pub fn check_solid(&self) -> Result<()> {
+        if !self.is_solid() {
+            return Ok(());
+        }
+        if self.optimization.mass_fraction.is_some() {
+            bail!(
+                "engine = \"{}\" cannot be combined with [optimization] mass_fraction: the solid \
+                 engine fills the domain completely, so there is no fraction of it to target - the \
+                 part is the design space itself. Remove the key, or run this problem with engine \
+                 = \"{}\"",
+                constants::SOLID_ENGINE,
+                constants::DEFAULT_ENGINE
+            );
+        }
+        if self.optimization.overhang.is_some() {
+            bail!(
+                "engine = \"{}\" cannot be combined with [optimization.overhang]: the \
+                 self-supporting filter is a stage of the SIMP density chain, and the solid engine \
+                 has no density chain to chain it onto. There is no solid equivalent either - what \
+                 a fully dense domain needs to print is supports under it, which is the slicer's \
+                 business rather than the design's. Drop the table, or run this problem with engine \
+                 = \"{}\"",
+                constants::SOLID_ENGINE,
+                constants::DEFAULT_ENGINE
+            );
+        }
+        if self.optimization.wireframe.is_some() {
+            bail!(
+                "engine = \"{}\" cannot be combined with [optimization.wireframe]: the guide \
+                 wireframe seeds a density field and holds a floor under the SIMP update, and the \
+                 solid engine runs no update to hold anything under. There is no solid equivalent \
+                 either, and none is needed: every cell the guide would route through is already \
+                 full. Drop the table, or run this problem with engine = \"{}\"",
+                constants::SOLID_ENGINE,
+                constants::DEFAULT_ENGINE
+            );
+        }
+        if self.optimization.local_volume.is_some() {
+            bail!(
+                "engine = \"{}\" cannot be combined with [optimization.local_volume]: the local cap \
+                 forbids material from concentrating, and a fully dense part is that concentration \
+                 everywhere - no design satisfies a cap below one, and the solid engine has no \
+                 design variable to move towards one anyway. Drop the table, or run this problem \
+                 with engine = \"{}\"",
+                constants::SOLID_ENGINE,
+                constants::DEFAULT_ENGINE
+            );
+        }
+        // The two passes over the finished field. Both are legal for every other
+        // engine and both would take this one's whole point away: what the solid
+        // engine exports is the domain, exactly, and a pass that removes or adds
+        // material to it exports something else.
+        let trim = self.output.trim.unwrap_or_default();
+        let reinforce = self.output.reinforce.unwrap_or_default();
+        for (key, asked, label, off) in [
+            (
+                "trim",
+                trim != TrimPolicy::Off,
+                trim.label(),
+                TrimPolicy::Off.label(),
+            ),
+            (
+                "reinforce",
+                reinforce != ReinforcePolicy::Off,
+                reinforce.label(),
+                ReinforcePolicy::Off.label(),
+            ),
+        ] {
+            if asked {
+                bail!(
+                    "engine = \"{}\" cannot be combined with [output] {key} = \"{label}\": the \
+                     solid engine exports exactly the domain that was described, and this pass \
+                     would alter it - {key} is for a part an optimizer produced, where some of the \
+                     material carries nothing or came out too thin. Set {key} = \"{off}\", or run \
+                     this problem with engine = \"{}\"",
+                    constants::SOLID_ENGINE,
+                    constants::DEFAULT_ENGINE
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Resolve growth controls and apply defaults.
@@ -2554,6 +2705,7 @@ impl Config {
         self.optimization_params()?;
         self.solver_params()?;
         self.growth_params()?;
+        self.check_solid()?;
         self.domain_csg()?;
         self.keepout_union()?;
         self.keepin_union()?;
@@ -4494,6 +4646,177 @@ max_steps = 25
             err.contains(constants::DEFAULT_ENGINE),
             "the error has to offer the engine that does support it: {err}"
         );
+    }
+
+    /// The minimal configuration with the solid engine selected, which is the
+    /// minimal one *without* its mass fraction: that engine refuses the key.
+    fn solid(extra: &str) -> String {
+        format!(
+            "engine = \"{}\"\n{}{extra}",
+            constants::SOLID_ENGINE,
+            MINIMAL.replace("mass_fraction = 0.3\n", "")
+        )
+    }
+
+    #[test]
+    fn the_solid_engine_needs_no_mass_fraction_and_every_other_engine_still_does() {
+        let cfg = Config::parse(&solid("")).expect("parse");
+        cfg.validate_static().expect("validate");
+        assert!(cfg.is_solid() && !cfg.is_growth());
+        // Resolved to a full domain, which is what the field really comes out
+        // at and what every summary line reads.
+        assert_eq!(
+            cfg.optimization_params().unwrap().mass_fraction,
+            constants::DENSITY_MAX
+        );
+
+        // The requirement is lifted for that engine and for no other.
+        for engine in [constants::DEFAULT_ENGINE, constants::GROWTH_ENGINE] {
+            let text = format!(
+                "engine = \"{engine}\"\n{}",
+                MINIMAL.replace("mass_fraction = 0.3\n", "")
+            );
+            let err = Config::parse(&text)
+                .expect("parse")
+                .validate_static()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("mass_fraction") && err.contains("required"),
+                "{engine}: unexpected error: {err}"
+            );
+            assert!(
+                err.contains(constants::SOLID_ENGINE),
+                "{engine}: the error has to name the engine that does without it: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_solid_engine_rejects_a_mass_fraction_that_is_set() {
+        let text = format!("engine = \"{}\"\n{MINIMAL}", constants::SOLID_ENGINE);
+        let err = Config::parse(&text)
+            .expect("parse")
+            .validate_static()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mass_fraction"), "unexpected error: {err}");
+        assert!(
+            err.contains("Remove the key"),
+            "the error has to say what to do about it: {err}"
+        );
+        assert!(
+            err.contains(constants::SOLID_ENGINE) && err.contains(constants::DEFAULT_ENGINE),
+            "the error has to name both engines: {err}"
+        );
+        // A value outside the legal range is refused for the same reason rather
+        // than for its range: the key is not this engine's to set at all.
+        let out_of_range = format!(
+            "engine = \"{}\"\n{}",
+            constants::SOLID_ENGINE,
+            MINIMAL.replace("mass_fraction = 0.3", "mass_fraction = 1.5")
+        );
+        let err = Config::parse(&out_of_range)
+            .expect("parse")
+            .validate_static()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Remove the key"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn the_solid_engine_rejects_every_table_that_prices_a_density_field() {
+        for (body, needle) in [
+            (
+                "\n[optimization.overhang]\nbuild_direction = \"z+\"\n",
+                "overhang",
+            ),
+            ("\n[optimization.wireframe]\nradius_mm = 2.0\n", "wireframe"),
+            (
+                "\n[optimization.local_volume]\nmax_fraction = 0.6\n",
+                "local_volume",
+            ),
+        ] {
+            let err = Config::parse(&solid(body))
+                .expect("parse")
+                .validate_static()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{body}: unexpected error: {err}");
+            assert!(
+                err.contains("no solid equivalent") || err.contains("solid engine"),
+                "{body}: the error has to say why: {err}"
+            );
+            assert!(
+                err.contains(constants::DEFAULT_ENGINE),
+                "{body}: the error has to offer the engine that does support it: {err}"
+            );
+        }
+        // The local cap is refused by the engine rather than by the update
+        // scheme gate, which would otherwise fire first and give advice to
+        // nowhere.
+        let err = Config::parse(&solid(
+            "\n[optimization.local_volume]\nmax_fraction = 0.6\n",
+        ))
+        .expect("parse")
+        .validate_static()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !err.contains("needs update"),
+            "the update scheme gate answered for the solid engine: {err}"
+        );
+    }
+
+    #[test]
+    fn the_solid_engine_rejects_a_pass_that_would_alter_the_domain() {
+        for (body, needle) in [
+            ("trim = \"stress\"", "trim"),
+            ("reinforce = \"min_thickness\"", "reinforce"),
+        ] {
+            let text = solid("").replace(
+                "stl_path = \"out.stl\"",
+                &format!("stl_path = \"out.stl\"\n{body}"),
+            );
+            let err = Config::parse(&text)
+                .expect("parse")
+                .validate_static()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{body}: unexpected error: {err}");
+            assert!(
+                err.contains("exports exactly the domain"),
+                "{body}: the error has to say why: {err}"
+            );
+        }
+        // Both explicitly off is what the engine asks for, and is accepted.
+        let off = solid("").replace(
+            "stl_path = \"out.stl\"",
+            "stl_path = \"out.stl\"\ntrim = \"off\"\nreinforce = \"off\"",
+        );
+        Config::parse(&off)
+            .expect("parse")
+            .validate_static()
+            .expect("off is what the solid engine wants");
+    }
+
+    #[test]
+    fn the_solid_engine_leaves_the_simp_knobs_it_never_reads_alone() {
+        // Legal but unused, exactly as they are under the growth engine: a
+        // configuration that carries them still builds, and they resolve to
+        // whatever they say.
+        let text = solid("").replace(
+            "min_feature_mm = 6.0",
+            "min_feature_mm = 6.0\npenalty = 4.0\nstiffness_floor = 1e-6\nmax_iterations = 7\n\
+             convergence_tol = 0.05\nupdate = \"mma\"",
+        );
+        let cfg = Config::parse(&text).expect("parse");
+        cfg.validate_static().expect("validate");
+        let params = cfg.optimization_params().expect("params");
+        assert_eq!(params.penalty, 4.0);
+        assert_eq!(params.stiffness_floor, 1e-6);
+        assert_eq!(params.max_iterations, 7);
+        assert_eq!(params.update, UpdateScheme::Mma);
     }
 
     #[test]

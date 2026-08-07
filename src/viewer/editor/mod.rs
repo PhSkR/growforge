@@ -2068,6 +2068,18 @@ weight = 1.0
         TEXT.get_or_init(|| format!("engine = \"growth\"\n{FIXTURE}"))
     }
 
+    /// The same problem exported by the solid engine, which is the fixture
+    /// *without* its mass fraction: that engine refuses the key.
+    pub fn solid_fixture() -> &'static str {
+        static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        TEXT.get_or_init(|| {
+            format!(
+                "engine = \"solid\"\n{}",
+                FIXTURE.replace("mass_fraction = 0.3  # keep this comment\n", "")
+            )
+        })
+    }
+
     /// The fixture configuration.
     pub fn fixture() -> &'static str {
         FIXTURE
@@ -2405,7 +2417,7 @@ vector = [0.0, 0.0, -80.0]
         let mut editor = Editor::open(&path).expect("open");
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.44);
+            .edit(|config| config.optimization.mass_fraction = Some(0.44));
         assert!(editor.state.is_dirty());
         editor.save();
         assert!(!editor.state.is_dirty());
@@ -2426,7 +2438,7 @@ vector = [0.0, 0.0, -80.0]
 
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.44);
+            .edit(|config| config.optimization.mass_fraction = Some(0.44));
         assert!(!editor.request_close(), "unsaved edits must be asked about");
         assert!(editor.is_asking() && !editor.may_close());
         editor.decide(CloseDecision::Cancel);
@@ -2458,7 +2470,7 @@ vector = [0.0, 0.0, -80.0]
         let mut editor = Editor::open(&path).expect("open");
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.9);
+            .edit(|config| config.optimization.mass_fraction = Some(0.9));
         editor.request_close();
         editor.decide(CloseDecision::Discard);
         assert!(editor.may_close());
@@ -2487,7 +2499,7 @@ vector = [0.0, 0.0, -80.0]
         // a close.
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.44);
+            .edit(|config| config.optimization.mass_fraction = Some(0.44));
         assert!(!editor.request_open(other.clone()));
         assert_eq!(editor.asking(), Some(&Intent::OpenFile(other.clone())));
         assert!(
@@ -2597,7 +2609,7 @@ vector = [0.0, 0.0, -80.0]
         let mut editor = Editor::open(&path).expect("open");
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.44);
+            .edit(|config| config.optimization.mass_fraction = Some(0.44));
 
         // The close is asked about, and that is the question from here on.
         assert!(!editor.request_close());
@@ -4086,7 +4098,7 @@ vector = [0.0, 0.0, -80.0]
 
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.2);
+            .edit(|config| config.optimization.mass_fraction = Some(0.2));
         editor.on_edited();
         std::thread::sleep(Duration::from_secs_f64(
             constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
@@ -4138,7 +4150,7 @@ vector = [0.0, 0.0, -80.0]
 
         // A committed edit of a growth control, the way the panel makes one.
         editor.state.edit(|config| {
-            config.optimization.mass_fraction = 0.1;
+            config.optimization.mass_fraction = Some(0.1);
         });
         editor.on_edited();
         std::thread::sleep(Duration::from_secs_f64(
@@ -4186,7 +4198,7 @@ vector = [0.0, 0.0, -80.0]
         let mut scene = editor.initial_scene();
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.2);
+            .edit(|config| config.optimization.mass_fraction = Some(0.2));
         editor.on_edited();
         std::thread::sleep(Duration::from_secs_f64(
             constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
@@ -4217,7 +4229,7 @@ vector = [0.0, 0.0, -80.0]
         // And the editor still works: another edit starts another run.
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.25);
+            .edit(|config| config.optimization.mass_fraction = Some(0.25));
         editor.on_edited();
         std::thread::sleep(Duration::from_secs_f64(
             constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
@@ -4292,7 +4304,7 @@ vector = [0.0, 0.0, -80.0]
         // The preview an edit starts. It exports nothing of its own.
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.2);
+            .edit(|config| config.optimization.mass_fraction = Some(0.2));
         editor.on_edited();
         std::thread::sleep(Duration::from_secs_f64(
             constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
@@ -4404,7 +4416,7 @@ vector = [0.0, 0.0, -80.0]
         // run starts rather than being swallowed by the failed one.
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.4);
+            .edit(|config| config.optimization.mass_fraction = Some(0.4));
         editor.on_edited();
         std::thread::sleep(Duration::from_secs_f64(
             constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
@@ -4769,7 +4781,7 @@ vector = [0.0, 0.0, -80.0]
         let mut scene = editor.initial_scene();
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.2);
+            .edit(|config| config.optimization.mass_fraction = Some(0.2));
         editor.on_edited();
         std::thread::sleep(Duration::from_secs_f64(
             constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
@@ -4832,7 +4844,7 @@ vector = [0.0, 0.0, -80.0]
         let mut scene = editor.initial_scene();
         editor
             .state
-            .edit(|config| config.optimization.mass_fraction = 0.2);
+            .edit(|config| config.optimization.mass_fraction = Some(0.2));
         editor.on_edited();
         std::thread::sleep(Duration::from_secs_f64(
             constants::VIEW_EDIT_REFRESH_DEBOUNCE_S * 2.0,
