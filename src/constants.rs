@@ -1961,6 +1961,21 @@ pub const VIEW_PANEL_WIDTH_POINTS: f32 = 260.0;
 /// sits under, where it is the header's persistent id as well as its label.
 pub const VIEW_LAYER_SWITCHES_LABEL: &str = "show";
 
+/// What both panels say under their heading to name the build that drew them.
+///
+/// Assembled from the manifest at compile time rather than at runtime, so the
+/// window cannot name a version other than the one the binary was built from -
+/// which is the whole point of the line: an exported part, a screenshot or a
+/// bug report has to be attributable to a build without anyone having to work
+/// out which one was installed that day.
+///
+/// One constant because both windows draw it: the run panel and the editor's
+/// panel say the same string in the same place, so a screenshot of either
+/// identifies the build the same way. `concat!` takes literals only, which is
+/// why the name comes from the manifest rather than from [`PROGRAM_NAME`]; the
+/// two are the same string, and this one cannot drift from the binary.
+pub const VIEW_VERSION_LINE: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"));
+
 /// How often the viewer wakes to service its window message queue after the
 /// window has been torn down but the run behind it is still going.
 ///

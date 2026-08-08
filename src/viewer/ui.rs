@@ -106,6 +106,11 @@ pub fn panel(
         .resizable(false)
         .show(root, |ui| {
             ui.heading(title);
+            ui.label(
+                egui::RichText::new(constants::VIEW_VERSION_LINE)
+                    .small()
+                    .weak(),
+            );
             ui.label(egui::RichText::new(adapter).small().weak());
             ui.separator();
 
@@ -197,4 +202,86 @@ pub fn panel(
             ui.monospace("F            fit view");
             ui.monospace("close window detaches");
         });
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// The text of every row a finished frame painted, one per line.
+    ///
+    /// egui has no readable widget tree once a frame is over: what it leaves is
+    /// the shapes it painted, so a row is read back through its galley - the
+    /// laid out text of the label itself. `Shape::Vec` is walked because a
+    /// painter may nest shapes; nothing here paints text any other way.
+    ///
+    /// Shared with the editor's panel tests, which read their own header the
+    /// same way.
+    pub fn painted_text(output: &egui::FullOutput) -> String {
+        fn collect(shape: &egui::Shape, into: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    into.push_str(text.galley.text());
+                    into.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    /// A raw input laying the window out at the size the viewer opens at.
+    ///
+    /// A row is painted only while it is inside the screen rect, so a test that
+    /// reads back what was painted has to give the frame one.
+    pub fn window_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    f32::from(constants::VIEW_WINDOW_WIDTH as u16),
+                    f32::from(constants::VIEW_WINDOW_HEIGHT as u16),
+                ),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// The panel names the build that drew it.
+    ///
+    /// Compared against a version spelled out here rather than against the
+    /// constant the panel draws, so the assertion is what a screenshot has to
+    /// show and not a second reading of the same value.
+    #[test]
+    fn the_panel_says_which_build_it_is() {
+        let context = egui::Context::default();
+        let mut scene = Scene::default();
+        let output = context.run_ui(window_input(), |root| {
+            panel(
+                root,
+                "test title",
+                "test adapter",
+                &mut scene,
+                None,
+                None,
+                None,
+            );
+        });
+        let text = painted_text(&output);
+        let expected = format!("growforge {}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            text.contains(&expected),
+            "the run panel drew no {expected:?} line: {text}"
+        );
+    }
 }

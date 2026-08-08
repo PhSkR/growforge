@@ -440,6 +440,11 @@ pub fn panel(root: &mut egui::Ui, editor: &mut Editor, scene: &mut Scene, adapte
                     .small()
                     .weak(),
             );
+            ui.label(
+                egui::RichText::new(constants::VIEW_VERSION_LINE)
+                    .small()
+                    .weak(),
+            );
             ui.label(egui::RichText::new(adapter).small().weak());
             ui.separator();
             toolbar(ui, editor);
@@ -3241,16 +3246,7 @@ mod tests {
     fn panel_overflow(editor: &mut Editor, scene: &mut Scene) -> f32 {
         let context = egui::Context::default();
         context.memory_mut(|memory| memory.set_everything_is_visible(true));
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(
-                    f32::from(constants::VIEW_WINDOW_WIDTH as u16),
-                    f32::from(constants::VIEW_WINDOW_HEIGHT as u16),
-                ),
-            )),
-            ..Default::default()
-        };
+        let input = crate::viewer::ui::tests::window_input();
         let mut overflow = 0.0;
         for _ in 0..2 {
             let _ = context.run_ui(input.clone(), |root| {
@@ -3258,6 +3254,20 @@ mod tests {
             });
         }
         overflow
+    }
+
+    /// Lay the panel out in a window the size the editor opens at and hand back
+    /// the text of every row it painted.
+    ///
+    /// The window sized rect is what makes the rows exist: a row outside the
+    /// screen rect is never painted, and what is asserted here is what was
+    /// painted rather than the state behind it.
+    fn panel_text(editor: &mut Editor, scene: &mut Scene) -> String {
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            let _ = panel(root, editor, scene, "test adapter");
+        });
+        crate::viewer::ui::tests::painted_text(&output)
     }
 
     /// Every row of the panel has to fit the width the panel declares.
@@ -3422,6 +3432,24 @@ mod tests {
                 constants::VIEW_EDIT_PANEL_WIDTH_POINTS
             );
         }
+    }
+
+    /// The panel names the build that drew it.
+    ///
+    /// The version is spelled out here rather than read from the constant the
+    /// panel draws, so what is asserted is the string a screenshot has to show
+    /// and not a second reading of the same value.
+    #[test]
+    fn the_panel_says_which_build_it_is() {
+        let (_dir, path) = write_temp("version_line", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        let text = panel_text(&mut editor, &mut scene);
+        let expected = format!("growforge {}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            text.contains(&expected),
+            "the editor panel drew no {expected:?} line: {text}"
+        );
     }
 
     /// Every shape a selected object can be, in every state its rows have.

@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-08-07 - 0.37.0 - The window says which build it is
+
+Tracing which build produced an artifact cost a week's forensics; the window
+that drew it should have said so on its face.
+
+- **Both panels name the build under their heading.** The run panel and the
+  editor's panel each draw `growforge <version>` in the same weak small text as
+  the adapter line beside it, from one constant assembled out of the manifest at
+  compile time - so a screenshot identifies the binary and cannot name a version
+  the running program is not. Window titles are untouched.
+- Tests: each panel's own frame is drawn headlessly and the painted rows are read
+  back for the string, counter-verified by breaking the constant, which fails
+  both.
+- Version 0.37.0.
+
 ## 2026-08-07 - 0.36.2 - The clamp report learns to see a floated face
 
 A user's print failed on a part whose bottom face floated 0.44 mm above the
