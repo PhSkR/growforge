@@ -2256,7 +2256,7 @@ switch the session to whatever comes back, without closing the window: see
 | properties          | exact numeric fields for whatever is selected, and its own extras (a domain entry's `op`, a support's fixed axes, a load's vector or torque) |
 | engine / resolution / material / optimization / growth / output | every scalar the configuration holds, each with its default shown when the key is absent; each section carries a `reset` button that puts its own keys back to those defaults |
 | problem             | grid size, cell, node and degree of freedom counts, per-region node counts and the memory estimate, refreshed on every edit |
-| show                | the same layer switches the viewer has, plus the editor's own selection, hover, gizmo, dimension, floor grid and placement preview overlays; under them, what the [trim](#trimming-unloaded-material) pass removed from the design on screen, or the warning that it was refused, what the [flush fill](#flush-fill) pass put back out to the surfaces the walls rest on, what the [reinforcement](#reinforcement-minimum-printable-thickness) pass spent on its thin arms, or the warning that a member could not be thickened, and what the [boundary clamp](#exact-boundaries) moved onto the shapes |
+| show                | the same layer switches the viewer has, plus the editor's own selection, hover, gizmo, dimension and placement preview overlays - the floor grid's own switch is up in the snapping controls, beside the increment it is ruled at; under them, what the [trim](#trimming-unloaded-material) pass removed from the design on screen, or the warning that it was refused, what the [flush fill](#flush-fill) pass put back out to the surfaces the walls rest on, what the [reinforcement](#reinforcement-minimum-printable-thickness) pass spent on its thin arms, or the warning that a member could not be thickened, and what the [boundary clamp](#exact-boundaries) moved onto the shapes |
 | stress              | the [safety factor](#stress-report) of the part that was just written, first, with the peak von Mises stress of every load case under it; present after a full run and after `generate stl`, absent while one is running and absent when the stress solve produced no report |
 
 **Every labelled block above folds away**, and stays however you left it for the
@@ -2484,6 +2484,7 @@ whatever they started off by.
 | control            | what it sets                                                    |
 | ------------------ | ---------------------------------------------------------------- |
 | `snap mm`          | the length increment: a dropdown of the usual ones, `off`, or any number typed in beside it (default 1 mm) |
+| `floor grid`       | whether the grid ruled at that increment is drawn (on by default) |
 | held `Alt`         | no snapping at all, for as long as it is held                    |
 | (fixed)            | rotations snap to 22.5 degrees, which holds 45 and 90            |
 
@@ -2495,8 +2496,10 @@ from the world origin rather than from the edge of the footprint, so they sit on
 round coordinates and stay put when the domain is resized. The lines are drawn
 dim - half the brightness they had before 0.26.1 - so the ruling is read against
 the model rather than competing with it. It is a layer like any other and can be
-switched off entirely under **show**; it is drawn in edit mode alone, so `view`
-and `run --view` are unchanged.
+switched off entirely by the **floor grid** box in the snapping controls above,
+where it sits beside the increment it is ruled at rather than among the overlay
+switches under **show**; it is drawn in edit mode alone, so `view` and
+`run --view` are unchanged.
 
 Fine increments over large domains are capped. A 400 mm domain at a 0.1 mm
 increment asks for eight thousand lines, which is neither drawable nor legible,

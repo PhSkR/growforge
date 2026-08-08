@@ -2,7 +2,7 @@
 //! the control legend.
 
 use crate::constants;
-use crate::viewer::scene::{LAYERS, Layer, LayerRole, Scene};
+use crate::viewer::scene::{LAYERS, Layer, LayerRole, Scene, SwitchHome};
 use crate::viewer::snapshot::{FrameKind, Progress, RunStatus};
 
 /// What a switch says on hover while the layer behind it is empty. A layer with
@@ -11,11 +11,30 @@ use crate::viewer::snapshot::{FrameKind, Progress, RunStatus};
 /// ticked.
 const ABSENT_LAYER_HELP: &str = "nothing has produced this layer yet";
 
+/// Draw one layer's visibility switch: the checkbox, the layer's own hover text,
+/// and the reason it cannot be ticked while the layer is empty.
+///
+/// One switch on its own, because not every one of them is drawn in this block:
+/// a layer whose switch is homed elsewhere is drawn by whatever block owns it,
+/// and it has to be the same checkbox, explained the same way, wherever it is.
+pub fn layer_switch(ui: &mut egui::Ui, scene: &mut Scene, layer: Layer) -> egui::Response {
+    let info = layer.info();
+    let present = scene.get(layer).is_some();
+    let visible = scene.visibility_mut(layer);
+    ui.add_enabled(present, egui::Checkbox::new(visible, info.label))
+        .on_hover_text(info.help)
+        .on_disabled_hover_text(ABSENT_LAYER_HELP)
+}
+
 /// Draw the layer visibility switches and the two shading toggles.
 ///
 /// Shared with the editor's panel, so the same scene is controlled the same way
 /// whichever mode the window is in. Layers the editor alone produces are listed
 /// only when `editor` is set; everywhere else they do not exist.
+///
+/// Layers whose switch is homed elsewhere - [`SwitchHome::Elsewhere`] - are left
+/// out here whichever panel is drawing: the block that owns such a switch draws
+/// it itself, and the table is what says which those are.
 ///
 /// `editor` decides the block's own heading too: this panel writes it here,
 /// while the editor's panel draws the block under a collapsing header that
@@ -30,15 +49,10 @@ pub fn layer_switches(ui: &mut egui::Ui, scene: &mut Scene, editor: bool) {
     if !editor {
         ui.label(egui::RichText::new(constants::VIEW_LAYER_SWITCHES_LABEL).strong());
     }
-    for info in LAYERS
-        .iter()
-        .filter(|info| editor || info.role != LayerRole::Editor)
-    {
-        let present = scene.get(info.layer).is_some();
-        let visible = scene.visibility_mut(info.layer);
-        ui.add_enabled(present, egui::Checkbox::new(visible, info.label))
-            .on_hover_text(info.help)
-            .on_disabled_hover_text(ABSENT_LAYER_HELP);
+    for info in LAYERS.iter().filter(|info| {
+        (editor || info.role != LayerRole::Editor) && info.switch == SwitchHome::Show
+    }) {
+        layer_switch(ui, scene, info.layer);
     }
     let has_stress = scene.has_stress();
     ui.add_enabled(
@@ -237,6 +251,35 @@ pub(crate) mod tests {
         text
     }
 
+    /// Where the row whose whole text is `needle` was painted: the middle of
+    /// that text, which is a point inside the widget that drew it.
+    ///
+    /// What it is for is driving a click at a row without knowing egui's own
+    /// widget ids, which a frame does not hand back: a checkbox responds over
+    /// its label as well as its box, so the middle of the label is a point the
+    /// switch itself takes the click at.
+    pub fn painted_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+        fn find(shape: &egui::Shape, needle: &str, found: &mut Option<egui::Pos2>) {
+            match shape {
+                egui::Shape::Text(text) if found.is_none() && text.galley.text() == needle => {
+                    *found = Some(text.pos + text.galley.size() / 2.0);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        find(shape, needle, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut found = None;
+        for clipped in &output.shapes {
+            find(&clipped.shape, needle, &mut found);
+        }
+        found
+    }
+
     /// A raw input laying the window out at the size the viewer opens at.
     ///
     /// A row is painted only while it is inside the screen rect, so a test that
@@ -276,5 +319,33 @@ pub(crate) mod tests {
             text.lines().any(|line| line == expected),
             "the run panel's heading is not {expected:?}: {text}"
         );
+    }
+
+    /// This panel lists the layers a run and a setup view produce, and only
+    /// those.
+    ///
+    /// It has no precision block to home a switch in, so nothing may be taken
+    /// out of its list: the floor grid the editor moved beside its snap
+    /// increment is an editor layer this panel never drew in the first place.
+    /// Read off the table both ways round, so a layer that vanished from the
+    /// block and one that appeared in it both fail.
+    #[test]
+    fn the_run_panel_lists_every_layer_outside_the_editor_and_no_other() {
+        let context = egui::Context::default();
+        let mut scene = Scene::default();
+        let output = context.run_ui(window_input(), |root| {
+            panel(root, "test", "test adapter", &mut scene, None, None, None);
+        });
+        let text = painted_text(&output);
+        for info in LAYERS {
+            let listed = text.lines().any(|line| line == info.label);
+            assert_eq!(
+                listed,
+                info.role != LayerRole::Editor,
+                "the run panel {} the {} switch: {text}",
+                if listed { "draws" } else { "does not draw" },
+                info.label
+            );
+        }
     }
 }

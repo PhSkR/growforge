@@ -29,8 +29,8 @@ use crate::viewer::editor::state::{
     set_shape_contained, shape_of,
 };
 use crate::viewer::editor::{CloseDecision, Editor, Intent};
-use crate::viewer::scene::Scene;
-use crate::viewer::ui::layer_switches;
+use crate::viewer::scene::{Layer, Scene};
+use crate::viewer::ui::{layer_switch, layer_switches};
 
 /// Wraps the interaction bookkeeping around one widget.
 ///
@@ -446,7 +446,7 @@ pub fn panel(root: &mut egui::Ui, editor: &mut Editor, scene: &mut Scene, adapte
             ui.separator();
             toolbar(ui, editor);
             ui.separator();
-            precision(ui, editor);
+            precision(ui, editor, scene);
             ui.separator();
             validation(ui, editor);
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -603,13 +603,19 @@ fn toolbar(ui: &mut egui::Ui, editor: &mut Editor) {
     }
 }
 
-/// How precisely the viewport drags land: the snap increment, and whether
-/// objects are kept inside the domain.
+/// How precisely the viewport drags land: the snap increment, whether objects
+/// are kept inside the domain, and whether the grid ruled at that increment is
+/// drawn.
 ///
-/// Both belong to the session rather than to the file - nothing here is ever
-/// written to the configuration - which is why they sit above the document's
-/// own sections rather than among them.
-fn precision(ui: &mut egui::Ui, editor: &mut Editor) {
+/// All three belong to the session rather than to the file - nothing here is
+/// ever written to the configuration - which is why they sit above the
+/// document's own sections rather than among them.
+///
+/// The floor grid's switch is here rather than in the `show` block because it
+/// is what makes the increment above it visible: the grid is a workspace
+/// control before it is an overlay. It is the same switch the block drew, from
+/// the same layer table, over the same scene state.
+fn precision(ui: &mut egui::Ui, editor: &mut Editor, scene: &mut Scene) {
     // One explanation over the whole row: the dropdown and the box beside it set
     // the same increment, one from the usual list and one from anything at all.
     let snap = "the increment drags land on: a position along an axis, a dimension being resized, \
@@ -660,6 +666,7 @@ fn precision(ui: &mut egui::Ui, editor: &mut Editor) {
             editor.set_containment(on);
         }
     });
+    layer_switch(ui, scene, Layer::Grid);
     ui.label(
         egui::RichText::new(format!(
             "drags land on the increment and rotations on {} deg; hold Alt for a free drag",
@@ -5494,6 +5501,103 @@ mod tests {
         // no longer applies.
         editor.set_containment(false);
         assert!(editor.containment_note().is_none());
+    }
+
+    /// One click at `pos`, through the whole panel, in the frames egui needs to
+    /// report it.
+    ///
+    /// A widget is hit tested against the rects the pass before it registered,
+    /// so the pointer arrives in a frame of its own, presses in the next and
+    /// lets go in the one after, with a last frame for the click to be reported
+    /// in. One release in the whole sequence, so it is one click however egui
+    /// attributes it - which is what makes this a click on the switch rather
+    /// than a call to what the switch writes, the way a button's row has to be
+    /// driven.
+    fn click_panel_at(editor: &mut Editor, scene: &mut Scene, pos: egui::Pos2) {
+        let context = egui::Context::default();
+        let button = |pressed| {
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            button(true),
+            button(false),
+            Vec::new(),
+        ] {
+            let input = egui::RawInput {
+                events,
+                ..crate::viewer::ui::tests::window_input()
+            };
+            let _ = context.run_ui(input, |root| {
+                let _ = panel(root, editor, scene, "test adapter");
+            });
+        }
+    }
+
+    /// The floor grid's switch is one of the workspace controls, beside the
+    /// increment the grid is ruled at, and not one of the overlay switches.
+    ///
+    /// Three things, because a relocation is all three: the precision block
+    /// draws it, the `show` block no longer does, and what a click on it in the
+    /// panel changes is the same scene visibility it always changed.
+    #[test]
+    fn the_floor_grid_switch_is_in_the_precision_block() {
+        let (_dir, path) = write_temp("grid_switch", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        // The grid's own geometry, which is what makes its switch tickable: an
+        // empty layer is switched off and disabled.
+        assert!(editor.pump(&mut scene).overlays);
+        assert!(scene.get(Layer::Grid).is_some(), "the grid has lines");
+        let label = Layer::Grid.info().label;
+
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            precision(root, &mut editor, &mut scene);
+        });
+        let text = crate::viewer::ui::tests::painted_text(&output);
+        assert!(
+            text.lines().any(|line| line == label),
+            "the precision block draws no {label:?} switch: {text}"
+        );
+
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            show_block(root, &mut scene);
+        });
+        let shown = crate::viewer::ui::tests::painted_text(&output);
+        assert!(
+            !shown.lines().any(|line| line == label),
+            "the show block still draws the {label:?} switch: {shown}"
+        );
+        // Not vacuous: the block is still the list of every other overlay.
+        let gizmo = Layer::Gizmo.info().label;
+        assert!(
+            shown.lines().any(|line| line == gizmo),
+            "the show block lost the {gizmo:?} switch too: {shown}"
+        );
+
+        // And it is the same switch over the same state: one click through the
+        // panel, where it now sits, and the layer is off.
+        let was = scene.is_visible(Layer::Grid);
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            let _ = panel(root, &mut editor, &mut scene, "test adapter");
+        });
+        let pos = crate::viewer::ui::tests::painted_text_center(&output, label)
+            .unwrap_or_else(|| panic!("the panel painted no {label:?} row"));
+        click_panel_at(&mut editor, &mut scene, pos);
+        assert_eq!(
+            scene.is_visible(Layer::Grid),
+            !was,
+            "clicking the {label:?} switch in the precision block did not change the layer's \
+             visibility"
+        );
     }
 
     /// A panel edit of a shape goes through the containment rule, exactly as a

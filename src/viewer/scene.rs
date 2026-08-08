@@ -323,6 +323,23 @@ pub enum LayerRole {
     Editor,
 }
 
+/// Which block of a panel draws a layer's visibility switch.
+///
+/// The switch itself is the same checkbox wherever it is drawn, explained by
+/// the same hover text; this says where it belongs, which is a fact about the
+/// layer rather than about the panel that happens to draw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchHome {
+    /// The `show` block, with the rest of them.
+    Show,
+    /// A block that owns the switch and draws it itself: the floor grid's
+    /// belongs beside the snap increment it is ruled at, in the editor's
+    /// precision block. The `show` block leaves these out, so only a layer the
+    /// editor produces may say it - anywhere else there is no such block, and
+    /// the switch would exist nowhere at all.
+    Elsewhere,
+}
+
 /// Static description of one layer.
 #[derive(Debug, Clone, Copy)]
 pub struct LayerInfo {
@@ -341,6 +358,8 @@ pub struct LayerInfo {
     pub translucent: bool,
     /// What produces this layer's geometry.
     pub role: LayerRole,
+    /// Where the visibility switch for this layer is drawn.
+    pub switch: SwitchHome,
 }
 
 /// Every layer, in panel and draw order. Opaque layers are drawn first; the
@@ -354,6 +373,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_DENSITY,
         translucent: false,
         role: LayerRole::Density,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Supports,
@@ -363,6 +383,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_SUPPORT,
         translucent: false,
         role: LayerRole::Setup,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Loads,
@@ -372,6 +393,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_LOAD,
         translucent: false,
         role: LayerRole::Setup,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Gizmo,
@@ -381,6 +403,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_GIZMO_HANDLE,
         translucent: false,
         role: LayerRole::Editor,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Measure,
@@ -390,6 +413,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_MEASURE,
         translucent: false,
         role: LayerRole::Editor,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Grid,
@@ -401,6 +425,10 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_GRID_MINOR,
         translucent: false,
         role: LayerRole::Editor,
+        // Beside the increment it is ruled at, since 0.38.1: the grid is what
+        // makes that increment visible, and the switch reads as an editing
+        // control rather than as one more overlay.
+        switch: SwitchHome::Elsewhere,
     },
     LayerInfo {
         layer: Layer::Domain,
@@ -410,6 +438,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_DOMAIN,
         translucent: true,
         role: LayerRole::Setup,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Keepout,
@@ -418,6 +447,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_KEEPOUT,
         translucent: true,
         role: LayerRole::Setup,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Keepin,
@@ -426,6 +456,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_KEEPIN,
         translucent: true,
         role: LayerRole::Setup,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Selection,
@@ -434,6 +465,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_SELECTION,
         translucent: true,
         role: LayerRole::Editor,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Hover,
@@ -443,6 +475,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_HOVER,
         translucent: true,
         role: LayerRole::Editor,
+        switch: SwitchHome::Show,
     },
     LayerInfo {
         layer: Layer::Placement,
@@ -454,6 +487,7 @@ pub const LAYERS: &[LayerInfo] = &[
         color: constants::VIEW_COLOR_PLACE_GHOST,
         translucent: true,
         role: LayerRole::Editor,
+        switch: SwitchHome::Show,
     },
 ];
 
@@ -1025,6 +1059,25 @@ magnitude_nmm = 500.0
         *scene.visibility_mut(Layer::Keepout) = false;
         assert!(!scene.is_visible(Layer::Keepout));
         assert!(scene.is_visible(Layer::Keepin));
+    }
+
+    /// A switch homed outside the `show` block is drawn by a block only the
+    /// editor's panel has, so the layer behind it has to be one the editor
+    /// produces: anywhere else the block leaves it out and nothing draws it,
+    /// and the layer would have no switch at all.
+    #[test]
+    fn a_switch_homed_elsewhere_belongs_to_an_editor_layer() {
+        for info in LAYERS
+            .iter()
+            .filter(|info| info.switch == SwitchHome::Elsewhere)
+        {
+            assert_eq!(
+                info.role,
+                LayerRole::Editor,
+                "the {} switch is drawn outside the show block, which only the editor has",
+                info.label
+            );
+        }
     }
 
     #[test]

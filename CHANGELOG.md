@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-08-08 - 0.38.1 - The grid switch moves to the controls it belongs to
+
+- **The `floor grid` switch is in the precision block**, under `keep inside
+  domain` and beside the `snap mm` it is ruled at, instead of down among the
+  overlay switches in `show`: the grid is what makes that increment visible, so
+  it reads as a workspace control rather than as one more layer. Same checkbox,
+  same hover text, same scene state - only its place in the panel changed.
+- The layer table now says where each switch is drawn (`SwitchHome`), so the
+  shared `show` block leaves out the ones a block of its own owns rather than
+  naming a layer. `view` and `run --view` are untouched: the floor grid is an
+  editor layer and neither ever listed it.
+- Tests: the precision block draws the switch, the `show` block no longer does,
+  and a real click on the relocated row - laid out, hit tested and released over
+  four headless frames - flips the same visibility it always did.
+  Counter-verified by clicking beside it.
+- Version 0.38.1.
+
 ## 2026-08-08 - 0.38.0 - The title bar and the terminal say it too
 
 0.37.0 put the build in small weak text under both panels' headings, where it is
