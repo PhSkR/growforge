@@ -105,12 +105,9 @@ pub fn panel(
         .exact_size(constants::VIEW_PANEL_WIDTH_POINTS)
         .resizable(false)
         .show(root, |ui| {
+            // The heading is the window title, which names the build: see
+            // `VIEW_WINDOW_TITLE`. Nothing below it repeats that.
             ui.heading(title);
-            ui.label(
-                egui::RichText::new(constants::VIEW_VERSION_LINE)
-                    .small()
-                    .weak(),
-            );
             ui.label(egui::RichText::new(adapter).small().weak());
             ui.separator();
 
@@ -257,31 +254,27 @@ pub(crate) mod tests {
         }
     }
 
-    /// The panel names the build that drew it.
+    /// The panel names the build that drew it, in its heading.
     ///
-    /// Compared against a version spelled out here rather than against the
-    /// constant the panel draws, so the assertion is what a screenshot has to
+    /// The heading is the window title, and the title is what carries the build
+    /// since 0.38.0, so the panel is given a title built the way a run window
+    /// builds one - the prefix constant and the project - and the painted rows
+    /// are read back for it. Compared against a version spelled out here rather
+    /// than against the constant, so the assertion is what a screenshot has to
     /// show and not a second reading of the same value.
     #[test]
     fn the_panel_says_which_build_it_is() {
         let context = egui::Context::default();
         let mut scene = Scene::default();
+        let title = format!("{} - test project", constants::VIEW_WINDOW_TITLE);
         let output = context.run_ui(window_input(), |root| {
-            panel(
-                root,
-                "test title",
-                "test adapter",
-                &mut scene,
-                None,
-                None,
-                None,
-            );
+            panel(root, &title, "test adapter", &mut scene, None, None, None);
         });
         let text = painted_text(&output);
-        let expected = format!("growforge {}", env!("CARGO_PKG_VERSION"));
+        let expected = format!("growforge {} - test project", env!("CARGO_PKG_VERSION"));
         assert!(
-            text.contains(&expected),
-            "the run panel drew no {expected:?} line: {text}"
+            text.lines().any(|line| line == expected),
+            "the run panel's heading is not {expected:?}: {text}"
         );
     }
 }

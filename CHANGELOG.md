@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-08-08 - 0.38.0 - The title bar and the terminal say it too
+
+0.37.0 put the build in small weak text under both panels' headings, where it is
+easy to miss. The two places a user actually looks first are the window's title
+bar and the console the command was typed into, so the version moves into them.
+
+- **Both window titles carry the version.** `growforge 0.38.0 - <project>` in the
+  run and setup windows, `growforge 0.38.0 edit - <file>` in the editor, with the
+  unsaved asterisk still on the end of it. Each panel draws that same title as
+  its heading, so a screenshot of a panel alone names the build too - in the
+  heading rather than in a footnote under it.
+- **0.37.0's version line is gone from both panels**, superseded by the heading
+  above it: one prominent statement instead of a subtle one repeated. What is
+  left is one constant, `NAME_AND_VERSION`, behind the titles and the console
+  line alike, so nothing that names the build can drift.
+- **Every command prints the version first.** One line, `growforge 0.38.0`, at
+  the dispatch and ahead of any other output, for `check`, `run`, `bench`, `view`
+  and `edit` alike; `--version` and `--help` are answered by the parser and are
+  unchanged.
+- Tests: both title builders asserted whole - clean, dirty and saved for the
+  editor - the first stdout line of the real binary asserted end to end, and each
+  panel's painted heading asserted whole in its own headless frame.
+  Counter-verified by breaking the constant.
+- **New maintenance script `tools/sweep.ps1`** (run weekly by a Windows
+  scheduled task registered outside the repo): deletes regenerable build
+  caches - incremental, docs, an oversized debug profile - and stale session
+  scratchpads, after a hundred gigabytes of cargo artifacts accumulated in a
+  week. It refuses to run mid-build and every deletion roots in a validated
+  absolute path.
+- Version 0.38.0.
+
 ## 2026-08-07 - 0.37.0 - The window says which build it is
 
 Tracing which build produced an artifact cost a week's forensics; the window

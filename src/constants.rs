@@ -19,6 +19,23 @@ pub const PROGRAM_NAME: &str = "growforge";
 /// Crate version, used in the binary STL header.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Program and version as one string - `growforge 0.38.0` - and the single
+/// derivation of that fragment.
+///
+/// Everything that names the build to a user is this constant: the line the
+/// command line prints before anything else, and the prefix of both window
+/// titles - which each panel draws as its own heading, so the panels name the
+/// build without a second line to say it. One constant because they have to
+/// agree - a screenshot, a pasted console log and an exported part all have to
+/// name the same binary - and because a run cannot then be attributed to a
+/// version it was not built from.
+///
+/// Assembled from the manifest at compile time. `concat!` takes literals only,
+/// which is why the two halves come from the manifest rather than from
+/// [`PROGRAM_NAME`] and [`VERSION`]; the strings are the same, and these cannot
+/// drift from the binary.
+pub const NAME_AND_VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"));
+
 /// Name of the default optimization engine.
 pub const DEFAULT_ENGINE: &str = "simp";
 
@@ -1724,8 +1741,16 @@ pub const MS_PER_S: f64 = 1000.0;
 // outside constants.rs" rule keeps holding, and so a build without the feature
 // still documents them.
 
-/// Window title prefix; the project name is appended.
-pub const VIEW_WINDOW_TITLE: &str = "growforge";
+/// Window title prefix; the mode and the document are appended, so a title
+/// reads `growforge 0.38.0 - <project>` in the run and setup windows and
+/// `growforge 0.38.0 edit - <file>` in the editor.
+///
+/// The prefix carries the version - [`NAME_AND_VERSION`] - because the title bar
+/// and the taskbar entry are what a user, and a screenshot of a window, see
+/// first. Each panel draws this same title as its own heading, which is what a
+/// screenshot of the panel alone carries and what makes a second, weaker version
+/// line under it a repetition rather than a claim of its own.
+pub const VIEW_WINDOW_TITLE: &str = NAME_AND_VERSION;
 
 /// Initial window width in logical pixels.
 pub const VIEW_WINDOW_WIDTH: u32 = 1280;
@@ -1960,21 +1985,6 @@ pub const VIEW_PANEL_WIDTH_POINTS: f32 = 260.0;
 /// heading, and the editor's panel writes it on the collapsing header the block
 /// sits under, where it is the header's persistent id as well as its label.
 pub const VIEW_LAYER_SWITCHES_LABEL: &str = "show";
-
-/// What both panels say under their heading to name the build that drew them.
-///
-/// Assembled from the manifest at compile time rather than at runtime, so the
-/// window cannot name a version other than the one the binary was built from -
-/// which is the whole point of the line: an exported part, a screenshot or a
-/// bug report has to be attributable to a build without anyone having to work
-/// out which one was installed that day.
-///
-/// One constant because both windows draw it: the run panel and the editor's
-/// panel say the same string in the same place, so a screenshot of either
-/// identifies the build the same way. `concat!` takes literals only, which is
-/// why the name comes from the manifest rather than from [`PROGRAM_NAME`]; the
-/// two are the same string, and this one cannot drift from the binary.
-pub const VIEW_VERSION_LINE: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"));
 
 /// How often the viewer wakes to service its window message queue after the
 /// window has been torn down but the run behind it is still going.

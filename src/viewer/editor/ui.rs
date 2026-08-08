@@ -434,14 +434,11 @@ pub fn panel(root: &mut egui::Ui, editor: &mut Editor, scene: &mut Scene, adapte
             // region it was added to - `max_rect` as well as `min_rect` - so the
             // budget has to be taken while it still is one.
             let budget = ui.max_rect().right();
+            // The heading is the window title, which names the build: see
+            // `VIEW_WINDOW_TITLE`. Nothing below it repeats that.
             ui.heading(editor.window_title());
             ui.label(
                 egui::RichText::new(editor.state.path().display().to_string())
-                    .small()
-                    .weak(),
-            );
-            ui.label(
-                egui::RichText::new(constants::VIEW_VERSION_LINE)
                     .small()
                     .weak(),
             );
@@ -3434,21 +3431,24 @@ mod tests {
         }
     }
 
-    /// The panel names the build that drew it.
+    /// The panel names the build that drew it, in its heading.
     ///
-    /// The version is spelled out here rather than read from the constant the
-    /// panel draws, so what is asserted is the string a screenshot has to show
-    /// and not a second reading of the same value.
+    /// The heading is the window title, and the title is what carries the build
+    /// since 0.38.0: the whole heading is asserted, so the row a screenshot of
+    /// the panel shows is pinned rather than the substring inside it. The version
+    /// is spelled out here rather than read from the constant the title is built
+    /// from, so what is asserted is the string that has to be on screen and not a
+    /// second reading of the same value.
     #[test]
     fn the_panel_says_which_build_it_is() {
         let (_dir, path) = write_temp("version_line", fixture());
         let mut editor = Editor::open(&path).expect("open");
         let mut scene = editor.initial_scene();
         let text = panel_text(&mut editor, &mut scene);
-        let expected = format!("growforge {}", env!("CARGO_PKG_VERSION"));
+        let expected = format!("growforge {} edit - config.toml", env!("CARGO_PKG_VERSION"));
         assert!(
-            text.contains(&expected),
-            "the editor panel drew no {expected:?} line: {text}"
+            text.lines().any(|line| line == expected),
+            "the editor panel's heading is not {expected:?}: {text}"
         );
     }
 

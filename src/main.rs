@@ -82,7 +82,15 @@ fn main() -> ExitCode {
 }
 
 fn dispatch() -> Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    // Every invocation names the build before it says anything else, so a
+    // console log, a pasted transcript or a terminal left open beside a window
+    // is attributable to a binary. Printed here rather than per subcommand, and
+    // after the parse rather than before it: `--version` and `--help` are
+    // answered by clap inside `parse`, which exits, so neither is given this
+    // line twice.
+    println!("{}", constants::NAME_AND_VERSION);
+    match command {
         Command::Check { config } => {
             let (_, problem) = load_config_and_problem(&config)?;
             print_warnings(&problem.warnings);

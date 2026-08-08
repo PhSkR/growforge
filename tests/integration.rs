@@ -3380,3 +3380,45 @@ fn a_wall_that_came_out_short_of_the_floor_is_exported_flush_with_it() {
     std::fs::remove_file(&flushed.output.stl_path).ok();
     std::fs::remove_file(&plain.output.stl_path).ok();
 }
+
+/// The command line names the build before it says anything else.
+///
+/// Driven through the binary itself, because the claim is about what a terminal
+/// shows: the first line of output, ahead of the problem summary. `check` is the
+/// cheapest command that prints - it builds the model and writes nothing - and
+/// the line is printed once at the dispatch, so what holds for `check` holds for
+/// every subcommand. The version is spelled out here rather than read from the
+/// constant the binary prints, so what is asserted is the string a pasted
+/// transcript has to carry.
+#[test]
+fn the_command_line_names_the_build_on_its_first_line() {
+    let path = std::env::temp_dir().join(format!(
+        "growforge_version_banner_{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, SMALL_CANTILEVER).expect("write the fixture");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_growforge"))
+        .arg("check")
+        .arg(&path)
+        .output()
+        .expect("run the binary");
+    std::fs::remove_file(&path).ok();
+
+    assert!(
+        output.status.success(),
+        "`growforge check` failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("growforge {}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        stdout.lines().next(),
+        Some(expected.as_str()),
+        "the first line of `growforge check` is not {expected:?}: {stdout}"
+    );
+    // Ahead of the output the command was run for, not instead of it.
+    assert!(
+        stdout.contains("configuration is valid"),
+        "`growforge check` printed the version and not its own report: {stdout}"
+    );
+}

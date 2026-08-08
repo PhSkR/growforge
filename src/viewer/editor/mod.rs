@@ -2413,6 +2413,29 @@ vector = [0.0, 0.0, -80.0]
         assert!(scene.get(Layer::Gizmo).is_none());
     }
 
+    /// The editor's title names the build, the mode and the document, and the
+    /// unsaved marker still goes on the end of it.
+    ///
+    /// The version is spelled out here rather than read from the constant the
+    /// title is built from, so what is asserted is the string a title bar has to
+    /// show and not a second reading of the same value.
+    #[test]
+    fn the_window_title_names_the_build_the_mode_and_the_document() {
+        let (_dir, path) = write_temp("title", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let clean = format!("growforge {} edit - config.toml", env!("CARGO_PKG_VERSION"));
+        assert_eq!(editor.window_title(), clean);
+
+        editor
+            .state
+            .edit(|config| config.optimization.mass_fraction = Some(0.44));
+        assert!(editor.state.is_dirty());
+        assert_eq!(editor.window_title(), format!("{clean}*"));
+
+        editor.save();
+        assert_eq!(editor.window_title(), clean);
+    }
+
     #[test]
     fn a_committed_edit_marks_the_file_dirty_and_refreshes_the_scene() {
         let (_dir, path) = write_temp("refresh", fixture());

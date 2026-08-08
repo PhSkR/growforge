@@ -608,6 +608,20 @@ vector = [0.0, 0.0, -20.0]
         }
     }
 
+    /// The run and setup window names the build as well as the project.
+    ///
+    /// The version is spelled out here rather than read from the constant the
+    /// title is built from, so what is asserted is the string a title bar has to
+    /// show and not a second reading of the same value.
+    #[test]
+    fn the_window_title_names_the_build_and_the_project() {
+        let problem = tiny_problem();
+        assert_eq!(
+            window_title(&problem),
+            format!("growforge {} - preview", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
     #[test]
     fn a_panicking_worker_tells_the_window_before_the_panic_propagates() {
         let link = ViewLink::new();
