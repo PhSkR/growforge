@@ -2165,6 +2165,24 @@ pub const VIEW_EDIT_NEW_FILE_NAME: &str = "new_part.toml";
 pub const VIEW_EDIT_NEW_EXISTS_NOTE: &str = "already exists - use open instead; a new file is only scaffolded for a name that is not \
      there yet";
 
+/// Folder, under the platform's Documents folder, that is the canonical home of
+/// a user's growforge configurations.
+///
+/// What `growforge edit` with no path looks in, and what the installed Start
+/// Menu shortcut therefore lands in: an installed copy has no working directory
+/// worth defaulting to - the program sits in Program Files, where nothing may be
+/// written - so the one place it can offer is the user's own. Nothing else reads
+/// it: a path given on the command line is always taken as it stands, and the
+/// folder is only created when a file is actually saved into it.
+pub const VIEW_EDIT_CONFIGS_HOME_DIR: &str = "growforge";
+
+/// What the console says when the dialog a pathless `growforge edit` raised was
+/// cancelled.
+///
+/// A cancelled dialog is an answer, not a failure: nothing was asked for after
+/// all, so the command says what happened in one line and exits successfully.
+pub const VIEW_EDIT_NOTHING_OPENED: &str = "nothing opened";
+
 // ---------------------------------------------------------------------------
 // Starter configuration (`growforge edit` on a path that is not there yet)
 // ---------------------------------------------------------------------------

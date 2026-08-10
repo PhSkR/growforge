@@ -32,6 +32,41 @@ conversion growforge does internally is the mass density: `1 g/cm^3 = 1e-9
 tonne/mm^3`, which is what makes `rho * V * g` come out in newtons (see
 `constants::TONNE_PER_MM3_PER_G_PER_CM3` for the dimensional analysis).
 
+## Installing
+
+Windows: download `growforge-setup-<version>.exe` from the GitHub Releases page
+and run it. It installs `growforge.exe` into `Program Files\growforge` with the
+shipped `examples\*.toml` beside it as read-only samples, puts a **growforge**
+shortcut in the Start Menu (a desktop one is offered, unchecked, during the
+install) and registers an uninstaller under Settings > Apps.
+
+**Upgrading is running the newer setup.** It recognizes the installation that is
+there, replaces it in place, and offers to close a running editor first rather
+than failing on a locked file. Nothing you have saved is touched: the program is
+all that is installed.
+
+The Start Menu shortcut starts the editor with **no path**, which is how
+`growforge edit` is meant to be started when there is no terminal to type one
+into: it asks for the file first, in the platform's own dialog, starting in
+`Documents\growforge` - the canonical home of your configurations. If that
+folder already holds `.toml` files the dialog picks one of them; if it is empty
+or not there yet, the dialog is save-as shaped and the name you type is
+scaffolded into a [starter configuration](#opening-and-starting-files).
+Cancelling is an answer: the console says `nothing opened` and the command
+exits. Nothing is created on the way to the question - the folder comes into
+existence when a file is actually saved into it, which is why the first dialog
+of all opens in `Documents` itself: a dialog cannot show a folder that is not
+there yet. `growforge edit <file>` from a
+terminal is unchanged, and every other command still takes its path.
+
+The installer is built from this repository by `tools\build_installer.ps1`,
+which builds the release executable, reads the version off it and compiles
+`tools\installer.iss` into `target\installer\`. It needs [Inno
+Setup 6](https://jrsoftware.org/isinfo.php) (`winget install -e --id
+JRSoftware.InnoSetup`) and publishes nothing.
+
+There is no installer for other platforms; build from source.
+
 ## Build and run
 
 ```sh
@@ -101,7 +136,8 @@ whether the overhang constraint is on or, for a growth run, the resolved growth
 controls, the solver backend, the cavity policy, estimated memory) without
 optimizing. `view` prints the same summary and opens a 3D window on the
 setup. `edit` opens the same window on the same setup and lets you change it -
-see [Editor](#editor). `run` does the optimization, prints the cavity and stress
+see [Editor](#editor) - and is the one command whose path may be left out, in
+which case it asks for the file first; see [Installing](#installing). `run` does the optimization, prints the cavity and stress
 reports and writes the STL, with `--view` adding a live window over it.
 `--quiet` suppresses the per-iteration progress lines. `bench` times the linear
 solve of a configuration on every available backend and writes nothing; see
@@ -2797,6 +2833,15 @@ cannot be written over.
 
 A file that will not open - a configuration that does not parse - leaves the
 session on the document it was on, with the reason on the status line.
+
+**`growforge edit` with no path at all** raises one of those same two dialogs
+before the window exists, seeded at `Documents\growforge` instead of at a
+session's directory - there is no session yet - and from the file it comes back
+with, this is `growforge edit <that file>`: an existing one opens, a name that is
+not there yet is scaffolded, the same refusal and all. Which dialog it is comes
+from that folder: `open` when it already holds configurations, save-as when it
+is empty or not there. See [Installing](#installing), which is where a session
+started that way comes from.
 
 ## Configuration reference
 

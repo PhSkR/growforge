@@ -1,4 +1,5 @@
-//! The visual editor: `growforge edit <config.toml>`.
+//! The visual editor: `growforge edit <config.toml>`, or `growforge edit` on
+//! its own, which asks for the file before any window exists - see [`start`].
 //!
 //! The same window the viewer already opens, in a mode where the problem
 //! definition is the document. Objects are picked and dragged in the viewport
@@ -44,6 +45,7 @@ pub mod measure;
 pub mod pick;
 pub mod place;
 pub mod snap;
+pub mod start;
 pub mod state;
 pub mod toml_io;
 pub mod ui;
@@ -2273,6 +2275,14 @@ vector = [0.0, 0.0, -80.0]
     /// A directory that removes itself, so a test that writes a file leaves
     /// nothing behind.
     pub struct TempDir(PathBuf);
+
+    impl TempDir {
+        /// Take responsibility for removing `directory`, whether or not it is
+        /// there yet: a test that creates it later still leaves nothing behind.
+        pub fn at(directory: PathBuf) -> TempDir {
+            TempDir(directory)
+        }
+    }
 
     impl Drop for TempDir {
         fn drop(&mut self) {

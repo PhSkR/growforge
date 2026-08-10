@@ -1,6 +1,6 @@
 [package]
 name = "growforge"
-version = "0.38.1"
+version = "0.39.0"
 edition = "2024"
 description = "Topology optimization and growth heuristics for strong, weight-optimized printable structures"
 
@@ -25,6 +25,7 @@ gpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
 # back out; a headless build only ever reads one.
 viewer = [
     "dep:bytemuck",
+    "dep:dirs",
     "dep:egui",
     "dep:egui-wgpu",
     "dep:egui-winit",
@@ -41,6 +42,19 @@ clap = { version = "4.6.4", features = ["derive"] }
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.3"
+
+# Where the platform says the user's Documents folder is, which is the one
+# thing a pathless `growforge edit` has to know: the configurations home is a
+# folder under it. Resolved by asking Windows for the known folder rather than
+# by joining `%USERPROFILE%\Documents`, because a Documents folder redirected
+# onto OneDrive - the default on a managed machine - is not under the profile
+# at all, and a guess would put a user's files somewhere they will not look for
+# them. `dirs` rather than `directories`: one function, `document_dir`, is the
+# whole of what is needed, and `directories` is a second layer of API over the
+# same `dirs-sys` call. Under the `viewer` feature because only the editor's
+# file dialogs ever ask; a headless build is handed its path on the command
+# line.
+dirs = { version = "6.0.0", optional = true }
 
 # Graphics and compute stack, shared by the `gpu` and `viewer` features. egui
 # 0.35 is built against wgpu 29 and winit 0.30; the three versions must move
@@ -71,6 +85,18 @@ rfd = { version = "0.17.2", optional = true }
 toml_edit = { version = "0.25.13", optional = true }
 wgpu = { version = "29.0.4", optional = true }
 winit = { version = "0.30.13", optional = true }
+
+[build-dependencies]
+# Stamps the Windows VersionInfo resource onto the executable, so the file's
+# Properties tab, an installer and any inventory tool can name the build
+# without running it. `winresource` is the maintained fork of the classic
+# `winres`, which has had no release since 2021; it generates the VERSIONINFO
+# block from a struct rather than from a checked-in `.rc` file, which keeps the
+# version in the manifest and nowhere else. It compiles the resource with the
+# `rc.exe` of the installed Windows SDK - the same SDK the MSVC toolchain
+# already needs - and `build.rs` skips it outright when the target is not
+# Windows.
+winresource = "0.1.31"
 
 [profile.release]
 opt-level = 3

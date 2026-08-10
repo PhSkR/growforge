@@ -49,8 +49,9 @@ enum Command {
     /// value numerically, re-run on the spot and save the file back.
     Edit {
         /// Path to the TOML problem definition. It is written only when you
-        /// save.
-        config: PathBuf,
+        /// save. Left out, the file dialog asks for one, starting in the
+        /// growforge folder of your Documents.
+        config: Option<PathBuf>,
     },
     /// Time the linear solve of a configuration on every available backend.
     Bench {
@@ -114,7 +115,16 @@ fn dispatch() -> Result<()> {
         // The editor loads the file itself: it has to open a configuration that
         // does not build yet, which is exactly the one you need to edit, and it
         // keeps the file's own text so a save preserves it.
-        Command::Edit { config } => open_editor(&config),
+        //
+        // It is also the one command that can be started without a path -
+        // a Start Menu shortcut has no terminal to type one into - and then it
+        // asks for the file in the platform's own dialog before any window
+        // exists. Every other command needs its path: there is nothing sensible
+        // to check, view, time or run without one.
+        Command::Edit { config } => match config {
+            Some(config) => open_editor(&config),
+            None => open_editor_without_a_path(),
+        },
         Command::Run {
             config,
             quiet,
@@ -286,6 +296,11 @@ fn open_editor(config: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(feature = "viewer")]
+fn open_editor_without_a_path() -> Result<()> {
+    growforge::viewer::edit_without_a_path()
+}
+
+#[cfg(feature = "viewer")]
 fn run_with_view(
     config: &Config,
     problem: &Problem,
@@ -311,10 +326,68 @@ fn open_editor(_config: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(not(feature = "viewer"))]
+fn open_editor_without_a_path() -> Result<()> {
+    anyhow::bail!(NO_VIEWER)
+}
+
+#[cfg(not(feature = "viewer"))]
 fn run_with_view(
     _config: &Config,
     _problem: &Problem,
     _reporter: &ConsoleReporter,
 ) -> Result<RunOutcome> {
     anyhow::bail!(NO_VIEWER)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a command line as the binary's own would be parsed, without the
+    /// program name a real one starts with.
+    fn parse(arguments: &[&str]) -> Result<Command, clap::Error> {
+        let mut line = vec![constants::PROGRAM_NAME];
+        line.extend_from_slice(arguments);
+        Cli::try_parse_from(line).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn edit_takes_the_path_it_was_given() {
+        let Ok(Command::Edit { config }) = parse(&["edit", "parts/bracket.toml"]) else {
+            panic!("`edit <path>` did not parse as an edit");
+        };
+        assert_eq!(config, Some(PathBuf::from("parts/bracket.toml")));
+    }
+
+    #[test]
+    fn edit_on_its_own_is_a_command_with_no_path_in_it() {
+        let Ok(Command::Edit { config }) = parse(&["edit"]) else {
+            panic!("`edit` with no path was rejected");
+        };
+        assert_eq!(config, None, "a path appeared where none was typed");
+    }
+
+    #[test]
+    fn every_other_command_still_needs_its_path() {
+        // Nothing to check, view, time or run without one, so the parser
+        // refuses rather than inventing a file.
+        for command in ["check", "view", "bench", "run"] {
+            let Err(error) = parse(&[command]) else {
+                panic!("`{command}` parsed with no path");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "`{command}` was refused for the wrong reason: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_given_to_another_command_is_the_one_it_gets() {
+        let Ok(Command::Run { config, .. }) = parse(&["run", "parts/bracket.toml"]) else {
+            panic!("`run <path>` did not parse as a run");
+        };
+        assert_eq!(config, PathBuf::from("parts/bracket.toml"));
+    }
 }

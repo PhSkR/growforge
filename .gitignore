@@ -2,3 +2,4 @@
 *.stl
 *_stress.json
 .claude/settings.local.json
+/tools/sweep.log

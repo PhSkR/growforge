@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-08-09 - 0.39.0 - It installs, and it opens without being told where
+
+growforge has been a binary you build and a path you type. Neither survives
+being handed to someone: there is nothing to double click, and a shortcut to
+`growforge.exe` with no arguments printed a usage error. This release is the
+setup that installs it and the one command that can be started without a path.
+
+- **A Windows installer.** `tools\installer.iss` compiled by
+  `tools\build_installer.ps1`: `growforge.exe` into `Program Files\growforge`
+  with the shipped `examples\*.toml` beside it read-only, a Start Menu shortcut
+  (a desktop one offered unchecked), an uninstaller, and `CloseApplications` so
+  an upgrade over a running editor asks to close it rather than failing on a
+  locked file. The `AppId` GUID is fixed and commented as such: it is the
+  identity that makes the next setup an upgrade rather than a second parallel
+  install. The version is never written in the script - it is read off the built
+  executable and passed in with `/DAppVersion` - and the build script publishes
+  nothing: it builds, compiles the setup into the ignored `target\installer\`,
+  and says where it landed.
+- **`growforge edit` takes no path at all now**, which is what makes that
+  shortcut sane. It asks for the file in the platform's own dialog before any
+  window exists, starting in `Documents\growforge`, the canonical home of a
+  user's configurations: `open` when that folder already holds `.toml` files,
+  save-as when it is empty or not there yet, and from what comes back this is
+  `growforge edit <that file>` down to the same call - an existing file opens, a
+  typed name is scaffolded. Cancelling is an answer: one line, `nothing opened`,
+  and a successful exit. **Nothing is created on the way to the question**; the
+  folder comes into existence when a file is saved into it, and until it does
+  the dialog opens in `Documents` itself rather than at a path the shell cannot
+  show. `edit <file>` is
+  untouched, and `check`, `view`, `bench` and `run` still require their path -
+  there is nothing sensible to do without one.
+- **The executable carries its version.** A new `build.rs` stamps the Windows
+  VersionInfo resource - `FileVersion`, `ProductVersion`, `ProductName`,
+  `FileDescription` - from the `CARGO_PKG_*` values Cargo hands a build script,
+  so the Properties tab of a copied binary names the build and the manifest
+  stays the only place a version is written. It reported 0.0.0.0 until now. The
+  script does nothing at all when the target is not Windows.
+- Tests: the dialog decision over a real folder - missing, empty, other files
+  only, a directory that merely ends in `.toml`, an actual configuration, and an
+  uppercase `.TOML` - plus the configurations home resolving under the platform's
+  Documents folder, and the command line parsing `edit` with a path, `edit`
+  without one, and the four commands that still refuse to run without theirs.
+  The version resource and the installer are verified where they exist: a
+  probe of the built executable's `VersionInfo`, and a silent install of the
+  setup into a sandbox directory, `--version` from the installed copy, and a
+  silent uninstall that leaves nothing behind - which is what caught the
+  read-only samples surviving their own uninstaller.
+- New dependencies: `dirs` (under the `viewer` feature) for the platform's
+  Documents folder, asked for by known folder because one redirected onto
+  OneDrive is not under `%USERPROFILE%` at all; `winresource` as a build
+  dependency for the version resource. `tools/sweep.log` is now ignored.
+- Version 0.39.0.
+
 ## 2026-08-08 - 0.38.1 - The grid switch moves to the controls it belongs to
 
 - **The `floor grid` switch is in the precision block**, under `keep inside

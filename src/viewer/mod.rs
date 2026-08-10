@@ -29,6 +29,7 @@ mod gpu;
 mod ui;
 
 pub use crate::viewer::editor::edit;
+pub use crate::viewer::editor::start::edit_without_a_path;
 
 use std::time::{Duration, Instant};
 
