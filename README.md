@@ -1,6 +1,6 @@
-# growforge
+# growforge 3D
 
-growforge grows strong, weight-optimized 3D structures. It reads a TOML problem
+growforge 3D grows strong, weight-optimized 3D structures. It reads a TOML problem
 definition, voxelizes the design domain, runs one of three engines over it, and
 exports a watertight binary STL ready for slicing.
 
@@ -28,7 +28,7 @@ save the file back.
 Millimetres, newtons, megapascals (MPa = N/mm^2), newton-millimetres for torque,
 g/cm^3 for mass density and mm/s^2 for gravitational acceleration. There is no
 unit key anywhere in the config; every number is in these units. The one
-conversion growforge does internally is the mass density: `1 g/cm^3 = 1e-9
+conversion growforge 3D does internally is the mass density: `1 g/cm^3 = 1e-9
 tonne/mm^3`, which is what makes `rho * V * g` come out in newtons (see
 `constants::TONNE_PER_MM3_PER_G_PER_CM3` for the dimensional analysis).
 
@@ -36,7 +36,7 @@ tonne/mm^3`, which is what makes `rho * V * g` come out in newtons (see
 
 Windows: download `growforge-setup-<version>.exe` from the GitHub Releases page
 and run it. It installs `growforge.exe` into `Program Files\growforge` with the
-shipped `examples\*.toml` beside it as read-only samples, puts a **growforge**
+shipped `examples\*.toml` beside it as read-only samples, puts a **growforge 3D**
 shortcut in the Start Menu (a desktop one is offered, unchecked, during the
 install) and registers an uninstaller under Settings > Apps.
 
@@ -248,7 +248,7 @@ prune = true    # optional, default true
 ```
 
 A space colonization branch stops where the attraction points around it run out,
-which leaves a tip hanging in mid air. Growforge treats that as a **defect, not
+which leaves a tip hanging in mid air. Growforge 3D treats that as a **defect, not
 a style**, and removes it. A free tip:
 
 * carries no load, which makes it dead mass in a tool whose entire purpose is
@@ -348,7 +348,7 @@ Space colonization is stochastic, so a four-fold problem - a square table on
 four identical corner feet, loaded in the middle - grows **four different
 legs**. All of them are sound and none of them is the same, which is organic and
 is exactly what one user asked for an alternative to. This is that alternative:
-growforge grows **one fundamental domain** and replicates exact copies of it, so
+growforge 3D grows **one fundamental domain** and replicates exact copies of it, so
 a symmetric problem can produce a symmetric part. Leaving the table out is the
 default and changes nothing.
 
@@ -392,7 +392,7 @@ structure actually does.
 `mass_fraction` still means what it always did: the mean density over **every**
 design cell of the problem. The arithmetic works out because the sector is about
 `1 / N` of the design volume, so filling it to a fraction `f` of its own volume
-fills the whole to `f` as well; growforge measures the whole replicated
+fills the whole to `f` as well; growforge 3D measures the whole replicated
 structure rather than the sector, so the two agree even where the boundary cuts
 through cells. (The sector is *exactly* `1 / N` of the design cells only when no
 cell centre lands on the boundary. An axis with an odd number of cells puts a
@@ -431,7 +431,7 @@ symmetry       6-fold rotation about z, 6 sectors; grown in 2160 of the 12888
                approximate to within a voxel)
 ```
 
-**Symmetry replicates geometry, not loads.** Growforge does *not* try to verify
+**Symmetry replicates geometry, not loads.** Growforge 3D does *not* try to verify
 that the problem is symmetric - checking a whole problem is neither cheap nor
 robust - so a lopsided load on a symmetric structure will happily produce a
 symmetric part that is wrong for it. What it does do is check the cheap half:
@@ -765,7 +765,7 @@ dC/dx_e = 2 u^T (df/dx_e) - u^T (dK/dx_e) u
 
 both halves chained back through the filter transposes. That first term can make
 a sensitivity positive, which the multiplicative optimality criteria update
-cannot represent. When it does, growforge shifts every sensitivity by a multiple
+cannot represent. When it does, growforge 3D shifts every sensitivity by a multiple
 of the volume gradient until they are all negative again and prints a one-off
 note saying so. Because the shift is a multiple of the *volume* gradient it only
 renames the Lagrange multiplier and leaves the stationarity conditions untouched;
@@ -973,7 +973,7 @@ iteration it lands on follows the wander and moves from run to run - what does
 not is that it is the only one of the six it stops.
 
 The bias is deliberately asymmetric, because the two mistakes are not: a stall
-that is missed costs the rest of the budget, which is exactly what growforge did
+that is missed costs the rest of the budget, which is exactly what growforge 3D did
 before this existed, while a converging run falsely called stalled loses the
 design it was on its way to. Anything the test cannot read clearly - a window
 that is not full, a non-finite number - reads as "not stalled". Every threshold
@@ -1285,7 +1285,7 @@ and still on the report for anything that asks it. A run with nothing adrift say
 nothing extra in any case.
 
 `boundaries = "voxel"` exports the isosurface exactly as the field produced it.
-That is what growforge did before 0.22.0, and it is the setting for reproducing a
+That is what growforge 3D did before 0.22.0, and it is the setting for reproducing a
 file written by an older version - **the default changes the STL of an existing
 configuration**, which is the point of it.
 
@@ -1508,7 +1508,7 @@ trim           warning: refused, and the part was exported untrimmed: removing
 ```
 
 Connectivity is face connectivity, six neighbours, which is the reading every
-structural question in growforge uses: a diagonal touch is not a joint. There is
+structural question in growforge 3D uses: a diagonal touch is not a joint. There is
 no partial outcome by design - a half-applied trim is a structure neither the
 optimizer produced nor the user asked for.
 
@@ -2304,7 +2304,7 @@ toolbar, the snapping controls and the validation block are not foldable: a
 warning you cannot see is a warning that was never printed.
 
 An optional key has a checkbox in front of it: unticked means the key is not in
-the file at all and growforge's own default applies, and the default is shown
+the file at all and growforge 3D's own default applies, and the default is shown
 next to it. Ticking it writes the key with that default as its starting value.
 
 **Every control in the panel explains itself on hover** - what the key does, in
@@ -2752,7 +2752,7 @@ detached `run --view`, because a process that owns window state and stops
 servicing its message queue is one Windows declares hung and kills.
 
 Two editors can of course be pointed at two configurations that name the same
-`[output] stl_path`. Nothing in growforge arbitrates that - the path is your own
+`[output] stl_path`. Nothing in growforge 3D arbitrates that - the path is your own
 instruction - but before a full run overwrites a file that something else wrote,
 the panel says so. "Something else" means what it says: a file this session's own
 last run wrote - by `run full` or by `generate stl` - is recognized as ours, mtime
@@ -3266,16 +3266,16 @@ rotation_deg = [0.0, 0.0, 30.0]   # optional; absent is the same as [0, 0, 0]
 
 **One thing to know about its distance field.** A box, a capped cylinder, a
 sphere and a tube carry their exact signed distance. An ellipsoid's has no closed form (the
-nearest point on it is the root of a sextic), so growforge uses the scaled-space
+nearest point on it is the root of a sextic), so growforge 3D uses the scaled-space
 field: `(|q / r| - 1) * min(r)` on the centred, inverse-rotated sample. **Its
 zero level set is exact** - the surface is exactly where the field says it is -
-so every question growforge asks a shape is answered exactly: cell
+so every question growforge 3D asks a shape is answered exactly: cell
 classification samples cell centres, support and load region selection samples
 nodes, keepout/keepin precedence and the domain CSG read the sign, and the
 editor's picking, hovering and containment use the exact intersection and the
 exact bounds. Away from the surface the magnitude is a lower bound on the true
 distance rather than the distance itself - never larger, and never changing by
-more than one millimetre per millimetre travelled. Nothing in growforge reads
+more than one millimetre per millimetre travelled. Nothing in growforge 3D reads
 it, so nothing is approximate because of it; it is written down here because the
 field is public and a future consumer that wants a true distance would need to
 know.
@@ -3320,7 +3320,7 @@ selects nodes, exports and picks exactly like any other shape.
 Each cell is classified by its centre point: inside a keepout it is **void**,
 otherwise inside a keepin it is **solid** (density pinned at 1, not a design
 variable), otherwise inside the domain it is a **design** cell, otherwise void.
-Keepout therefore beats keepin, which beats the domain; growforge warns when a
+Keepout therefore beats keepin, which beats the domain; growforge 3D warns when a
 keepout and a keepin overlap.
 
 ### What is rejected, and what only warns

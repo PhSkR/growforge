@@ -529,7 +529,7 @@ fn growth_params(problem: &Problem) -> Result<GrowthParams> {
     problem.growth.ok_or_else(|| {
         anyhow::anyhow!(
             "the growth engine was selected without resolved [growth] parameters; this is a \
-             growforge bug, the problem builder resolves them for engine = \"{}\"",
+             growforge 3D bug, the problem builder resolves them for engine = \"{}\"",
             constants::GROWTH_ENGINE
         )
     })

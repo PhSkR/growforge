@@ -18,11 +18,16 @@ use growforge::report::{
 use growforge::{RunOutcome, load_config_and_problem};
 
 #[derive(Parser)]
+// `name` is the command: what is typed, and what the usage line and every error
+// message spell. `display_name` is the product: what `--version` answers with.
+// They are deliberately different strings - the brand extends the command name
+// rather than replacing it - so a rebrand never changes what a user types.
 #[command(
     name = constants::PROGRAM_NAME,
+    display_name = constants::DISPLAY_NAME,
     version,
     about = "Grows strong, weight-optimized 3D structures with FEA based topology optimization",
-    long_about = "growforge reads a TOML problem definition, voxelizes the design domain, runs \
+    long_about = "growforge 3D reads a TOML problem definition, voxelizes the design domain, runs \
                   SIMP topology optimization with a real finite element solve, the fast growth \
                   heuristic, or no optimization at all when the part was drawn rather than \
                   optimized, reports the von Mises stresses of the result and exports a \
@@ -90,7 +95,7 @@ fn dispatch() -> Result<()> {
     // after the parse rather than before it: `--version` and `--help` are
     // answered by clap inside `parse`, which exits, so neither is given this
     // line twice.
-    println!("{}", constants::NAME_AND_VERSION);
+    println!("{}", constants::DISPLAY_NAME_AND_VERSION);
     match command {
         Command::Check { config } => {
             let (_, problem) = load_config_and_problem(&config)?;
@@ -311,9 +316,9 @@ fn run_with_view(
 
 /// Message used by every viewer entry point when the feature is compiled out.
 #[cfg(not(feature = "viewer"))]
-const NO_VIEWER: &str = "this build of growforge was compiled without the `viewer` feature, so it \
-                         has no window; rebuild with the default features (cargo build --release) \
-                         to use `view`, `edit` and `run --view`";
+const NO_VIEWER: &str = "this build of growforge 3D was compiled without the `viewer` feature, \
+                         so it has no window; rebuild with the default features (cargo build \
+                         --release) to use `view`, `edit` and `run --view`";
 
 #[cfg(not(feature = "viewer"))]
 fn open_setup_view(_config: &Config, _problem: &Problem) -> Result<()> {

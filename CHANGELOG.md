@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-08-10 - 0.40.0 - It is called growforge 3D
+
+The product has a name of its own now. **Every surface a user reads says
+`growforge 3D`; every name a machine matches on stays `growforge`** - that is
+the rule the rebrand is built on, and the two are separate constants so the
+first can move again without the second ever having to.
+
+- **Displayed:** both window titles and therefore both panel headings
+  (`growforge 3D 0.40.0 - <project>`, `growforge 3D 0.40.0 edit - <file>`), the
+  console banner every command prints first, `--version`, the 80 byte header
+  stamped into every exported STL and the `generator` of the stress JSON, the
+  editor's file dialogs, the installer's `AppName` and its shortcuts, and the
+  prose of a message that names the program.
+- **Machine, unchanged:** the crate, the library, the executable, the command
+  that is typed (`growforge edit ...` parses exactly as before), the GitHub
+  slug, `Documents\growforge`, the installer's `AppId` and `{autopf}\growforge`
+  install directory - so this release upgrades the last one in place - and
+  `growforge-setup-<version>.exe`.
+- `constants::DISPLAY_NAME` and `DISPLAY_NAME_AND_VERSION` are the new
+  derivation of the displayed name; `PROGRAM_NAME` and `NAME_AND_VERSION` stay
+  the machine one. `DISPLAY_NAME` is a deliberate literal - what the product is
+  called cannot be assembled from what the package is called - held to one rule
+  by a test: **the brand may extend the machine name, never contradict it**, so
+  what is read on a window can always be typed at a prompt.
+- **An upgrade cleans up the shortcut names it changed.** An `[InstallDelete]`
+  block removes 0.39.0's `growforge` and `Uninstall growforge` icons, which an
+  upgrade otherwise leaves sitting beside the new ones until an uninstall. It
+  names those two files literally, inside the group this setup created itself:
+  no wildcards, and nothing under `{autodesktop}` ever - a shortcut a user made
+  is theirs.
+- **Upgrading works at all now.** The shipped samples are installed read-only,
+  and Setup refuses to replace a read-only file without `overwritereadonly`, so
+  every upgrade over an existing install aborted on the first example and rolled
+  itself back. Present since the installer was added in 0.39.0 and found by the
+  first upgrade anyone ran; the samples still land read-only.
+- Tests: the drift guard on that rule and on the two spellings of the brand, the
+  titles, the panel headings, the console banner and the STL header re-pinned to
+  the brand spelled out, and `--version` answering with the product while the
+  usage line still names the command. Counter-verified by rolling the brand back
+  to the bare machine name: seven display assertions fail, and the drift guard -
+  correctly - does not. The setup is verified by a real 0.39.0 -> 0.40.0 upgrade
+  in a sandbox: old icons gone, new ones there, an unrelated shortcut left in the
+  same folder untouched, then an uninstall that leaves nothing.
+- Version 0.40.0.
+
 ## 2026-08-09 - 0.39.0 - It installs, and it opens without being told where
 
 growforge has been a binary you build and a path you type. Neither survives

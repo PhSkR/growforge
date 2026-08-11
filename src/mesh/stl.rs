@@ -14,11 +14,13 @@ use crate::constants;
 use crate::geometry::{cross, difference};
 use crate::mesh::Mesh;
 
-/// The 80 byte header growforge stamps onto its STL files.
+/// The 80 byte header growforge 3D stamps onto its STL files.
+///
+/// The display name, not the machine one: a slicer shows this header beside the
+/// part, so it is a surface a user reads.
 pub fn header() -> [u8; constants::STL_HEADER_BYTES] {
     let mut header = [0u8; constants::STL_HEADER_BYTES];
-    let text = format!("{} {}", constants::PROGRAM_NAME, constants::VERSION);
-    let bytes = text.as_bytes();
+    let bytes = constants::DISPLAY_NAME_AND_VERSION.as_bytes();
     let n = bytes.len().min(constants::STL_HEADER_BYTES);
     header[..n].copy_from_slice(&bytes[..n]);
     header
@@ -162,9 +164,14 @@ mod tests {
         write(&path, &mesh).expect("write");
 
         let (header, triangles) = read(&path).expect("read");
+        // Spelled out rather than read back from the constant that wrote it: a
+        // slicer shows this line, so what is asserted is the string on a user's
+        // screen and not a second reading of the same value.
+        let stamped = String::from_utf8_lossy(&header);
+        let expected = format!("growforge 3D {}", env!("CARGO_PKG_VERSION"));
         assert!(
-            String::from_utf8_lossy(&header).starts_with(constants::PROGRAM_NAME),
-            "header does not carry the program name"
+            stamped.starts_with(&expected),
+            "the header does not open with {expected:?}: {stamped:?}"
         );
         assert_eq!(triangles.len(), mesh.triangles.len());
 

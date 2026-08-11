@@ -545,13 +545,12 @@ pub fn to_json(problem: &Problem, report: &StressReport) -> String {
         "  \"project\": {},\n",
         json::string(&problem.name)
     ));
+    // The build as a user reads it, the same string the exported STL's header
+    // carries: this field is provenance for whoever opens the report, and
+    // nothing matches on it.
     out.push_str(&format!(
         "  \"generator\": {},\n",
-        json::string(&format!(
-            "{} {}",
-            constants::PROGRAM_NAME,
-            constants::VERSION
-        ))
+        json::string(constants::DISPLAY_NAME_AND_VERSION)
     ));
     out.push_str("  \"units\": \"MPa\",\n");
     out.push_str(&format!(

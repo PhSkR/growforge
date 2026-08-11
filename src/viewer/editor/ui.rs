@@ -2661,7 +2661,7 @@ fn output_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                  the domain is projected back onto the analytic surface, so a bore comes out as \
                  the cylinder that was asked for rather than a fraction of a voxel under it. \
                  voxel exports the isosurface as the field produced it, which is what growforge \
-                 did before 0.22.0",
+                 3D did before 0.22.0",
             ) {
                 output.boundaries = Some(boundaries);
                 changed = true;
@@ -3442,17 +3442,20 @@ mod tests {
     ///
     /// The heading is the window title, and the title is what carries the build
     /// since 0.38.0: the whole heading is asserted, so the row a screenshot of
-    /// the panel shows is pinned rather than the substring inside it. The version
-    /// is spelled out here rather than read from the constant the title is built
-    /// from, so what is asserted is the string that has to be on screen and not a
-    /// second reading of the same value.
+    /// the panel shows is pinned rather than the substring inside it. The brand
+    /// and the version are spelled out here rather than read from the constant
+    /// the title is built from, so what is asserted is the string that has to be
+    /// on screen and not a second reading of the same value.
     #[test]
     fn the_panel_says_which_build_it_is() {
         let (_dir, path) = write_temp("version_line", fixture());
         let mut editor = Editor::open(&path).expect("open");
         let mut scene = editor.initial_scene();
         let text = panel_text(&mut editor, &mut scene);
-        let expected = format!("growforge {} edit - config.toml", env!("CARGO_PKG_VERSION"));
+        let expected = format!(
+            "growforge 3D {} edit - config.toml",
+            env!("CARGO_PKG_VERSION")
+        );
         assert!(
             text.lines().any(|line| line == expected),
             "the editor panel's heading is not {expected:?}: {text}"

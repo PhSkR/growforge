@@ -256,7 +256,7 @@ fn small_cantilever_runs_end_to_end() {
 
     // And the file that was written must parse back.
     let (header, triangles) = mesh::stl::read(&outcome.stl_path).expect("read back the STL");
-    assert!(String::from_utf8_lossy(&header).starts_with(constants::PROGRAM_NAME));
+    assert!(String::from_utf8_lossy(&header).starts_with(constants::DISPLAY_NAME));
     assert_eq!(triangles.len(), outcome.stats.triangles);
     std::fs::remove_file(&outcome.stl_path).ok();
 }
@@ -790,7 +790,7 @@ fn a_local_volume_capped_run_completes_and_exports() {
         outcome.islands.unserved
     );
     let (header, triangles) = mesh::stl::read(&outcome.stl_path).expect("read back the STL");
-    assert!(String::from_utf8_lossy(&header).starts_with(constants::PROGRAM_NAME));
+    assert!(String::from_utf8_lossy(&header).starts_with(constants::DISPLAY_NAME));
     assert_eq!(triangles.len(), outcome.stats.triangles);
     std::fs::remove_file(&outcome.stl_path).ok();
 }
@@ -3387,9 +3387,10 @@ fn a_wall_that_came_out_short_of_the_floor_is_exported_flush_with_it() {
 /// shows: the first line of output, ahead of the problem summary. `check` is the
 /// cheapest command that prints - it builds the model and writes nothing - and
 /// the line is printed once at the dispatch, so what holds for `check` holds for
-/// every subcommand. The version is spelled out here rather than read from the
-/// constant the binary prints, so what is asserted is the string a pasted
-/// transcript has to carry.
+/// every subcommand. The brand and the version are spelled out here rather than
+/// read from the constant the binary prints, so what is asserted is the string a
+/// pasted transcript has to carry - and the command it was typed as stays
+/// `growforge`, which is the whole point of the two names being different.
 #[test]
 fn the_command_line_names_the_build_on_its_first_line() {
     let path = std::env::temp_dir().join(format!(
@@ -3410,7 +3411,7 @@ fn the_command_line_names_the_build_on_its_first_line() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected = format!("growforge {}", env!("CARGO_PKG_VERSION"));
+    let expected = format!("growforge 3D {}", env!("CARGO_PKG_VERSION"));
     assert_eq!(
         stdout.lines().next(),
         Some(expected.as_str()),
@@ -3420,5 +3421,47 @@ fn the_command_line_names_the_build_on_its_first_line() {
     assert!(
         stdout.contains("configuration is valid"),
         "`growforge check` printed the version and not its own report: {stdout}"
+    );
+}
+
+/// `--version` answers with the product; the usage line still names the command.
+///
+/// The two names are different on purpose - the brand extends the machine name
+/// rather than replacing it - and this is the one place both are visible at
+/// once: a user reads `growforge 3D` and types `growforge`. Driven through the
+/// binary because the claim is about what clap prints, not about a constant.
+#[test]
+fn the_command_line_answers_with_the_product_and_is_typed_as_the_command() {
+    let version = std::process::Command::new(env!("CARGO_BIN_EXE_growforge"))
+        .arg("--version")
+        .output()
+        .expect("run the binary");
+    assert!(version.status.success(), "`--version` failed");
+    let printed = String::from_utf8_lossy(&version.stdout);
+    let expected = format!("growforge 3D {}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        printed.trim_end(),
+        expected,
+        "`--version` is not {expected:?}: {printed}"
+    );
+
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_growforge"))
+        .arg("--help")
+        .output()
+        .expect("run the binary");
+    assert!(help.status.success(), "`--help` failed");
+    let text = String::from_utf8_lossy(&help.stdout);
+    let usage = text
+        .lines()
+        .find(|line| line.starts_with("Usage:"))
+        .unwrap_or_else(|| panic!("`--help` printed no usage line: {text}"));
+    // The executable's own file name, which carries an extension on Windows.
+    assert!(
+        usage.contains(constants::PROGRAM_NAME),
+        "the usage line does not name the command: {usage}"
+    );
+    assert!(
+        !usage.contains(constants::DISPLAY_NAME),
+        "the usage line tells the user to type the brand: {usage}"
     );
 }

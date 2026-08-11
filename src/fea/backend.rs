@@ -81,9 +81,9 @@ impl LinearSolver {
             SolverBackend::Gpu => {
                 let _ = (grid, fixed);
                 anyhow::bail!(
-                    "this build of growforge was compiled without the `gpu` feature, so it has no \
-                     compute backend; rebuild with the default features (cargo build --release), \
-                     or set [solver] backend = \"{}\"",
+                    "this build of growforge 3D was compiled without the `gpu` feature, so it has \
+                     no compute backend; rebuild with the default features (cargo build \
+                     --release), or set [solver] backend = \"{}\"",
                     SolverBackend::Cpu.label()
                 )
             }

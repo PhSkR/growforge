@@ -302,9 +302,9 @@ pub(crate) mod tests {
     /// The heading is the window title, and the title is what carries the build
     /// since 0.38.0, so the panel is given a title built the way a run window
     /// builds one - the prefix constant and the project - and the painted rows
-    /// are read back for it. Compared against a version spelled out here rather
-    /// than against the constant, so the assertion is what a screenshot has to
-    /// show and not a second reading of the same value.
+    /// are read back for it. Compared against a brand and a version spelled out
+    /// here rather than against the constant, so the assertion is what a
+    /// screenshot has to show and not a second reading of the same value.
     #[test]
     fn the_panel_says_which_build_it_is() {
         let context = egui::Context::default();
@@ -314,7 +314,7 @@ pub(crate) mod tests {
             panel(root, &title, "test adapter", &mut scene, None, None, None);
         });
         let text = painted_text(&output);
-        let expected = format!("growforge {} - test project", env!("CARGO_PKG_VERSION"));
+        let expected = format!("growforge 3D {} - test project", env!("CARGO_PKG_VERSION"));
         assert!(
             text.lines().any(|line| line == expected),
             "the run panel's heading is not {expected:?}: {text}"

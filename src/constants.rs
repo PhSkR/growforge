@@ -13,28 +13,62 @@
 // Identity
 // ---------------------------------------------------------------------------
 
-/// Program name, used in the CLI banner and the binary STL header.
+/// The *machine* name: the crate, the executable, the command that is typed,
+/// the folder the configurations live in. It is `CARGO_PKG_NAME` spelled out,
+/// and it is what anything a machine matches on uses.
+///
+/// The name a user is *shown* is [`DISPLAY_NAME`]. The two are deliberately
+/// different strings for one reason: a rename of the product is not a rename of
+/// the command, the install directory or the release file, and holding them
+/// apart is what lets the first happen without the second.
 pub const PROGRAM_NAME: &str = "growforge";
 
-/// Crate version, used in the binary STL header.
+/// The *display* name: what every surface a user reads calls this program -
+/// window titles, both panel headings, the console banner, `--version`, the
+/// header stamped into an exported STL, and the prose of a message that names
+/// the program.
+///
+/// A deliberate literal, not a derivation. The brand carries something the
+/// package name cannot - what the program makes - so it cannot be assembled
+/// from `CARGO_PKG_NAME`, and a build that renamed the crate must not silently
+/// rename the product.
+///
+/// The coupling rule, pinned by `the_display_name_extends_the_machine_name` in
+/// this module's tests: **the brand may extend the machine name, never
+/// contradict it.** A user who reads `growforge 3D` on a window has to be able
+/// to type `growforge` at a prompt and reach it, so the displayed name starts
+/// with the name the executable, the command and the install directory carry.
+pub const DISPLAY_NAME: &str = "growforge 3D";
+
+/// Crate version, used everywhere a build names itself.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Program and version as one string - `growforge 0.38.0` - and the single
-/// derivation of that fragment.
+/// Machine name and version as one string - `growforge 0.40.0`.
 ///
-/// Everything that names the build to a user is this constant: the line the
-/// command line prints before anything else, and the prefix of both window
-/// titles - which each panel draws as its own heading, so the panels name the
-/// build without a second line to say it. One constant because they have to
-/// agree - a screenshot, a pasted console log and an exported part all have to
-/// name the same binary - and because a run cannot then be attributed to a
-/// version it was not built from.
+/// Kept for the surfaces that name the *binary* rather than the product; every
+/// surface a user reads uses [`DISPLAY_NAME_AND_VERSION`] instead.
 ///
 /// Assembled from the manifest at compile time. `concat!` takes literals only,
 /// which is why the two halves come from the manifest rather than from
 /// [`PROGRAM_NAME`] and [`VERSION`]; the strings are the same, and these cannot
 /// drift from the binary.
 pub const NAME_AND_VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"));
+
+/// Display name and version as one string - `growforge 3D 0.40.0` - and the
+/// single derivation of that fragment.
+///
+/// Everything that names the build to a user is this constant: the line the
+/// command line prints before anything else, `--version`, the prefix of both
+/// window titles - which each panel draws as its own heading, so the panels name
+/// the build without a second line to say it - and the header of an exported
+/// STL. One constant because they have to agree: a screenshot, a pasted console
+/// log and a part opened in a slicer all have to name the same build, and a run
+/// cannot then be attributed to a version it was not built from.
+///
+/// `concat!` takes literals only, so the brand is spelled again here rather than
+/// read from [`DISPLAY_NAME`]; the two are pinned to each other by the same test
+/// that pins the coupling rule.
+pub const DISPLAY_NAME_AND_VERSION: &str = concat!("growforge 3D", " ", env!("CARGO_PKG_VERSION"));
 
 /// Name of the default optimization engine.
 pub const DEFAULT_ENGINE: &str = "simp";
@@ -1742,15 +1776,16 @@ pub const MS_PER_S: f64 = 1000.0;
 // still documents them.
 
 /// Window title prefix; the mode and the document are appended, so a title
-/// reads `growforge 0.38.0 - <project>` in the run and setup windows and
-/// `growforge 0.38.0 edit - <file>` in the editor.
+/// reads `growforge 3D 0.40.0 - <project>` in the run and setup windows and
+/// `growforge 3D 0.40.0 edit - <file>` in the editor.
 ///
-/// The prefix carries the version - [`NAME_AND_VERSION`] - because the title bar
-/// and the taskbar entry are what a user, and a screenshot of a window, see
-/// first. Each panel draws this same title as its own heading, which is what a
-/// screenshot of the panel alone carries and what makes a second, weaker version
-/// line under it a repetition rather than a claim of its own.
-pub const VIEW_WINDOW_TITLE: &str = NAME_AND_VERSION;
+/// The prefix carries the brand and the version - [`DISPLAY_NAME_AND_VERSION`] -
+/// because the title bar and the taskbar entry are what a user, and a screenshot
+/// of a window, see first. Each panel draws this same title as its own heading,
+/// which is what a screenshot of the panel alone carries and what makes a
+/// second, weaker version line under it a repetition rather than a claim of its
+/// own.
+pub const VIEW_WINDOW_TITLE: &str = DISPLAY_NAME_AND_VERSION;
 
 /// Initial window width in logical pixels.
 pub const VIEW_WINDOW_WIDTH: u32 = 1280;
@@ -2132,11 +2167,11 @@ pub const VIEW_EDIT_FALLBACK_EXTENT_MM: f64 = 100.0;
 pub const VIEW_EDIT_NEW_CASE_PREFIX: &str = "case-";
 
 /// Extension the editor's file dialogs filter on and give a name that was typed
-/// without one. A growforge configuration is a TOML document.
+/// without one. A growforge 3D configuration is a TOML document.
 pub const VIEW_EDIT_FILE_EXTENSION: &str = "toml";
 
 /// What the file dialogs call that kind of file in their filter dropdown.
-pub const VIEW_EDIT_FILE_FILTER: &str = "growforge configuration";
+pub const VIEW_EDIT_FILE_FILTER: &str = "growforge 3D configuration";
 
 /// Extension of the copy an editing session writes beside its file when the
 /// viewer dies with unsaved changes in it.
@@ -2148,10 +2183,10 @@ pub const VIEW_EDIT_FILE_FILTER: &str = "growforge configuration";
 pub const VIEW_EDIT_RECOVERY_EXTENSION: &str = "recovered.toml";
 
 /// Title of the dialog the "open" button raises.
-pub const VIEW_EDIT_OPEN_DIALOG_TITLE: &str = "open a growforge configuration";
+pub const VIEW_EDIT_OPEN_DIALOG_TITLE: &str = "open a growforge 3D configuration";
 
 /// Title of the dialog the "new" button raises.
-pub const VIEW_EDIT_NEW_DIALOG_TITLE: &str = "new growforge configuration";
+pub const VIEW_EDIT_NEW_DIALOG_TITLE: &str = "new growforge 3D configuration";
 
 /// Name the "new" dialog opens with, which is also what the scaffolded file's
 /// project and STL are named after when it is accepted as it stands: the file
@@ -2706,3 +2741,50 @@ pub const VIEW_EDIT_PLACE_HINT_FIRST: &str = "click the first point in the viewp
 /// And while the second is.
 pub const VIEW_EDIT_PLACE_HINT_SECOND: &str =
     "click the second point; then drag the middle to curve it. Esc cancels";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The brand may extend the machine name, never contradict it.
+    ///
+    /// [`DISPLAY_NAME`] is a literal, because what the product is called is not
+    /// derivable from what the package is called, and this is the coupling that
+    /// literal is still held to: the name on a window has to begin with the name
+    /// typed at a prompt, so a user reading `growforge 3D` knows what to run,
+    /// what the executable is called and which folder the setup installed into.
+    /// Read from the manifest rather than from [`PROGRAM_NAME`], so a crate
+    /// rename that left the brand behind - either half moving without the other
+    /// - fails here rather than on a user's machine.
+    #[test]
+    fn the_display_name_extends_the_machine_name() {
+        assert!(
+            DISPLAY_NAME.starts_with(env!("CARGO_PKG_NAME")),
+            "the display name {DISPLAY_NAME:?} does not start with the package name {:?}: a brand \
+             that contradicts the command, the executable and the install directory leaves a user \
+             with nothing to type",
+            env!("CARGO_PKG_NAME")
+        );
+        assert_eq!(
+            PROGRAM_NAME,
+            env!("CARGO_PKG_NAME"),
+            "the machine name is the package name spelled out; they have drifted"
+        );
+    }
+
+    /// The two display constants are one string and its extension by the
+    /// version, which `concat!` cannot express because it takes literals only.
+    #[test]
+    fn the_display_version_string_is_the_display_name_and_the_version() {
+        assert_eq!(
+            DISPLAY_NAME_AND_VERSION,
+            format!("{DISPLAY_NAME} {VERSION}"),
+            "the brand is spelled twice in this module and the two spellings have drifted"
+        );
+        assert_eq!(
+            NAME_AND_VERSION,
+            format!("{PROGRAM_NAME} {VERSION}"),
+            "the machine name and version string no longer matches its two halves"
+        );
+    }
+}

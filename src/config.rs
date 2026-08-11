@@ -1528,7 +1528,7 @@ pub fn starter_config(name: &str) -> String {
     let thickness = constants::STARTER_PAD_MM;
     let top = side - thickness;
     format!(
-        "# growforge starter configuration, written by `growforge edit`.\n\
+        "# growforge 3D starter configuration, written by `growforge edit`.\n\
          #\n\
          # A {side:.0} mm block standing on the floor, carrying {load:.0} N on a pad at the\n\
          # top. Everything here is a starting point: drag the objects in the viewport,\n\
