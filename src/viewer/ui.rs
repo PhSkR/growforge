@@ -9,7 +9,11 @@ use crate::viewer::snapshot::{FrameKind, Progress, RunStatus};
 /// nothing in it is switched off rather than hidden, so the panel keeps its
 /// shape from frame to frame - and the checkbox has to say why it cannot be
 /// ticked.
-const ABSENT_LAYER_HELP: &str = "nothing has produced this layer yet";
+///
+/// Shared with the editor's precision block, whose "show nothing but the part"
+/// box is disabled for exactly this reason - the density layer is empty - and
+/// so has to say it in the same words.
+pub const ABSENT_LAYER_HELP: &str = "nothing has produced this layer yet";
 
 /// Draw one layer's visibility switch: the checkbox, the layer's own hover text,
 /// and the reason it cannot be ticked while the layer is empty.

@@ -30,7 +30,7 @@ use crate::viewer::editor::state::{
 };
 use crate::viewer::editor::{CloseDecision, Editor, Intent};
 use crate::viewer::scene::{Layer, Scene};
-use crate::viewer::ui::{layer_switch, layer_switches};
+use crate::viewer::ui::{ABSENT_LAYER_HELP, layer_switch, layer_switches};
 
 /// Wraps the interaction bookkeeping around one widget.
 ///
@@ -604,10 +604,10 @@ fn toolbar(ui: &mut egui::Ui, editor: &mut Editor) {
 }
 
 /// How precisely the viewport drags land: the snap increment, whether objects
-/// are kept inside the domain, and whether the grid ruled at that increment is
-/// drawn.
+/// are kept inside the domain, whether the grid ruled at that increment is
+/// drawn, and whether the viewport shows the part on its own.
 ///
-/// All three belong to the session rather than to the file - nothing here is
+/// All four belong to the session rather than to the file - nothing here is
 /// ever written to the configuration - which is why they sit above the
 /// document's own sections rather than among them.
 ///
@@ -615,6 +615,11 @@ fn toolbar(ui: &mut egui::Ui, editor: &mut Editor) {
 /// is what makes the increment above it visible: the grid is a workspace
 /// control before it is an overlay. It is the same switch the block drew, from
 /// the same layer table, over the same scene state.
+///
+/// The last of them is here for the same reason and one more: it is not a
+/// layer's switch at all but a mode over all of them, and it takes the
+/// viewport's editing with it - see [`Scene::isolate_part`] and
+/// [`Editor::suspend_interaction`].
 fn precision(ui: &mut egui::Ui, editor: &mut Editor, scene: &mut Scene) {
     // One explanation over the whole row: the dropdown and the box beside it set
     // the same increment, one from the usual list and one from anything at all.
@@ -667,6 +672,21 @@ fn precision(ui: &mut egui::Ui, editor: &mut Editor, scene: &mut Scene) {
         }
     });
     layer_switch(ui, scene, Layer::Grid);
+    // Tickable only once a run has produced the part it shows, and said so on
+    // hover while it is not: an empty viewport with the editing suspended behind
+    // it would be a window with nothing in it and nothing to do.
+    let has_part = scene.get(Layer::Density).is_some();
+    ui.add_enabled(
+        has_part,
+        egui::Checkbox::new(scene.isolate_part_mut(), "show nothing but the part"),
+    )
+    .on_hover_text(
+        "draw the density surface on its own and leave every other layer out of the frame, \
+         whatever its own switch says - and suspend editing in the viewport while it is, since \
+         the handles a drag would grab are among what is hidden. Orbit, pan, zoom and the whole \
+         of this panel go on working; unticking it puts every layer back exactly as it was",
+    )
+    .on_disabled_hover_text(ABSENT_LAYER_HELP);
     ui.label(
         egui::RichText::new(format!(
             "drags land on the increment and rotations on {} deg; hold Alt for a free drag",
@@ -675,6 +695,15 @@ fn precision(ui: &mut egui::Ui, editor: &mut Editor, scene: &mut Scene) {
         .small()
         .weak(),
     );
+    // For as long as the viewport is not answering, said where the switch that
+    // did it is.
+    if scene.isolate_part() {
+        ui.label(
+            egui::RichText::new(constants::VIEW_EDIT_ISOLATE_PART_NOTE)
+                .small()
+                .color(ui.visuals().warn_fg_color),
+        );
+    }
     // Said only when the grid is not ruled at the increment above, so the plane
     // on screen is never quietly a different one from the one drags land on.
     if let Some(note) = editor.floor_grid().and_then(grid::FloorGrid::note) {
@@ -5601,6 +5630,182 @@ mod tests {
             "clicking the {label:?} switch in the precision block did not change the layer's \
              visibility"
         );
+    }
+
+    /// The label of the switch that shows the part on its own.
+    const ISOLATE_LABEL: &str = "show nothing but the part";
+
+    /// Everything the precision block paints with every hover text of it shown,
+    /// which is the only way a tooltip is readable back out of a frame.
+    ///
+    /// `set_everything_is_visible` is egui's own switch for it, the same one the
+    /// overflow guard opens the collapsed blocks with; a widget's *disabled*
+    /// hover text is the one it paints while it is disabled, and its ordinary
+    /// one while it is not, so which of the two a box is explaining itself with
+    /// is readable here as well as what it says. Twice, because the first pass
+    /// is what leaves the tooltip's own area the state the second lays it out
+    /// against.
+    fn hover_texts(editor: &mut Editor, scene: &mut Scene) -> String {
+        let context = egui::Context::default();
+        context.memory_mut(|memory| memory.set_everything_is_visible(true));
+        let input = crate::viewer::ui::tests::window_input();
+        let mut text = String::new();
+        for _ in 0..2 {
+            let output = context.run_ui(input.clone(), |root| {
+                precision(root, editor, scene);
+            });
+            text = crate::viewer::ui::tests::painted_text(&output);
+        }
+        text
+    }
+
+    /// A density layer, which is what a finished run leaves on screen and what
+    /// that switch is about.
+    fn part() -> crate::viewer::scene::LayerMesh {
+        crate::viewer::scene::LayerMesh::from_mesh(
+            &crate::viewer::tessellate::box_mesh([0.0, 0.0, 0.0], [8.0, 8.0, 8.0]),
+            Layer::Density.info().color,
+            crate::viewer::scene::Shading::Smooth,
+        )
+    }
+
+    /// The switch that shows the part on its own is one of the workspace
+    /// controls, beside the other two boxes, and not one of the overlay
+    /// switches - which it is not one of in a second sense: it is a mode over
+    /// all of them rather than a layer's own switch.
+    ///
+    /// The same three things the floor grid's relocation is held to: the
+    /// precision block draws it, the `show` block does not, and a click on it in
+    /// the panel is what changes the scene.
+    #[test]
+    fn the_show_nothing_but_the_part_switch_is_in_the_precision_block() {
+        let (_dir, path) = write_temp("isolate_switch", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        // A run's surface on screen, which is what makes the box tickable.
+        scene.set(Layer::Density, Some(part()));
+
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            precision(root, &mut editor, &mut scene);
+        });
+        let text = crate::viewer::ui::tests::painted_text(&output);
+        assert!(
+            text.lines().any(|line| line == ISOLATE_LABEL),
+            "the precision block draws no {ISOLATE_LABEL:?} box: {text}"
+        );
+
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            show_block(root, &mut scene);
+        });
+        let shown = crate::viewer::ui::tests::painted_text(&output);
+        assert!(
+            !shown.lines().any(|line| line == ISOLATE_LABEL),
+            "the show block draws the {ISOLATE_LABEL:?} box: {shown}"
+        );
+        // Not vacuous: the block is still the list of the overlays themselves.
+        let density = Layer::Density.info().label;
+        assert!(
+            shown.lines().any(|line| line == density),
+            "the show block lost the {density:?} switch: {shown}"
+        );
+
+        // And it is the switch over the scene: one click through the panel,
+        // where it sits, and the part is the only layer drawn.
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            let _ = panel(root, &mut editor, &mut scene, "test adapter");
+        });
+        let pos = crate::viewer::ui::tests::painted_text_center(&output, ISOLATE_LABEL)
+            .unwrap_or_else(|| panic!("the panel painted no {ISOLATE_LABEL:?} row"));
+        click_panel_at(&mut editor, &mut scene, pos);
+        assert!(
+            scene.isolate_part(),
+            "clicking the {ISOLATE_LABEL:?} box in the precision block changed nothing"
+        );
+        for info in crate::viewer::scene::LAYERS {
+            assert_eq!(
+                scene.is_visible(info.layer),
+                info.layer == Layer::Density,
+                "the {} layer is drawn wrongly with the box ticked",
+                info.label
+            );
+        }
+        // And the panel says so, for as long as it is true.
+        let said = panel_text(&mut editor, &mut scene);
+        assert!(
+            said.contains(constants::VIEW_EDIT_ISOLATE_PART_NOTE),
+            "the panel does not say the viewport is suspended: {said}"
+        );
+    }
+
+    /// Before a run there is no part to show on its own, so the box cannot be
+    /// ticked and says why on hover.
+    ///
+    /// The disabled tooltip is read back the way the overflow guard reads the
+    /// closed blocks: egui's own `everything_is_visible` paints every hover text
+    /// of the frame, and a disabled widget's is the one that is painted while it
+    /// is disabled. The click that follows is what proves the box is really
+    /// inert rather than merely explained - and the same click with a part on
+    /// screen is what keeps that from being vacuous.
+    #[test]
+    fn the_switch_cannot_be_ticked_before_a_run_and_says_why() {
+        let (_dir, path) = write_temp("isolate_before_run", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        // The grid's own geometry first, so its switch is enabled: it explains
+        // an empty layer in the same words, and the box under test has to be
+        // the only thing in the block saying them.
+        editor.pump(&mut scene);
+        assert!(scene.get(Layer::Grid).is_some(), "the grid has lines");
+        assert!(
+            scene.get(Layer::Density).is_none(),
+            "a session opens with no part on screen"
+        );
+
+        let disabled = hover_texts(&mut editor, &mut scene);
+        assert!(
+            disabled.contains(crate::viewer::ui::ABSENT_LAYER_HELP),
+            "the disabled box does not say why it cannot be ticked: {disabled}"
+        );
+        // With a part on screen nothing in the block is disabled, so that
+        // sentence is gone and the box explains what it does instead: which is
+        // what says the sentence above belonged to this box.
+        scene.set(Layer::Density, Some(part()));
+        let enabled = hover_texts(&mut editor, &mut scene);
+        assert!(
+            !enabled.contains(crate::viewer::ui::ABSENT_LAYER_HELP),
+            "the box still says it cannot be ticked with a part on screen: {enabled}"
+        );
+        assert!(
+            enabled.contains("suspend editing in the viewport"),
+            "the box does not say that it suspends editing: {enabled}"
+        );
+        scene.clear_density();
+
+        // A click on it does nothing at all, which is what disabled means.
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            let _ = panel(root, &mut editor, &mut scene, "test adapter");
+        });
+        let pos = crate::viewer::ui::tests::painted_text_center(&output, ISOLATE_LABEL)
+            .unwrap_or_else(|| panic!("the panel painted no {ISOLATE_LABEL:?} row"));
+        click_panel_at(&mut editor, &mut scene, pos);
+        assert!(
+            !*scene.isolate_part_mut(),
+            "the box took a click with no part on screen"
+        );
+        assert!(
+            scene.is_visible(Layer::Domain),
+            "a refused click hid the model"
+        );
+
+        // The same click, once a run has produced one, is taken - so the
+        // assertion above is about the state and not about the click.
+        scene.set(Layer::Density, Some(part()));
+        click_panel_at(&mut editor, &mut scene, pos);
+        assert!(scene.isolate_part(), "the box refused a click with a part");
     }
 
     /// A panel edit of a shape goes through the containment rule, exactly as a

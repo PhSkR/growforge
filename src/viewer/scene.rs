@@ -519,6 +519,9 @@ pub struct Scene {
     /// Panel toggle: draw the density layer with per-triangle normals instead
     /// of the smooth ones it was built with.
     flat_shading: bool,
+    /// Panel toggle: show the part on its own, leaving every other layer out of
+    /// the frame whatever its own switch says.
+    isolate_part: bool,
 }
 
 impl Default for Scene {
@@ -529,13 +532,26 @@ impl Default for Scene {
             stress: None,
             stress_shading: false,
             flat_shading: constants::VIEW_DEFAULT_FLAT_SHADING,
+            isolate_part: constants::VIEW_EDIT_ISOLATE_PART_DEFAULT,
         }
     }
 }
 
 impl Scene {
     /// Replace a layer's geometry; `None` removes it.
+    ///
+    /// Emptying the density layer clears the switch that shows the part on its
+    /// own, whoever empties it: the mode describes a surface that is no longer
+    /// there, and the viewport takes no editing while it is set, so a flag left
+    /// standing would isolate - and lock - the window again the moment the next
+    /// preview put a surface back, with nobody having asked for it. Enforced
+    /// here rather than in the paths that empty the layer, so it holds for every
+    /// caller and there is one place it is stated: the same shape
+    /// [`Scene::set_stress`] has.
     pub fn set(&mut self, layer: Layer, mesh: Option<LayerMesh>) {
+        if layer == Layer::Density && mesh.is_none() {
+            self.isolate_part = false;
+        }
         self.meshes[layer.slot()] = mesh;
     }
 
@@ -581,6 +597,25 @@ impl Scene {
         self.flat_shading
     }
 
+    /// Mutable toggle for the side panel checkbox.
+    pub fn isolate_part_mut(&mut self) -> &mut bool {
+        &mut self.isolate_part
+    }
+
+    /// True while nothing but the part is on screen.
+    ///
+    /// Guarded by there being a part, exactly as the stress toggle is guarded by
+    /// there being a stress copy: a switch left on when the surface it shows was
+    /// taken away would leave an empty viewport - and, since the editor stops
+    /// taking pointer input while this is set, an empty viewport nothing could
+    /// be done in. What keeps the flag itself from ever standing in that state
+    /// is [`Scene::set`], which clears it whenever the density layer is emptied,
+    /// whoever empties it; the guard here is what makes the two impossible to
+    /// disagree, and covers a flag written on with no part ever set.
+    pub fn isolate_part(&self) -> bool {
+        self.isolate_part && self.get(Layer::Density).is_some()
+    }
+
     /// The geometry the density layer should currently be drawn with.
     pub fn density_geometry(&self) -> Option<&LayerMesh> {
         if self.stress_shading() {
@@ -607,13 +642,24 @@ impl Scene {
     /// Called when an edit has made the design on screen describe a
     /// configuration that no longer exists; showing it next to the new setup
     /// would claim a result the editor does not have.
+    ///
+    /// The switch that shows the part on its own goes with it, in
+    /// [`Scene::set`], which is where that holds for every caller rather than
+    /// only for this one.
     pub fn clear_density(&mut self) {
         self.set(Layer::Density, None);
         self.set_stress(None);
     }
 
-    /// True when the layer is switched on in the side panel.
+    /// True when the layer is drawn: switched on in the side panel, and not left
+    /// out by the switch that shows the part on its own.
+    ///
+    /// That switch overrides the individual ones rather than writing them, so
+    /// unticking it puts every layer back exactly as it was found.
     pub fn is_visible(&self, layer: Layer) -> bool {
+        if self.isolate_part() {
+            return layer == Layer::Density;
+        }
         self.visible[layer.slot()]
     }
 
@@ -927,6 +973,16 @@ magnitude_nmm = 500.0
         (config, problem)
     }
 
+    /// A density layer, which is what a run leaves on screen: any geometry at
+    /// all, in the layer the switches below are about.
+    fn part() -> LayerMesh {
+        LayerMesh::from_mesh(
+            &tessellate::box_mesh([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+            Layer::Density.info().color,
+            Shading::Smooth,
+        )
+    }
+
     /// A small grid of design cells holding an off-centre ball: a curved
     /// surface whose vertices land between the lattice planes rather than on
     /// them, which is what a sampling check needs.
@@ -1059,6 +1115,86 @@ magnitude_nmm = 500.0
         *scene.visibility_mut(Layer::Keepout) = false;
         assert!(!scene.is_visible(Layer::Keepout));
         assert!(scene.is_visible(Layer::Keepin));
+    }
+
+    /// A part on its own, and every layer back where it was afterwards.
+    ///
+    /// The switch is a mode over the individual ones rather than a write to
+    /// them: what it hides it hides whatever those say, and what it hid it
+    /// gives back exactly as it found it - which is only true if the per-layer
+    /// flags were never touched, so they are read back one by one.
+    #[test]
+    fn showing_nothing_but_the_part_hides_every_other_layer_and_gives_them_all_back() {
+        let mut scene = Scene::default();
+        scene.set(Layer::Density, Some(part()));
+        // A state worth restoring: not every layer is on to begin with.
+        *scene.visibility_mut(Layer::Keepout) = false;
+        *scene.visibility_mut(Layer::Gizmo) = false;
+        let before: Vec<bool> = LAYERS.iter().map(|i| scene.is_visible(i.layer)).collect();
+
+        *scene.isolate_part_mut() = true;
+        assert!(scene.isolate_part());
+        for info in LAYERS {
+            assert_eq!(
+                scene.is_visible(info.layer),
+                info.layer == Layer::Density,
+                "the {} layer is drawn wrongly while the part is shown on its own",
+                info.label
+            );
+        }
+
+        *scene.isolate_part_mut() = false;
+        assert!(!scene.isolate_part());
+        for (info, was) in LAYERS.iter().zip(before) {
+            assert_eq!(
+                scene.is_visible(info.layer),
+                was,
+                "the {} layer did not come back as it was",
+                info.label
+            );
+        }
+    }
+
+    /// The part going away takes the switch with it, whoever takes the part
+    /// away.
+    ///
+    /// The flag itself is what is read back, through `isolate_part_mut`, and not
+    /// only the guarded answer: a raw flag left standing behind a guard that
+    /// says otherwise is a checkbox drawn ticked that nothing can untick, and a
+    /// window that isolates and locks itself again the moment the next preview
+    /// lands. So both ways of emptying the layer are driven - the editor's own
+    /// `clear_density`, and the plain `set` any caller has - and both are asked
+    /// the same two questions.
+    #[test]
+    fn the_part_going_away_takes_the_switch_with_it() {
+        for empty in [
+            Scene::clear_density as fn(&mut Scene),
+            |scene: &mut Scene| scene.set(Layer::Density, None),
+        ] {
+            let mut scene = Scene::default();
+            scene.set(Layer::Density, Some(part()));
+            *scene.isolate_part_mut() = true;
+            assert!(scene.isolate_part());
+
+            empty(&mut scene);
+            assert!(
+                !*scene.isolate_part_mut(),
+                "the flag behind the checkbox stayed set behind a part that is gone"
+            );
+            assert!(!scene.isolate_part());
+            for info in LAYERS {
+                assert!(
+                    scene.is_visible(info.layer),
+                    "the {} layer stayed hidden behind a part that is gone",
+                    info.label
+                );
+            }
+            // And it stays clear when a part comes back: the next preview must
+            // not re-isolate a window nobody asked to.
+            scene.set(Layer::Density, Some(part()));
+            assert!(!scene.isolate_part(), "a new part brought the mode back");
+            assert!(scene.is_visible(Layer::Domain));
+        }
     }
 
     /// A switch homed outside the `show` block is drawn by a block only the

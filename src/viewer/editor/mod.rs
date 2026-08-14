@@ -1466,6 +1466,28 @@ impl Editor {
         self.drag.is_some()
     }
 
+    /// Put down whatever the pointer was holding, because the viewport has
+    /// stopped handing it any.
+    ///
+    /// What the window calls while nothing but the part is on screen: every
+    /// handle, outline and landing marker a gesture aims at is hidden then, and
+    /// a gesture that survived into that state would go on moving geometry
+    /// nobody can see. A drag is ended the way letting go of it ends it - the
+    /// step it made is recorded rather than rolled back, because it is an edit
+    /// the user made and undo is what takes it away - and a placement is
+    /// cancelled, exactly as Escape cancels it, because its clicks are the ones
+    /// that stop arriving.
+    ///
+    /// Idempotent and cheap, so the input path may ask on every event rather
+    /// than having to notice the frame the switch was thrown in.
+    pub fn suspend_interaction(&mut self) {
+        if self.drag.is_some() {
+            self.release(None, false);
+        }
+        self.cancel_placing();
+        self.clear_hover();
+    }
+
     /// Point the hover highlight at whatever is under the pointer.
     ///
     /// `ray` is the very ray a click would be cast along, and `None` for every

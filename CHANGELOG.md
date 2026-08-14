@@ -1,5 +1,46 @@
 # Changelog
 
+## 2026-08-13 - 0.41.0 - Show nothing but the part
+
+A finished part is looked at through the model that produced it: the domain
+shell, the regions, the grid and the gizmo are all still on screen. **One box in
+the editor's precision block puts the part on screen alone** - and takes the
+viewport's editing with it, because the handles a click would find are among
+what it hides.
+
+- **`show nothing but the part`**, beside `keep inside domain` and `floor grid`.
+  Ticked, only the density surface is drawn: every other layer is left out
+  whatever its own switch says, and unticking gives each of them back exactly as
+  it was - the mode overrides the per-layer flags rather than writing them. The
+  stress colouring and flat shading still apply, since both are the same layer.
+- **The viewport stops taking edits while it is ticked**: no picking, no grab, no
+  drag, no hover outline, no placement click. Whatever a gesture was holding when
+  the box went on is put down once, by the editor
+  (`Editor::suspend_interaction`) - a drag ends as letting go ends it, a
+  placement cancels as Escape cancels it. **The camera and the whole panel are
+  untouched**: orbit, pan, zoom and every widget go on working, which is what the
+  mode is for. Decided at the two roots of the editor's pointer input rather than
+  inside the gestures, so no path can be added that forgets to ask.
+- **It cannot be ticked before a run**, and says why on hover in the same words
+  every empty layer's switch uses. A part that goes away under a ticked box -
+  an edit that invalidates the run - clears the switch with it, so the viewport
+  is never left showing nothing and taking nothing. Cleared in `Scene::set`
+  itself, whoever empties the layer, so no future caller can leave the flag
+  standing behind a part that is gone and have the next preview re-isolate the
+  window nobody asked to isolate.
+- Nothing is persisted: it is a session switch like every other layer control.
+  The run window has no precision block and gets no box.
+- `constants::VIEW_EDIT_ISOLATE_PART_DEFAULT` (off) and
+  `VIEW_EDIT_ISOLATE_PART_NOTE`, the line the panel shows for as long as the
+  viewport is suspended.
+- Tests: the box is in the precision block and not in `show`, and a click on it
+  there is what changes the scene; every other layer hidden and all of them
+  restored; the disabled box's hover text before a run, and the click it refuses;
+  and the whole input path through the window - hover, grab, drag, click, orbit -
+  with the box on, off, and with the part taken away under it. Counter-verified
+  by removing the gate: hover, grab and the flag-clearing all fail.
+- Version 0.41.0.
+
 ## 2026-08-10 - 0.40.0 - It is called growforge 3D
 
 The product has a name of its own now. **Every surface a user reads says

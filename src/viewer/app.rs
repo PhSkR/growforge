@@ -484,10 +484,33 @@ impl<'a> ViewerApp<'a> {
         }
     }
 
+    /// True while the viewport takes no editing input at all, which is what the
+    /// scene's "show nothing but the part" switch does as well as hiding the
+    /// layers.
+    ///
+    /// Asked at the two roots of the editor's pointer input - the window events
+    /// and the per-frame hover - rather than inside the gestures themselves, so
+    /// there is one place that decides it and no path can be added that forgets
+    /// to ask. What is suspended is picking, grabbing, dragging, hovering and
+    /// placement clicks, and nothing else: the camera keeps every event, because
+    /// looking at the part from another side is what the mode is for.
+    ///
+    /// Whatever a gesture was holding when the switch went on is put down here,
+    /// once, by the editor itself: see [`Editor::suspend_interaction`].
+    fn editing_suspended(&mut self) -> bool {
+        if !self.scene.isolate_part() {
+            return false;
+        }
+        if let Some(editor) = self.editor.as_mut() {
+            editor.suspend_interaction();
+        }
+        true
+    }
+
     /// Editor input: gizmo drags and click-to-select. Returns true when a
     /// handle took the event, which is what keeps the camera out of it.
     fn handle_editor_event(&mut self, event: &WindowEvent) -> bool {
-        if self.editor.is_none() {
+        if self.editor.is_none() || self.editing_suspended() {
             return false;
         }
         match event {
@@ -777,9 +800,11 @@ impl<'a> ViewerApp<'a> {
     /// `None` - no hover at all - covers every reason there is nothing under the
     /// pointer to click: it is off the window, over the side panel (which is
     /// what [`ViewerApp::editor_ray`] answers), or in the middle of a camera
-    /// drag, where the geometry is moving rather than being pointed at.
+    /// drag, where the geometry is moving rather than being pointed at. The one
+    /// reason that is not a ray at all - the viewport taking no editing input -
+    /// is answered above, where the outline is dropped rather than re-picked.
     fn hand_hover_to_editor(&mut self) {
-        if self.editor.is_none() {
+        if self.editor.is_none() || self.editing_suspended() {
             return;
         }
         let ray = if self.pointer.dragging() {
@@ -2350,6 +2375,139 @@ mod tests {
             harness.pump();
             assert_eq!(harness.selection(), None, "scale {scale}");
         }
+    }
+
+    /// While nothing but the part is on screen, the viewport takes no editing
+    /// at all: nothing is hovered, no handle is grabbed, no drag moves anything
+    /// and no click selects. The camera is not what was suspended, and
+    /// unticking the box - or the part going away under a ticked one - gives
+    /// every gesture straight back.
+    ///
+    /// Driven through the window's own event path, because that is where the
+    /// suspension is decided: what the gestures below are refused by is the
+    /// mode and not a missing handle, and the handles are asserted to be there
+    /// for exactly that reason.
+    #[test]
+    fn showing_nothing_but_the_part_suspends_editing_in_the_viewport() {
+        let load = Selection::Load { case: 0, load: 0 };
+        let mut harness = Harness::new(1.0);
+        // What a finished run leaves on screen, and what the switch shows on
+        // its own. Given to the scene after the opening fit, so the camera
+        // these gestures are aimed through is the one every other test drives.
+        harness.app.scene.set(
+            Layer::Density,
+            Some(LayerMesh::from_mesh(
+                &tessellate::box_mesh([24.0, 12.0, 12.0], [40.0, 20.0, 20.0]),
+                Layer::Density.info().color,
+                crate::viewer::scene::Shading::Smooth,
+            )),
+        );
+        let region = centre_of(&harness.shape(load));
+        harness.editor().state.select(Some(load));
+        harness.pump();
+        let handle = harness.handle(HandleKind::Translate(0));
+        let before = centre_of(&harness.shape(load));
+
+        *harness.app.scene.isolate_part_mut() = true;
+        assert!(
+            !harness.app.scene.is_visible(Layer::Gizmo),
+            "the handles are still drawn"
+        );
+        assert!(
+            !harness.editor().handles.is_empty(),
+            "the handles are hidden, not gone: a gesture at one has to be \
+             refused by the mode rather than by there being nothing there"
+        );
+
+        // Nothing under the pointer is hovered - neither the object nor the
+        // handle that stands at its centre.
+        harness.move_to(region);
+        harness.pump();
+        assert_eq!(
+            harness.editor().hover(),
+            None,
+            "an object nobody can see was hovered"
+        );
+        assert_eq!(
+            harness.editor().hovered_handle(),
+            None,
+            "a handle nobody can see was hovered"
+        );
+
+        // No handle is grabbed, and the drag that would have followed moves
+        // nothing.
+        harness.move_to(handle.position);
+        harness.press();
+        assert!(
+            !harness.editor().is_dragging(),
+            "a handle nobody can see was grabbed"
+        );
+        harness.move_to([
+            handle.position[0] + 8.0,
+            handle.position[1],
+            handle.position[2],
+        ]);
+        harness.pump();
+        harness.release();
+        harness.pump();
+        assert_eq!(
+            centre_of(&harness.shape(load)),
+            before,
+            "a suspended drag moved the object"
+        );
+
+        // And a click selects nothing.
+        harness.editor().state.select(None);
+        harness.pump();
+        harness.click(region);
+        assert_eq!(
+            harness.selection(),
+            None,
+            "an object nobody can see was picked"
+        );
+
+        // The camera is not what was suspended: the very gesture that grabs
+        // nothing orbits, which is what the mode is for.
+        let yaw = harness.app.camera.yaw;
+        harness.move_to_pixel(100.0, 100.0);
+        harness.press();
+        harness.move_to_pixel(160.0, 120.0);
+        harness.release();
+        assert!(
+            (harness.app.camera.yaw - yaw).abs() > 1e-9,
+            "the orbit stopped with the editing"
+        );
+
+        // Unticking gives the hover and the clicks back - the same pointer
+        // position, which is what says the ones above were refused by the mode.
+        *harness.app.scene.isolate_part_mut() = false;
+        harness.move_to(region);
+        harness.pump();
+        assert_eq!(
+            harness.editor().hover(),
+            Some(load),
+            "unticking the box did not give the hover back"
+        );
+        harness.click(region);
+        assert_eq!(
+            harness.selection(),
+            Some(load),
+            "unticking the box did not give the clicks back"
+        );
+
+        // And so does the part going away under a ticked box, which is what an
+        // edit that invalidates the run does to it: the viewport is never left
+        // showing nothing and taking nothing.
+        *harness.app.scene.isolate_part_mut() = true;
+        harness.editor().state.select(None);
+        harness.pump();
+        harness.app.scene.clear_density();
+        harness.click(region);
+        assert_eq!(
+            harness.selection(),
+            Some(load),
+            "a part that went away left the viewport inert"
+        );
     }
 
     #[test]

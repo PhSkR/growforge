@@ -2692,6 +2692,23 @@ pub const VIEW_EDIT_CONTAINMENT_NOTE: &str =
 /// Seconds that note stays up.
 pub const VIEW_EDIT_CONTAINMENT_NOTE_S: f64 = 4.0;
 
+/// Whether the viewport starts out showing nothing but the part.
+///
+/// Off: a session opens on the model it is there to edit - the domain, the
+/// regions, the gizmo - and the switch beside this one's siblings in the
+/// precision block is what puts the run's own surface on screen alone. Editor
+/// only, like the floor grid's switch: it is the one panel that draws it.
+pub const VIEW_EDIT_ISOLATE_PART_DEFAULT: bool = false;
+
+/// What the precision block says for as long as the part is shown on its own.
+///
+/// The viewport stops taking edits while it is - every handle and outline a
+/// gesture would aim at is hidden - so the panel says why nothing under the
+/// pointer answers, for as long as that is true. The same promise the placement
+/// hint keeps.
+pub const VIEW_EDIT_ISOLATE_PART_NOTE: &str =
+    "showing the part alone: viewport editing is suspended, and the camera and the panel are not";
+
 // ---------------------------------------------------------------------------
 // Viewer: editor two-click placement
 // ---------------------------------------------------------------------------

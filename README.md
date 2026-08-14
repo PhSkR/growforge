@@ -2521,6 +2521,7 @@ whatever they started off by.
 | ------------------ | ---------------------------------------------------------------- |
 | `snap mm`          | the length increment: a dropdown of the usual ones, `off`, or any number typed in beside it (default 1 mm) |
 | `floor grid`       | whether the grid ruled at that increment is drawn (on by default) |
+| `show nothing but the part` | the part on screen on its own, with [viewport editing suspended](#showing-nothing-but-the-part) (off by default) |
 | held `Alt`         | no snapping at all, for as long as it is held                    |
 | (fixed)            | rotations snap to 22.5 degrees, which holds 45 and 90            |
 
@@ -2581,6 +2582,30 @@ Enter, and the object goes exactly there - applied to the shape the drag started
 on, as one undo step rather than a second one stacked on the drag. Escape, or a
 click anywhere else, leaves the drag's own value alone. It is the same edit the
 properties panel makes, spelled where you are looking.
+
+### Showing nothing but the part
+
+**show nothing but the part** (off by default), the third box in the snapping
+controls, draws the density surface on its own: every other layer is left out of
+the frame whatever its own switch says, and unticking it gives each of them back
+exactly as it was. The stress colouring and flat shading still apply, because
+both are that same layer.
+
+**The viewport stops taking edits while it is ticked** - nothing is picked,
+grabbed, dragged, outlined or placed - because the handles a click would find are
+among what it hides, and a gesture at an invisible handle would move something
+you cannot see. Whatever a drag or a placement was holding when the box went on
+is put down with it: the drag ends as letting go ends it, one undo step and all,
+and the placement cancels as `Esc` cancels it. **The camera and the panel are
+untouched**: orbit, pan, zoom, every field and every button go on working, and
+the panel says the viewport is suspended for as long as it is.
+
+The box cannot be ticked before a run has produced a part, and says so on hover
+in the same words every empty layer's switch uses. A part that goes away under a
+ticked box - an edit that invalidates the run does exactly that - clears the box
+with it, so the viewport is never left showing nothing and taking nothing. Like
+every other layer switch it is a session's own: nothing about it is written to
+the configuration, and the editor is the one window that has it.
 
 ### Keeping objects inside the domain
 
