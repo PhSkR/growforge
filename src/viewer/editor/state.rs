@@ -46,6 +46,32 @@ pub enum Selection {
     },
 }
 
+/// A copied object, held as its own data rather than as a [`Selection`].
+///
+/// What was copied has to survive everything that can happen to the original
+/// before it is pasted - a drag, a delete, an undo, the whole list being
+/// renumbered underneath it - and an index would survive none of that. The
+/// clone is the copy.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Clipboard {
+    /// `[[domain]]` entry, with its own boolean operation.
+    Domain(DomainEntry),
+    /// `[[keepout]]` entry.
+    Keepout(ShapeSpec),
+    /// `[[keepin]]` entry.
+    Keepin(ShapeSpec),
+    /// `[[supports]]` entry.
+    Support(SupportSpec),
+    /// `[[loadcases]]` entry, together with every load in it.
+    LoadCase(LoadCaseSpec),
+    /// One `[[loadcases.loads]]` entry, and only the load: a load has no
+    /// existence outside a case, and which case it is pasted into is answered
+    /// by the selection at the moment of the paste rather than carried from the
+    /// copy - see [`EditorState::paste_case`]. An index remembered from then
+    /// would address whatever had moved into that position since.
+    Load(LoadSpec),
+}
+
 /// What kind of object an add button creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewObject {
@@ -1105,6 +1131,127 @@ impl EditorState {
         self.selection = Some(selection);
         self.stale = true;
         clamped
+    }
+
+    /// The selected object's own data, taken out of the configuration.
+    ///
+    /// A read, and nothing else: no interaction is closed, no undo step is
+    /// recorded and the document is not touched, because copying a
+    /// configuration is not a change to one. `None` when nothing is selected.
+    pub fn copy(&self) -> Option<Clipboard> {
+        let config = &self.config;
+        Some(match self.selection()? {
+            Selection::Domain(i) => Clipboard::Domain(config.domain.get(i)?.clone()),
+            Selection::Keepout(i) => Clipboard::Keepout(config.keepout.get(i)?.clone()),
+            Selection::Keepin(i) => Clipboard::Keepin(config.keepin.get(i)?.clone()),
+            Selection::Support(i) => Clipboard::Support(config.supports.get(i)?.clone()),
+            Selection::LoadCase(i) => Clipboard::LoadCase(config.loadcases.get(i)?.clone()),
+            Selection::Load { case, load } => {
+                Clipboard::Load(config.loadcases.get(case)?.loads.get(load)?.clone())
+            }
+        })
+    }
+
+    /// Whether [`EditorState::paste`] of `what` would put an object anywhere.
+    ///
+    /// Asked before anything at all is changed, because a paste that is refused
+    /// has to leave even the modes around it alone: see [`Editor::paste`]. A
+    /// load is the one thing that can be refused - it needs a case to go into -
+    /// and it is answered here by the very resolution the paste itself uses, so
+    /// the two cannot come to disagree.
+    pub fn can_paste(&self, what: &Clipboard) -> bool {
+        match what {
+            Clipboard::Load(_) => self.paste_case().is_some(),
+            _ => true,
+        }
+    }
+
+    /// Add a copied object to the configuration and select it, answering
+    /// whether it went anywhere.
+    ///
+    /// The one paste path, and [`EditorState::add_with`]'s counterpart: the
+    /// configuration and the document are changed together, the whole paste is
+    /// one undo step, and an object with nowhere to go changes nothing at all
+    /// rather than half of it.
+    ///
+    /// The clone keeps the coordinates it was copied from, so a paste lands on
+    /// top of the original exactly as two adds land on top of each other, and
+    /// the tree list is what tells them apart. Only a load case is changed at
+    /// all, by [`constants::VIEW_EDIT_PASTE_NAME_SUFFIX`] on its name, because
+    /// it is the one object here that carries a name.
+    ///
+    /// The one thing that can go nowhere is a load, which needs a case the
+    /// selection addresses: see [`EditorState::paste_case`]. Callers that must
+    /// know *before* changing anything else ask [`EditorState::can_paste`],
+    /// which resolves it the same way.
+    pub fn paste(&mut self, what: Clipboard) -> bool {
+        self.end_edit_any();
+        let snapshot = self.snapshot();
+        let selection = match what {
+            Clipboard::Domain(entry) => {
+                self.config.domain.push(entry);
+                self.document.push_object(toml_io::List::Domain);
+                Selection::Domain(self.config.domain.len() - 1)
+            }
+            Clipboard::Keepout(shape) => {
+                self.config.keepout.push(shape);
+                self.document.push_object(toml_io::List::Keepout);
+                Selection::Keepout(self.config.keepout.len() - 1)
+            }
+            Clipboard::Keepin(shape) => {
+                self.config.keepin.push(shape);
+                self.document.push_object(toml_io::List::Keepin);
+                Selection::Keepin(self.config.keepin.len() - 1)
+            }
+            Clipboard::Support(spec) => {
+                self.config.supports.push(spec);
+                self.document.push_object(toml_io::List::Supports);
+                Selection::Support(self.config.supports.len() - 1)
+            }
+            Clipboard::LoadCase(mut spec) => {
+                spec.name.push_str(constants::VIEW_EDIT_PASTE_NAME_SUFFIX);
+                self.config.loadcases.push(spec);
+                self.document.push_object(toml_io::List::LoadCases);
+                Selection::LoadCase(self.config.loadcases.len() - 1)
+            }
+            Clipboard::Load(load) => {
+                let Some(target) = self.paste_case() else {
+                    return false;
+                };
+                let Some(spec) = self.config.loadcases.get_mut(target) else {
+                    return false;
+                };
+                spec.loads.push(load);
+                let index = spec.loads.len() - 1;
+                self.document.push_object(toml_io::List::Loads(target));
+                Selection::Load {
+                    case: target,
+                    load: index,
+                }
+            }
+        };
+        self.history.push(snapshot);
+        self.selection = Some(selection);
+        self.stale = true;
+        true
+    }
+
+    /// Which load case a copied load would be pasted into, when the selection
+    /// addresses one at all.
+    ///
+    /// Read live and through [`EditorState::selection`], which answers only for
+    /// objects that are still there, so the answer can never be an index into a
+    /// list that has been renumbered under it. A copy of a load leaves the
+    /// selection on that load, so a paste straight after a copy puts it back
+    /// into its own case; selecting another case first is how the same load is
+    /// copied into that one; and a selection that says nothing about cases - a
+    /// keepout, nothing at all - is not a place to put a load, so there is no
+    /// answer rather than a guessed one.
+    fn paste_case(&self) -> Option<usize> {
+        match self.selection()? {
+            Selection::LoadCase(case) | Selection::Load { case, .. } => Some(case),
+            _ => None,
+        }
     }
 
     /// Delete the selected object, clearing the selection.

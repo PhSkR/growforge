@@ -68,7 +68,7 @@ use crate::viewer::editor::pick::Ray;
 use crate::viewer::editor::place::Placing;
 use crate::viewer::editor::snap::{Flush, Snap};
 use crate::viewer::editor::state::{
-    EditorState, NewObject, Selection, set_shape_contained, shape_of,
+    Clipboard, EditorState, NewObject, Selection, set_shape_contained, shape_of,
 };
 use crate::viewer::editor::worker::{RunKind, Worker};
 use crate::viewer::scene::{self, Layer, LayerMesh, Scene, Shading};
@@ -267,6 +267,17 @@ pub struct Editor {
     /// it asked for is started once that run is done.
     regrow_owed: bool,
     drag: Option<gizmo::Drag>,
+    /// What `copy` took, waiting for a paste: see [`Clipboard`].
+    ///
+    /// The session's own, and only the session's: it holds objects rather than
+    /// text, it never reaches the platform's clipboard, and it goes when the
+    /// window goes. What it holds is untouched by everything that happens to
+    /// the object it was copied from, deletes and undos included.
+    clipboard: Option<Clipboard>,
+    /// Set when the window itself saw the paste press: see
+    /// [`Editor::note_paste_key`]. Taken by the next [`Editor::shortcuts`],
+    /// whether or not that frame's guards let it do anything.
+    paste_key: bool,
     /// The two-click placement in progress, which owns the viewport's clicks
     /// while it lives: see [`place`]. `None` is the ordinary state, where a
     /// click selects.
@@ -392,6 +403,8 @@ impl Editor {
             auto_regrow,
             regrow_owed: false,
             drag: None,
+            clipboard: None,
+            paste_key: false,
             placing: None,
             drag_handle_at: None,
             handles: Vec::new(),
@@ -594,6 +607,67 @@ impl Editor {
             self.state.delete(selection);
             self.after_edit();
         }
+    }
+
+    /// Copy the selected object into the session's clipboard.
+    ///
+    /// The one copy path, as [`Editor::delete_selection`] is the one delete
+    /// path. It changes nothing: no undo step, nothing to save, nothing on
+    /// screen - so a copy taken and never pasted leaves the session exactly as
+    /// it was. With nothing selected there is nothing to copy, and whatever was
+    /// copied before stays where it is rather than being replaced by nothing.
+    pub fn copy_selection(&mut self) {
+        if let Some(copied) = self.state.copy() {
+            self.clipboard = Some(copied);
+        }
+    }
+
+    /// Paste what was copied, which becomes the selection.
+    ///
+    /// The one paste path. A structural change of the document, so it takes a
+    /// placement in progress with it exactly as a delete or an undo does - but
+    /// only once it is known to be one, because a paste that does nothing may
+    /// not cost the user the mode they are in. Both ways it can do nothing are
+    /// answered before the placement is touched: an empty clipboard, and a
+    /// copied load the selection gives no case to go into. What is left is a
+    /// paste that will happen, in the order every structural edit keeps -
+    /// cancel the mode, then change the document.
+    ///
+    /// The clipboard is left holding what it holds, so one copy pastes as many
+    /// times as it is asked to.
+    pub fn paste(&mut self) {
+        let Some(clipboard) = self.clipboard.clone() else {
+            return;
+        };
+        if !self.state.can_paste(&clipboard) {
+            return;
+        }
+        self.cancel_placing();
+        if self.state.paste(clipboard) {
+            self.after_edit();
+        }
+    }
+
+    /// The window saw the paste press itself.
+    ///
+    /// The one binding egui cannot be relied on to pass on. The winit backend
+    /// answers `Ctrl+V` by reading the *platform's* clipboard: it turns the
+    /// press into a paste event carrying that text and emits no key press for
+    /// it, and when there is no text to carry - an empty clipboard, or one
+    /// holding a screenshot - it emits nothing at all. The editor's clipboard
+    /// holds objects rather than text and has nothing to do with the platform's,
+    /// so a press answered that way would work or not work depending on what
+    /// some other program had copied, which is not a thing a user could ever
+    /// diagnose.
+    ///
+    /// So the window notes the press here, and [`Editor::shortcuts`] answers it
+    /// in the same frame the egui events of that press arrive in, folded into
+    /// the one decision: one press is one paste however many ways it arrives,
+    /// and it is refused by the same two guards as every other binding. Nothing
+    /// is deferred - a press the guards refuse is dropped with the frame that
+    /// refused it, rather than waiting behind a modal for the answer.
+    pub(crate) fn note_paste_key(&mut self) {
+        self.paste_key = true;
     }
 
     /// Called by the panel once a frame in which a widget changed something.
@@ -1674,13 +1748,19 @@ impl Editor {
         // first. One rule over all of them beats an exemption list somebody has
         // to maintain as bindings are added - and the modal's own buttons, which
         // are mouse-driven, remain the way it is answered.
+        //
+        // Taken before either of them can return, so the one press the window
+        // notes for itself - see [`Editor::note_paste_key`] - is refused by
+        // them like any other rather than saved up for the frame after the
+        // modal is answered or the text field is left.
+        let noted_paste = std::mem::take(&mut self.paste_key);
         if self.is_asking() {
             return;
         }
         if context.egui_wants_keyboard_input() {
             return;
         }
-        let (save, open, new, undo, redo, delete, escape) = context.input(|input| {
+        let (save, open, new, undo, redo, copy, paste, delete, escape) = context.input(|input| {
             let command = input.modifiers.command;
             (
                 command && input.key_pressed(egui::Key::S),
@@ -1690,10 +1770,30 @@ impl Editor {
                 command
                     && (input.key_pressed(egui::Key::Y)
                         || (input.modifiers.shift && input.key_pressed(egui::Key::Z))),
+                // Both spellings of the same two presses. The winit backend
+                // translates Ctrl+C and Ctrl+V into these events and emits no
+                // key press for either, so the event is what the real keyboard
+                // delivers; the key press is what a synthetic frame delivers,
+                // and what a backend that does not translate would. The paste
+                // has a third route on top of these two, because the event
+                // only arrives when the *platform's* clipboard holds text:
+                // see [`Editor::note_paste_key`].
+                (command && input.key_pressed(egui::Key::C))
+                    || input.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                (command && input.key_pressed(egui::Key::V))
+                    || input
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Paste(_))),
                 input.key_pressed(egui::Key::Delete),
                 input.key_pressed(egui::Key::Escape),
             )
         });
+        // One decision over all three ways one press can arrive, so a keystroke
+        // that arrives as an event *and* as the window's own note - which is
+        // what happens whenever the platform's clipboard holds text - is still
+        // one paste.
+        let paste = paste || noted_paste;
         // Before anything else it could mean: while a placement is in progress
         // Escape is what leaves it, at either of its two stages.
         if escape {
@@ -1716,6 +1816,12 @@ impl Editor {
         }
         if redo {
             self.redo();
+        }
+        if copy {
+            self.copy_selection();
+        }
+        if paste {
+            self.paste();
         }
         if delete {
             self.delete_selection();
@@ -2357,6 +2463,42 @@ vector = [0.0, 0.0, -80.0]
         press_key_with(editor, key, egui::Modifiers::COMMAND);
     }
 
+    /// One frame carrying `event` and no key press at all, which is how a real
+    /// `Ctrl+C` and `Ctrl+V` arrive: the winit backend translates both into
+    /// clipboard events and emits no key event for either.
+    fn send_event(editor: &mut Editor, event: egui::Event) {
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![event],
+            ..egui::RawInput::default()
+        };
+        let _ = context.run_ui(input, |_| {});
+        editor.shortcuts(&context);
+    }
+
+    /// One frame in which egui saw nothing at all, for the press the window
+    /// notes for itself rather than through egui.
+    fn quiet_frame(editor: &mut Editor) {
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |_| {});
+        editor.shortcuts(&context);
+    }
+
+    /// One frame in which a text field has the keyboard, which is the second
+    /// guard over every binding: what is typed into a field is not a shortcut.
+    fn typing_frame(editor: &mut Editor) {
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let mut text = String::new();
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        assert!(
+            context.egui_wants_keyboard_input(),
+            "the frame meant to be typing in is not"
+        );
+        editor.shortcuts(&context);
+    }
+
     /// How many objects each shape list holds, for the tests that care which
     /// list an add landed in.
     fn counts(editor: &Editor) -> [usize; 4] {
@@ -2733,6 +2875,12 @@ vector = [0.0, 0.0, -80.0]
         editor
             .state
             .edit(|config| config.optimization.mass_fraction = Some(0.44));
+        // Something copied before the question goes up, so the `Ctrl+V` below
+        // is a paste that would really land an object if it reached past it -
+        // and a keepin, so a `Ctrl+C` that reached past it would be visible as
+        // the clipboard holding the keepout selected instead.
+        editor.state.select(Some(Selection::Keepin(0)));
+        editor.copy_selection();
 
         // The close is asked about, and that is the question from here on.
         assert!(!editor.request_close());
@@ -2753,15 +2901,22 @@ vector = [0.0, 0.0, -80.0]
         editor.state.select(Some(Selection::Keepout(1)));
         let undo_depth = editor.state.undo_depth();
         let keepouts = editor.state.config().keepout.len();
+        let keepins = editor.state.config().keepin.len();
         for key in [
             egui::Key::O,
             egui::Key::N,
             egui::Key::S,
             egui::Key::Z,
             egui::Key::Y,
+            egui::Key::C,
+            egui::Key::V,
         ] {
             press_command_key(&mut editor, key);
         }
+        // Both spellings of the clipboard keys, since the real keyboard sends
+        // the second one.
+        send_event(&mut editor, egui::Event::Copy);
+        send_event(&mut editor, egui::Event::Paste("anything".to_string()));
         press_key(&mut editor, egui::Key::Delete);
         press_key(&mut editor, egui::Key::Escape);
         assert_eq!(
@@ -2781,6 +2936,15 @@ vector = [0.0, 0.0, -80.0]
             editor.state.config().keepout.len(),
             keepouts,
             "a delete reached past the modal"
+        );
+        assert_eq!(
+            editor.state.config().keepin.len(),
+            keepins,
+            "a paste reached past the modal"
+        );
+        assert!(
+            matches!(editor.clipboard, Some(Clipboard::Keepin(_))),
+            "a copy reached past the modal"
         );
         assert!(editor.state.is_dirty(), "a save reached past the modal");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), fixture());
@@ -2836,6 +3000,429 @@ vector = [0.0, 0.0, -80.0]
         // And neither has touched the document or the session.
         assert!(!editor.state.is_dirty());
         assert!(!editor.is_switching() && !editor.is_asking());
+    }
+
+    /// Every kind of object the tree addresses can be copied and pasted, the
+    /// clone is the original's own data, and it is what is selected afterwards.
+    ///
+    /// The clone lands on the coordinates it was copied from, so what the
+    /// viewport shows is two objects in one place and the tree list is what
+    /// tells them apart - the same answer two adds get. Only a load case is
+    /// changed by the paste at all, by the suffix on its name.
+    #[test]
+    fn copying_and_pasting_every_kind_of_object_adds_a_clone_and_selects_it() {
+        let (_dir, path) = write_temp("clipboard_kinds", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+
+        let before = counts(&editor);
+        editor.state.select(Some(Selection::Domain(0)));
+        let domain = editor.state.config().domain[0].clone();
+        editor.copy_selection();
+        editor.paste();
+        assert_eq!(grown(before, counts(&editor)), Some("domain"));
+        assert_eq!(editor.state.selection(), Some(Selection::Domain(1)));
+        assert_eq!(editor.state.config().domain[1], domain);
+
+        let before = counts(&editor);
+        editor.state.select(Some(Selection::Keepout(1)));
+        let keepout = editor.state.config().keepout[1].clone();
+        editor.copy_selection();
+        editor.paste();
+        assert_eq!(grown(before, counts(&editor)), Some("keepout"));
+        assert_eq!(editor.state.selection(), Some(Selection::Keepout(2)));
+        assert_eq!(editor.state.config().keepout[2], keepout);
+
+        let before = counts(&editor);
+        editor.state.select(Some(Selection::Keepin(0)));
+        let keepin = editor.state.config().keepin[0].clone();
+        editor.copy_selection();
+        editor.paste();
+        assert_eq!(grown(before, counts(&editor)), Some("keepin"));
+        assert_eq!(editor.state.selection(), Some(Selection::Keepin(1)));
+        assert_eq!(editor.state.config().keepin[1], keepin);
+
+        let before = counts(&editor);
+        editor.state.select(Some(Selection::Support(0)));
+        let support = editor.state.config().supports[0].clone();
+        editor.copy_selection();
+        editor.paste();
+        assert_eq!(grown(before, counts(&editor)), Some("supports"));
+        assert_eq!(editor.state.selection(), Some(Selection::Support(1)));
+        assert_eq!(editor.state.config().supports[1], support);
+
+        // A load, which goes back into the case it came from.
+        let before = counts(&editor);
+        editor
+            .state
+            .select(Some(Selection::Load { case: 0, load: 0 }));
+        let load = editor.state.config().loadcases[0].loads[0].clone();
+        editor.copy_selection();
+        editor.paste();
+        assert_eq!(counts(&editor), before, "no shape list grew");
+        assert_eq!(
+            editor.state.selection(),
+            Some(Selection::Load { case: 0, load: 1 })
+        );
+        assert_eq!(editor.state.config().loadcases[0].loads[1], load);
+
+        // And the case itself, loads and all, with the suffix on its name and
+        // nothing else about it touched.
+        editor.state.select(Some(Selection::LoadCase(0)));
+        let case = editor.state.config().loadcases[0].clone();
+        editor.copy_selection();
+        editor.paste();
+        assert_eq!(editor.state.selection(), Some(Selection::LoadCase(1)));
+        let mut expected = case.clone();
+        expected
+            .name
+            .push_str(constants::VIEW_EDIT_PASTE_NAME_SUFFIX);
+        assert_eq!(editor.state.config().loadcases[1], expected);
+        assert_eq!(editor.state.config().loadcases[0], case, "the original");
+    }
+
+    /// A paste is one undo step and a copy is none at all.
+    ///
+    /// The undo takes the whole pasted object and gives back the selection the
+    /// paste was made with, exactly as an add does; the copy before it changed
+    /// nothing, so there is nothing to save and nothing to come back to.
+    #[test]
+    fn a_paste_is_one_undo_step_and_a_copy_is_no_step_at_all() {
+        let (_dir, path) = write_temp("clipboard_undo", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.select(Some(Selection::Keepout(1)));
+
+        editor.copy_selection();
+        assert_eq!(editor.state.undo_depth(), 0, "a copy is not an edit");
+        assert!(!editor.state.is_dirty(), "and there is nothing to save");
+        assert_eq!(editor.state.selection(), Some(Selection::Keepout(1)));
+        assert_eq!(editor.state.config().keepout.len(), 2);
+
+        editor.paste();
+        assert_eq!(editor.state.undo_depth(), 1);
+        assert!(editor.state.is_dirty());
+        assert_eq!(editor.state.config().keepout.len(), 3);
+        assert_eq!(editor.state.selection(), Some(Selection::Keepout(2)));
+
+        editor.undo();
+        assert_eq!(
+            editor.state.config().keepout.len(),
+            2,
+            "one step must take the whole paste"
+        );
+        assert_eq!(
+            editor.state.selection(),
+            Some(Selection::Keepout(1)),
+            "and give back the selection it was made with"
+        );
+        assert!(!editor.state.is_dirty());
+
+        editor.redo();
+        assert_eq!(editor.state.config().keepout.len(), 3);
+        assert_eq!(editor.state.selection(), Some(Selection::Keepout(2)));
+    }
+
+    /// What was copied is data rather than a reference to an object, which is
+    /// what lets it be pasted after the original has been deleted - and after
+    /// the delete has been undone, which renumbers the list underneath it.
+    #[test]
+    fn the_clipboard_outlives_the_object_it_was_copied_from() {
+        let (_dir, path) = write_temp("clipboard_delete", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.select(Some(Selection::Keepout(1)));
+        let keepout = editor.state.config().keepout[1].clone();
+
+        editor.copy_selection();
+        editor.delete_selection();
+        assert_eq!(editor.state.config().keepout.len(), 1);
+
+        editor.paste();
+        assert_eq!(editor.state.config().keepout.len(), 2);
+        assert_eq!(editor.state.config().keepout[1], keepout);
+        assert_eq!(editor.state.selection(), Some(Selection::Keepout(1)));
+
+        // The undo of the delete brings the original back beside the paste of
+        // it; the clipboard is untouched by either and pastes a third.
+        editor.undo();
+        editor.undo();
+        assert_eq!(editor.state.config().keepout.len(), 2);
+        editor.paste();
+        assert_eq!(editor.state.config().keepout.len(), 3);
+        assert_eq!(editor.state.config().keepout[2], keepout);
+    }
+
+    /// A copy with nothing selected and a paste with nothing copied are both
+    /// nothing at all: no object, no undo step, nothing to save, and - because
+    /// neither is an edit - not even a placement in progress is disturbed.
+    #[test]
+    fn a_copy_of_nothing_and_a_paste_of_nothing_change_nothing() {
+        let (_dir, path) = write_temp("clipboard_empty", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let before = counts(&editor);
+        assert_eq!(editor.state.selection(), None);
+
+        editor.copy_selection();
+        assert!(editor.clipboard.is_none());
+        editor.paste();
+        assert_eq!(counts(&editor), before);
+        assert_eq!(editor.state.undo_depth(), 0);
+        assert!(!editor.state.is_dirty());
+        assert_eq!(editor.state.selection(), None);
+
+        // A placement in progress survives the paste that had nothing to paste,
+        // and is taken by the one that has.
+        editor.toggle_placing(NewObject::Keepout(ShapeKind::Tube));
+        editor.paste();
+        assert!(editor.is_placing(), "a paste of nothing is not a change");
+
+        // And survives the other paste that changes nothing: a copied load with
+        // no case the selection gives it to go into. Refused before anything at
+        // all is touched, the mode included.
+        editor
+            .state
+            .select(Some(Selection::Load { case: 0, load: 0 }));
+        editor.copy_selection();
+        editor.state.select(Some(Selection::Keepin(0)));
+        let depth = editor.state.undo_depth();
+        editor.paste();
+        assert!(
+            editor.is_placing(),
+            "a paste that was refused took the mode with it"
+        );
+        assert_eq!(editor.state.undo_depth(), depth);
+        assert_eq!(editor.state.config().loadcases[0].loads.len(), 1);
+
+        editor.state.select(Some(Selection::Keepin(0)));
+        editor.copy_selection();
+        // A copy of nothing does not empty a clipboard that holds something:
+        // the selection went away, the copy did not.
+        editor.state.select(None);
+        editor.copy_selection();
+        assert!(editor.clipboard.is_some());
+
+        editor.paste();
+        assert!(!editor.is_placing(), "a paste is a structural change");
+        assert_eq!(editor.state.config().keepin.len(), 2);
+        assert_eq!(editor.state.selection(), Some(Selection::Keepin(1)));
+    }
+
+    /// A load has no existence outside a load case, so a paste of one goes into
+    /// the case the selection addresses - and nowhere at all when it addresses
+    /// none.
+    ///
+    /// The selection is read at the moment of the paste, which is what makes
+    /// the answer trustworthy: an index remembered from the copy would go on
+    /// naming a position in a list that deletes renumber, and would quietly
+    /// drop the load into whatever had moved into that position since.
+    #[test]
+    fn a_copied_load_is_pasted_into_the_case_the_selection_addresses() {
+        let (_dir, path) = write_temp("clipboard_loads", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.add(NewObject::LoadCase);
+        assert_eq!(editor.state.config().loadcases.len(), 2);
+
+        // A copy leaves the selection on the load, so a paste straight after it
+        // puts the load back into its own case.
+        editor
+            .state
+            .select(Some(Selection::Load { case: 0, load: 0 }));
+        let load = editor.state.config().loadcases[0].loads[0].clone();
+        editor.copy_selection();
+        editor.paste();
+        assert_eq!(editor.state.config().loadcases[0].loads.len(), 2);
+        assert_eq!(editor.state.config().loadcases[0].loads[1], load);
+        assert_eq!(
+            editor.state.selection(),
+            Some(Selection::Load { case: 0, load: 1 })
+        );
+        assert!(editor.state.config().loadcases[1].loads.is_empty());
+
+        // Another case selected is where it goes instead, which is how a load
+        // is copied from one case into another.
+        editor.state.select(Some(Selection::LoadCase(1)));
+        editor.paste();
+        assert_eq!(editor.state.config().loadcases[1].loads, vec![load.clone()]);
+        assert_eq!(
+            editor.state.selection(),
+            Some(Selection::Load { case: 1, load: 0 })
+        );
+        assert_eq!(editor.state.config().loadcases[0].loads.len(), 2);
+
+        // A load selected is the same answer: the case that load is in.
+        editor.paste();
+        assert_eq!(editor.state.config().loadcases[1].loads.len(), 2);
+        assert_eq!(
+            editor.state.selection(),
+            Some(Selection::Load { case: 1, load: 1 })
+        );
+
+        // A delete clears the selection and renumbers the cases: the case that
+        // was 1 is now 0. There is nothing to paste into then, and the load is
+        // emphatically not dropped into the case that has taken the deleted
+        // one's place - no object anywhere, no undo step, nothing selected.
+        editor.state.select(Some(Selection::LoadCase(0)));
+        editor.delete_selection();
+        assert_eq!(editor.state.selection(), None);
+        let remaining = editor.state.config().loadcases.clone();
+        let depth = editor.state.undo_depth();
+        editor.paste();
+        assert_eq!(editor.state.config().loadcases, remaining);
+        assert_eq!(editor.state.undo_depth(), depth);
+        assert_eq!(editor.state.selection(), None);
+
+        // A selection that is not a case is not a place to put a load either.
+        editor.state.select(Some(Selection::Keepout(1)));
+        editor.paste();
+        assert_eq!(editor.state.config().loadcases, remaining);
+        assert_eq!(editor.state.undo_depth(), depth);
+        assert_eq!(editor.state.selection(), Some(Selection::Keepout(1)));
+
+        // And with a case selected again it pastes, into that one.
+        editor.state.select(Some(Selection::LoadCase(0)));
+        editor.paste();
+        assert_eq!(editor.state.config().loadcases.len(), 1);
+        assert_eq!(
+            editor.state.config().loadcases[0].loads.len(),
+            remaining[0].loads.len() + 1
+        );
+        assert_eq!(editor.state.config().loadcases[0].loads.last(), Some(&load));
+    }
+
+    /// The bindings, by every route one press can reach them by.
+    ///
+    /// The winit backend translates `Ctrl+C` and `Ctrl+V` into clipboard events
+    /// and emits no key press for either, so the events are what a real
+    /// keyboard delivers; the key press is what a synthetic frame delivers and
+    /// what a backend that does not translate would; and the window's own note
+    /// is what covers the paste the backend answers out of the platform's
+    /// clipboard and therefore does not always deliver at all. Reading any one
+    /// of them alone is a binding that works somewhere and nowhere else.
+    #[test]
+    fn the_clipboard_shortcuts_arrive_by_every_route_a_press_takes() {
+        let (_dir, path) = write_temp("clipboard_keys", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.select(Some(Selection::Keepin(0)));
+        let keepin = editor.state.config().keepin[0].clone();
+
+        press_command_key(&mut editor, egui::Key::C);
+        press_command_key(&mut editor, egui::Key::V);
+        assert_eq!(editor.state.config().keepin.len(), 2);
+        assert_eq!(editor.state.config().keepin[1], keepin);
+        assert_eq!(editor.state.selection(), Some(Selection::Keepin(1)));
+
+        editor.state.select(Some(Selection::Keepout(1)));
+        let keepout = editor.state.config().keepout[1].clone();
+        send_event(&mut editor, egui::Event::Copy);
+        send_event(
+            &mut editor,
+            egui::Event::Paste("whatever the platform's own clipboard holds".to_string()),
+        );
+        assert_eq!(editor.state.config().keepout.len(), 3);
+        assert_eq!(editor.state.config().keepout[2], keepout);
+        assert_eq!(editor.state.selection(), Some(Selection::Keepout(2)));
+
+        // The window's own note, which is the whole of what arrives when the
+        // platform's clipboard is empty or holds something that is not text.
+        editor.note_paste_key();
+        quiet_frame(&mut editor);
+        assert_eq!(editor.state.config().keepout.len(), 4);
+        assert_eq!(editor.state.config().keepout[3], keepout);
+        assert_eq!(editor.state.selection(), Some(Selection::Keepout(3)));
+
+        // And one press that arrives both ways - the ordinary case, with text
+        // on the platform's clipboard - is still one paste.
+        editor.note_paste_key();
+        send_event(&mut editor, egui::Event::Paste("some text".to_string()));
+        assert_eq!(
+            editor.state.config().keepout.len(),
+            5,
+            "one press pasted twice"
+        );
+
+        // Unmodified they are letters someone is typing.
+        let before = counts(&editor);
+        press_key(&mut editor, egui::Key::C);
+        press_key(&mut editor, egui::Key::V);
+        assert_eq!(counts(&editor), before);
+    }
+
+    /// A press the guards refuse is refused, not saved up.
+    ///
+    /// The window notes the paste press before anything has decided whether it
+    /// may be answered - it cannot know - so the note has to be taken by the
+    /// frame it belongs to whether or not that frame's guards let it do
+    /// anything. Otherwise a `Ctrl+V` typed into a text field, or at a modal,
+    /// lands an object the moment the field is left or the question answered.
+    #[test]
+    fn a_noted_paste_the_guards_refuse_does_not_arrive_later() {
+        let (_dir, path) = write_temp("clipboard_deferred", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.select(Some(Selection::Keepout(1)));
+        editor.copy_selection();
+        let keepouts = editor.state.config().keepout.len();
+
+        // Typed into a text field: nothing then, and nothing on the frame after
+        // the field is left either.
+        editor.note_paste_key();
+        typing_frame(&mut editor);
+        assert_eq!(editor.state.config().keepout.len(), keepouts);
+        quiet_frame(&mut editor);
+        assert_eq!(
+            editor.state.config().keepout.len(),
+            keepouts,
+            "the refused press was saved up"
+        );
+
+        // The same at the unsaved-changes modal, which is the other guard.
+        editor
+            .state
+            .edit(|config| config.optimization.mass_fraction = Some(0.44));
+        assert!(!editor.request_close());
+        editor.note_paste_key();
+        quiet_frame(&mut editor);
+        assert_eq!(editor.state.config().keepout.len(), keepouts);
+        editor.decide(CloseDecision::Cancel);
+        quiet_frame(&mut editor);
+        assert_eq!(
+            editor.state.config().keepout.len(),
+            keepouts,
+            "the refused press was saved up behind the question"
+        );
+
+        // With nothing refusing it, the very same note pastes.
+        editor.note_paste_key();
+        quiet_frame(&mut editor);
+        assert_eq!(editor.state.config().keepout.len(), keepouts + 1);
+    }
+
+    /// A pasted object reaches the file: the document gets its table where the
+    /// configuration got the object, so a save writes it out and reading the
+    /// file back gives the very configuration the session holds.
+    #[test]
+    fn a_pasted_object_is_written_to_the_file() {
+        let (_dir, path) = write_temp("clipboard_save", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+
+        editor.state.select(Some(Selection::Keepout(1)));
+        editor.copy_selection();
+        editor.paste();
+        editor.state.select(Some(Selection::LoadCase(0)));
+        editor.copy_selection();
+        editor.paste();
+        editor.save();
+
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            saved.matches("center = [50.0, 16.0, 16.0]").count(),
+            2,
+            "the pasted keepout is not in the file: {saved}"
+        );
+        assert!(saved.contains("\"tip-copy\""), "{saved}");
+        assert!(
+            saved.contains("# keep this comment"),
+            "a paste rewrote the file: {saved}"
+        );
+        let reopened = crate::config::Config::parse(&saved).expect("the written file parses");
+        assert_eq!(&reopened, editor.state.config());
     }
 
     #[test]

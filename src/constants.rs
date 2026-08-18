@@ -2166,6 +2166,15 @@ pub const VIEW_EDIT_FALLBACK_EXTENT_MM: f64 = 100.0;
 /// Name prefix of a newly added load case; the case's number is appended.
 pub const VIEW_EDIT_NEW_CASE_PREFIX: &str = "case-";
 
+/// Appended to the name of a pasted load case, which is the one object in the
+/// model carrying a name of its own.
+///
+/// Nothing enforces that the result is unique - two pastes of the same case
+/// produce two cases called the same thing, exactly as two adds produce two
+/// shapes in the same place - because names here are the user's own labels and
+/// a number nobody asked for is not an improvement on one.
+pub const VIEW_EDIT_PASTE_NAME_SUFFIX: &str = "-copy";
+
 /// Extension the editor's file dialogs filter on and give a name that was typed
 /// without one. A growforge 3D configuration is a TOML document.
 pub const VIEW_EDIT_FILE_EXTENSION: &str = "toml";

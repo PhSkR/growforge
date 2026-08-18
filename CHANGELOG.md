@@ -1,5 +1,72 @@
 # Changelog
 
+## 2026-08-17 - 0.42.0 - Copy and paste an object
+
+Building a part out of four of the same bracket meant drawing it four times.
+**`Ctrl+C` copies the selected object and `Ctrl+V` pastes it**, for every kind
+of object the tree addresses.
+
+- **`Ctrl+C` / `Ctrl+V`** on a domain entry, a keepout, a keepin, a support, a
+  load or a whole load case with its loads. The clone lands on the coordinates
+  it was copied from - two objects in one place, told apart in the tree list,
+  the answer two adds already get - and becomes the selection. A pasted load
+  case takes `constants::VIEW_EDIT_PASTE_NAME_SUFFIX` on its name, the one
+  free-text name in the model; nothing is made unique, because names here are
+  the user's own labels.
+- **A copied load goes into the case the selection addresses** - the case
+  itself, or the case a selected load is in - and the selection is read at the
+  moment of the paste rather than remembered from the copy, so it can never name
+  a case that has been deleted or renumbered since. Copying a load leaves it
+  selected, so pasting straight away puts it back into its own case; selecting
+  another case first is how the same load is copied into that one. With nothing
+  that names a case selected there is nowhere to put it, and a paste with
+  nowhere to go is no edit at all rather than half of one - or a guess.
+- **One paste is one undo step**, restoring the selection the paste was made
+  with; a copy is no step at all - nothing edited, nothing to save. The
+  configuration and the document are changed together, as an add does, so a save
+  writes the pasted object out with its own table and the file reads back as the
+  session holds it.
+- **The clipboard holds data, not a selection**: what was copied survives the
+  original being dragged, deleted or undone away, and one copy pastes as many
+  times as it is asked to. Session-scoped: never the platform's clipboard, and
+  gone with the window.
+- Both spellings of the two presses are read. The winit backend translates
+  `Ctrl+C` and `Ctrl+V` into clipboard *events* and emits no key press for
+  either, so reading key presses alone is a binding that works in a test and
+  nowhere else; both are read in the one shortcut block, which is what keeps the
+  modal guard and the text-field guard over them.
+- **The paste press has a third route, because the backend answers `Ctrl+V` out
+  of the *platform's* clipboard**: it delivers nothing at all when there is no
+  text there - an empty clipboard, or one holding a screenshot - and this
+  clipboard holds objects rather than text. So the window notes that press
+  itself (`Editor::note_paste_key`, beside the `F` it already reads) and the
+  shortcut block answers it in the same frame, folded into the one decision:
+  one press is one paste however many ways it arrives. The note is taken
+  *before* either guard can return, so a `Ctrl+V` typed into a text field or
+  aimed at the modal is refused with its own frame rather than landing an object
+  when the field is left or the question answered. Which key that is is decided
+  by the letter the layout produced, falling back to the position on a layout
+  that has no Latin letters - the rule the egui backend uses for the bindings it
+  answers itself.
+- **A paste that will do nothing does nothing at all**, the modes around it
+  included: whether it can happen is resolved before a placement in progress is
+  cancelled, through the very target resolution the paste itself uses, so the
+  one refusable paste cannot cost the user the two clicks they are halfway
+  through. A paste that will happen still cancels it first, as every structural
+  edit does.
+- Tests: every kind copied, pasted, compared against the original and found
+  selected; the undo step and the copy that is not one; a paste after the
+  original is deleted; the empty clipboard, the empty selection and the refused
+  load, none of which disturbs a placement in progress; load targeting into its
+  own case, into another, and refused after a delete has renumbered the list or
+  put the selection on a shape; all three routes a press arrives by, each
+  counter-verified by
+  removing it; a refused note that must not arrive later, counter-verified by
+  taking it after the guards; which key the window takes for a paste, by letter
+  and by position; the file a paste is saved to; and `Ctrl+C` / `Ctrl+V` in the
+  modal guard's own test, which now watches the clipboard as well.
+- Version 0.42.0.
+
 ## 2026-08-13 - 0.41.0 - Show nothing but the part
 
 A finished part is looked at through the model that produced it: the domain

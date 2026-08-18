@@ -2370,10 +2370,27 @@ and one undo brings the removed ones back.
 | scroll wheel             | zoom                                         |
 | `F`                      | fit view                                     |
 | `Delete`                 | delete the selected object                   |
+| `Ctrl+C` / `Ctrl+V`      | copy the selected object / paste it back, on the coordinates it was copied from |
 | `Ctrl+Z` / `Ctrl+Y`      | undo / redo (`Ctrl+Shift+Z` redoes too)      |
 | `Ctrl+S`                 | save                                         |
 | `Ctrl+O`                 | open another configuration in this window    |
 | `Ctrl+N`                 | scaffold a new one and edit that             |
+
+**`Ctrl+C` copies the selected object and `Ctrl+V` pastes it back**, whatever it
+is: a domain entry with its own boolean operation, a keepout, a keepin, a
+support, a load, or a whole load case with every load inside it. The clone lands
+on the coordinates it was copied from rather than beside them - two objects in
+one place, told apart in the tree list, exactly as two adds are - and it is what
+is selected afterwards; a pasted load case has `-copy` on its name, because it is
+the one object here carrying a name. A copied load goes into the load case the
+selection addresses: copying one leaves it selected, so pasting straight away
+puts it back into its own case, and selecting another case first is how the same
+load is copied into that one. With nothing that names a case selected there is
+nowhere to put it, and the paste does nothing at all rather than guessing a case
+for it. One paste is one undo step. The clipboard holds the object's own data rather than a
+reference to it, so what was copied can be pasted after the original has been
+deleted, and one copy pastes as many times as you ask; it is the session's own -
+it is not the platform's clipboard, and it goes when the window does.
 
 **The object under the pointer gets a thin outline** before you click it, which
 is how overlapping objects are told apart: a load region sitting inside a keepin

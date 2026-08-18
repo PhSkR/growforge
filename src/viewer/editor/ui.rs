@@ -2975,7 +2975,7 @@ fn summary(ui: &mut egui::Ui, state: &EditorState) {
 /// implements the bindings, so a binding is listed here only because somebody
 /// listed it. Kept as data rather than as a run of calls so that a test can at
 /// least ask whether a line is here at all.
-const CONTROLS: [&str; 15] = [
+const CONTROLS: [&str; 16] = [
     "left click    select",
     "left drag     orbit",
     "drag handle   move or resize (snapped)",
@@ -2987,6 +2987,7 @@ const CONTROLS: [&str; 15] = [
     "scroll        zoom",
     "F             fit view",
     "Delete        delete selection",
+    "Ctrl+C / +V   copy / paste selection",
     "Ctrl+Z / +Y   undo / redo",
     "Ctrl+S        save",
     "Ctrl+O        open another configuration",
@@ -5988,10 +5989,11 @@ mod tests {
     }
 
     /// The legend is hand written, and this is the only thing that notices when
-    /// a binding was added and never listed.
+    /// a binding was added and never listed. The clipboard pair is listed by
+    /// its copy half, which is how the line reading `Ctrl+C / +V` begins.
     #[test]
-    fn the_control_legend_lists_the_file_shortcuts() {
-        for binding in ["Ctrl+S", "Ctrl+O", "Ctrl+N"] {
+    fn the_control_legend_lists_the_keyboard_shortcuts() {
+        for binding in ["Ctrl+S", "Ctrl+O", "Ctrl+N", "Ctrl+Z", "Ctrl+C"] {
             assert!(
                 CONTROLS.iter().any(|line| line.starts_with(binding)),
                 "the legend does not list {binding}: {CONTROLS:?}"

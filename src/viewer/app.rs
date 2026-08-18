@@ -89,6 +89,33 @@ fn aspect_of(width: u32, height: u32) -> f64 {
     }
 }
 
+/// True while the shortcut modifier is held: the control key everywhere but
+/// macOS, where the same shortcuts are spelled with the command key. Which is
+/// what egui itself calls `command`, and these are its bindings.
+fn command_held(modifiers: &ModifiersState) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.super_key()
+    } else {
+        modifiers.control_key()
+    }
+}
+
+/// True when this press is the `V` of a paste: the letter the layout produced,
+/// or - when it produced no Latin letter at all - the position that letter is
+/// in on a Latin layout.
+///
+/// Both, in that order, which is how the egui backend decides the same question
+/// for the bindings it answers itself: a Dvorak layout reaches the paste by the
+/// key that types a `v` rather than by the one a US layout puts it on, and a
+/// layout with no Latin letters at all - Cyrillic, Greek - reaches it by
+/// position, because there is no letter there to match.
+fn is_paste_chord(logical: &winit::keyboard::Key, physical: PhysicalKey) -> bool {
+    match logical {
+        winit::keyboard::Key::Character(text) if text.is_ascii() => text.eq_ignore_ascii_case("v"),
+        _ => physical == PhysicalKey::Code(KeyCode::KeyV),
+    }
+}
+
 /// Physical pixels left for the 3D view once an egui panel `panel_points` wide
 /// has taken its share of a surface `surface_width` pixels wide.
 fn scene_width_for(surface_width: u32, pixels_per_point: f32, panel_points: f32) -> u32 {
@@ -745,6 +772,26 @@ impl<'a> ViewerApp<'a> {
                     editor.set_snap_bypass(self.modifiers.alt_key());
                 }
             }
+            // The paste press, which is nobody's gesture either - and the one
+            // binding that cannot be left to egui: the backend answers it out
+            // of the *platform's* clipboard and passes nothing on at all when
+            // there is no text there to paste. The editor's clipboard holds
+            // objects rather than text, so the press is noted here and answered
+            // by [`Editor::shortcuts`], under the guards every binding is under
+            // and folded into the one decision - see [`Editor::note_paste_key`].
+            // Noted before `consumed` and before the editing suspension, for the
+            // reason the modifiers are: neither is this binding's business, and
+            // both are answered where every other binding answers them.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && command_held(&self.modifiers)
+                    && is_paste_chord(&event.logical_key, event.physical_key) =>
+            {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.note_paste_key();
+                }
+            }
             _ => {}
         }
         let consumed = match (self.egui_state.as_mut(), self.window.as_ref()) {
@@ -1390,6 +1437,48 @@ mod tests {
     /// them, so the conversions have to come out the same at all of them - this
     /// is what says so, rather than an argument that they do.
     const SCALES: [f32; 3] = [1.0, 1.25, 1.5];
+
+    /// Which press the window takes for a paste, which is the one binding it
+    /// has to recognise itself: see [`ViewerApp::on_window_event`]. The event
+    /// carrying it cannot be built outside winit - one of its fields is that
+    /// crate's own - so what is pinned here is the decision the branch is
+    /// guarded by, on the two things it reads.
+    #[test]
+    fn the_window_takes_the_paste_press_by_letter_and_falls_back_to_position() {
+        use winit::keyboard::{Key, NamedKey};
+
+        let v = PhysicalKey::Code(KeyCode::KeyV);
+        let letter = |text: &str| Key::Character(text.into());
+
+        // The letter the layout produced decides, upper case or lower.
+        assert!(is_paste_chord(&letter("v"), v));
+        assert!(is_paste_chord(&letter("V"), v));
+        // A layout that puts another letter on that position is answered by its
+        // letter, not by the position: on Dvorak the paste is elsewhere.
+        assert!(!is_paste_chord(&letter("."), v));
+        assert!(is_paste_chord(
+            &letter("v"),
+            PhysicalKey::Code(KeyCode::Period)
+        ));
+        // A layout with no Latin letters at all has no letter to match, so the
+        // position is what is left - which is where the binding is printed.
+        assert!(is_paste_chord(&letter("м"), v));
+        assert!(!is_paste_chord(
+            &letter("м"),
+            PhysicalKey::Code(KeyCode::KeyC)
+        ));
+        // And a named key is never it.
+        assert!(!is_paste_chord(
+            &Key::Named(NamedKey::Enter),
+            PhysicalKey::Code(KeyCode::Enter)
+        ));
+
+        // The modifier it is held under is the one egui calls `command`.
+        assert!(command_held(&ModifiersState::CONTROL) != cfg!(target_os = "macos"));
+        assert!(command_held(&ModifiersState::SUPER) == cfg!(target_os = "macos"));
+        assert!(!command_held(&ModifiersState::empty()));
+        assert!(!command_held(&ModifiersState::SHIFT));
+    }
 
     #[test]
     fn clicking_an_arrow_grabs_that_handle_rather_than_changing_the_selection() {
