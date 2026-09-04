@@ -3,3 +3,4 @@
 *_stress.json
 .claude/settings.local.json
 /tools/sweep.log
+.claude/agent-memory/
