@@ -160,6 +160,12 @@ geometry is BLOCKING; a missing item that only changes a comment or a name is AS
 - Loaded design-space nodes pull material - the ordinary SIMP mechanism. Use it on
   purpose (a wall's top strip grows the wall) and never by accident (a load region
   spilling past its collar grows prongs - the rod-bracket lesson).
+- Every keepin lies INSIDE the domain, or is listed a second time as a `[[domain]]`
+  add with the same shape. The exact-boundary export (src/mesh/clamp.rs) seats
+  vertices onto the domain and the keepouts only; a keepin poking outside the domain
+  reads as strayed material, its skin stays voxel-faceted, vertices within a voxel
+  of a domain face get pulled onto it, and an export can die on a collapsed
+  triangle (shampoo holder, 2026-09-04). Mirroring costs no design cells.
 - Keepouts pierce faces: a bore or a hole extends past both faces it cuts so it never
   stops short. Bolt heads get a boss keepin, a clearance-hole keepout and an
   access-shaft keepout so the optimizer can never bury the head (Bike_Pedals). Pins are
