@@ -468,6 +468,7 @@ fn an_export_in_two_bodies_reports_its_safety_factor_with_a_warning() {
         &problem,
         &mut densities,
         growforge::stress::StressLimits::default(),
+        None,
         &growforge::Unwatched,
     )
     .expect("the pipeline")
@@ -3236,6 +3237,7 @@ fn a_wall_that_came_out_short_of_the_floor_is_exported_flush_with_it() {
         &flushed,
         &mut flushed_field,
         StressLimits::default(),
+        None,
         &Unwatched,
     )
     .expect("the flushed pipeline")
@@ -3245,6 +3247,7 @@ fn a_wall_that_came_out_short_of_the_floor_is_exported_flush_with_it() {
         &plain,
         &mut plain_field,
         StressLimits::default(),
+        None,
         &Unwatched,
     )
     .expect("the plain pipeline")

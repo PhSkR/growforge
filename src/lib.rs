@@ -40,7 +40,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::config::{BoundaryFidelity, Config};
-use crate::engine::DensityField;
+use crate::engine::{DensityField, ReduceSummary};
 use crate::fea::CancelProbe;
 use crate::flush::FlushReport;
 use crate::mesh::clamp::ClampReport;
@@ -214,13 +214,20 @@ pub fn analyse(problem: &Problem, densities: &mut [f64]) -> Result<Analysis> {
         problem,
         densities,
         StressLimits::default(),
+        // A field handed in on its own, with no run behind it to have removed
+        // material in stages; [`analyse_with`] is where a caller that has one
+        // passes its record.
+        None,
         CancelProbe::NONE,
     )?
     .expect("an unwatched analysis is never cancelled"))
 }
 
-/// [`analyse`] with an explicit budget for the stress solve, and a probe that
-/// may call the stress solve off.
+/// [`analyse`] with an explicit budget for the stress solve, a probe that may
+/// call the stress solve off, and the reduction schedule the field came out of.
+///
+/// `reduce` is what puts the schedule's stage records in the JSON report; a field
+/// that came from a run without an `[optimization.reduce]` table has none.
 ///
 /// `Ok(None)` means the probe did: nothing is written, and the caller is
 /// expected to unwind rather than export.
@@ -228,12 +235,13 @@ pub fn analyse_with(
     problem: &Problem,
     densities: &mut [f64],
     limits: StressLimits,
+    reduce: Option<&ReduceSummary>,
     cancel: CancelProbe<'_>,
 ) -> Result<Option<Analysis>> {
     let Some(analysis) = analysed(problem, densities, limits, cancel)? else {
         return Ok(None);
     };
-    write_stress_json(problem, &analysis)?;
+    write_stress_json(problem, &analysis, reduce)?;
     Ok(Some(analysis))
 }
 
@@ -275,11 +283,15 @@ fn analysed(
 ///
 /// A file the run leaves behind, so a caller that can be stopped calls it past
 /// the last boundary a stop is honoured at and never before one.
-fn write_stress_json(problem: &Problem, analysis: &Analysis) -> Result<()> {
+fn write_stress_json(
+    problem: &Problem,
+    analysis: &Analysis,
+    reduce: Option<&ReduceSummary>,
+) -> Result<()> {
     if let Some(report) = analysis.stress.report()
         && let Some(path) = &problem.output.stress_json
     {
-        stress::write_json(path, problem, report)?;
+        stress::write_json(path, problem, report, reduce)?;
     }
     Ok(())
 }
@@ -380,12 +392,18 @@ pub struct Completed {
 /// unloaded - it is there to be printable, not to carry anything - so trimming
 /// after it would remove exactly what it just added. See [`crate::reinforce`].
 ///
+/// `reduce` is the finished reduction schedule of the run that produced this
+/// field, when there was one: it is written into the JSON report beside the
+/// stress table, and it is the field's own record rather than anything this
+/// function derives.
+///
 /// `Ok(None)` is [`Stages::stopped`] answering yes at one of the boundaries:
 /// nothing was written, and the caller is expected to unwind rather than export.
 pub fn complete(
     problem: &Problem,
     densities: &mut [f64],
     limits: StressLimits,
+    reduce: Option<&ReduceSummary>,
     stages: &dyn Stages,
 ) -> Result<Option<Completed>> {
     if stages.stopped() {
@@ -433,7 +451,7 @@ pub fn complete(
     if stages.stopped() {
         return Ok(None);
     }
-    write_stress_json(problem, &analysis)?;
+    write_stress_json(problem, &analysis, reduce)?;
     let analysis_s = start.elapsed().as_secs_f64();
 
     stages.exporting();
@@ -490,6 +508,7 @@ pub fn optimize_and_export(problem: &Problem, reporter: &dyn Reporter) -> Result
         problem,
         &mut field.densities,
         StressLimits::default(),
+        field.reduce.as_ref(),
         &Unwatched,
     )?
     .expect("an unwatched pipeline is never stopped");
@@ -765,6 +784,7 @@ type = "gravity"
                 tolerance: 1e-12,
                 max_iterations: 1,
             },
+            None,
             CancelProbe::NONE,
         )
         .expect("the analysis itself must still succeed")
@@ -928,6 +948,7 @@ vector = [0.0, 0.0, -40.0]
             &untrimmed_problem,
             &mut untrimmed_field,
             StressLimits::default(),
+            None,
             &Unwatched,
         )
         .expect("the untrimmed pipeline")
@@ -943,9 +964,15 @@ vector = [0.0, 0.0, -40.0]
         std::fs::remove_file(&json).ok();
         problem.output.stress_json = Some(json.clone());
         let mut field = densities.clone();
-        let trimmed = complete(&problem, &mut field, StressLimits::default(), &Unwatched)
-            .expect("the trimmed pipeline")
-            .expect("nothing asked it to stop");
+        let trimmed = complete(
+            &problem,
+            &mut field,
+            StressLimits::default(),
+            None,
+            &Unwatched,
+        )
+        .expect("the trimmed pipeline")
+        .expect("nothing asked it to stop");
 
         let report = trimmed.trim.as_ref().expect("a trim report");
         assert_eq!(report.ending, trim::TrimEnding::Removed, "{report:?}");
@@ -1018,9 +1045,15 @@ vector = [0.0, 0.0, -40.0]
         let (mut problem, densities, _) = spurred("trim_refused");
         problem.output.trim_stress_fraction = 0.99;
         let mut field = densities.clone();
-        let refused = complete(&problem, &mut field, StressLimits::default(), &Unwatched)
-            .expect("the pipeline")
-            .expect("nothing asked it to stop");
+        let refused = complete(
+            &problem,
+            &mut field,
+            StressLimits::default(),
+            None,
+            &Unwatched,
+        )
+        .expect("the pipeline")
+        .expect("nothing asked it to stop");
 
         let report = refused.trim.as_ref().expect("a trim report");
         let trim::TrimEnding::Refused { first, second } = &report.ending else {
@@ -1042,7 +1075,7 @@ vector = [0.0, 0.0, -40.0]
         let (mut off, densities, _) = spurred("trim_refused_off");
         off.output.trim = crate::config::TrimPolicy::Off;
         let mut field = densities;
-        let plain = complete(&off, &mut field, StressLimits::default(), &Unwatched)
+        let plain = complete(&off, &mut field, StressLimits::default(), None, &Unwatched)
             .expect("the pipeline")
             .expect("nothing asked it to stop");
         assert!(plain.trim.is_none());
@@ -1074,7 +1107,7 @@ vector = [0.0, 0.0, -40.0]
             problem.output.reinforce = reinforce;
             let mut field = densities.clone();
             let stages = Scripted::default();
-            let completed = complete(&problem, &mut field, StressLimits::default(), &stages)
+            let completed = complete(&problem, &mut field, StressLimits::default(), None, &stages)
                 .expect("the pipeline")
                 .expect("nothing asked it to stop");
             std::fs::remove_file(&problem.output.stl_path).ok();
@@ -1320,7 +1353,7 @@ vector = [0.0, 0.0, -10.0]
         // The mirror: nothing stops it, and it writes both files.
         let watched = Scripted::default();
         let mut field = densities.clone();
-        let completed = complete(&problem, &mut field, limits, &watched)
+        let completed = complete(&problem, &mut field, limits, None, &watched)
             .expect("the pipeline")
             .expect("nothing asked it to stop");
         assert!(completed.stress.is_available());
@@ -1343,7 +1376,7 @@ vector = [0.0, 0.0, -10.0]
         };
         let mut field = densities;
         let outcome =
-            complete(&problem, &mut field, limits, &stopped).expect("a stop is not an error");
+            complete(&problem, &mut field, limits, None, &stopped).expect("a stop is not an error");
         assert!(outcome.is_none(), "a stopped pipeline has no result");
         let (asked, analysing, exporting) = stopped.counts();
         assert_eq!(
@@ -1377,6 +1410,7 @@ vector = [0.0, 0.0, -10.0]
             &problem,
             &mut field.densities,
             stress::StressLimits::default(),
+            None,
             CancelProbe::watching(&stop),
         )
         .expect("a stop is not an error");

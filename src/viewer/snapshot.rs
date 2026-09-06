@@ -466,6 +466,7 @@ mod tests {
             cg_iterations: vec![10],
             elapsed_s: iteration as f64,
             growth: None,
+            reduce: None,
         }
     }
 

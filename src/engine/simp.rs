@@ -234,6 +234,7 @@ impl Engine for SimpEngine {
                 cg_iterations: value.cg_iterations,
                 elapsed_s: start.elapsed().as_secs_f64(),
                 growth: None,
+                reduce: None,
             };
             reporter.iteration(&stats);
             // `work.printed` holds the physical densities of the trial design
@@ -305,8 +306,9 @@ impl Engine for SimpEngine {
                 params.max_iterations
             )),
             // Both of these announced themselves where they happened, with the
-            // iteration they happened on.
-            StopReason::Converged | StopReason::Stalled => {}
+            // iteration they happened on, and a schedule that ran out of stages
+            // says what it exported in its own summary.
+            StopReason::Converged | StopReason::Stalled | StopReason::ReduceComplete => {}
         }
 
         // A run that ended inside the hold window ended on a design the optimizer
@@ -354,6 +356,7 @@ impl Engine for SimpEngine {
             stop,
             overhang_residual,
             growth: None,
+            reduce: None,
         })
     }
 }

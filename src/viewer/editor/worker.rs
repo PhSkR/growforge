@@ -813,7 +813,10 @@ fn export_retained(
     // same thing twice rather than compounding.
     let mut densities = retained.densities().to_vec();
     let stop = || cancel.load(Ordering::Relaxed);
-    match crate::viewer::finish(problem, &mut densities, link, &stop) {
+    // A kept design is a field and the problem it belongs to; the run's
+    // stage records are not part of what is retained, so an export of it
+    // carries the stress report alone.
+    match crate::viewer::finish(problem, &mut densities, None, link, &stop) {
         Ok(Some(finished)) => {
             // Recorded exactly where a full run records it, so the editor's own
             // output stays its own however it was written.

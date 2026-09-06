@@ -413,6 +413,8 @@ impl Progress<'_> {
                 segments: skeleton.segment_count(),
                 attractors_remaining: remaining,
             }),
+            // A SIMP schedule; the growth engine rejects the table outright.
+            reduce: None,
         };
         self.reporter.iteration(&stats);
         self.reporter.densities(&stats, &densities);
@@ -988,6 +990,7 @@ impl Engine for GrowthEngine {
                     exact_on_the_voxel_lattice: symmetry.maps_cell_centres(grid),
                 }),
             }),
+            reduce: None,
         })
     }
 }

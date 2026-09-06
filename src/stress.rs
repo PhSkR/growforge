@@ -24,6 +24,7 @@ use anyhow::{Context, Result, anyhow};
 use rayon::prelude::*;
 
 use crate::constants;
+use crate::engine::ReduceSummary;
 use crate::fea::{
     self, CancelProbe, LinearSolver, SolveLimits, StiffnessOperator, element_stress,
     hex8_centroid_stress, hex8_stiffness, von_mises,
@@ -538,7 +539,12 @@ pub fn analyse_with_solver(
 }
 
 /// Serialize the report as JSON. Stresses are in MPa throughout.
-pub fn to_json(problem: &Problem, report: &StressReport) -> String {
+///
+/// `reduce` is the finished schedule of an `[optimization.reduce]` run, and is
+/// what puts the `reduce` object in the file: the target it was held to and the
+/// record of every stage it ran. A run without the table has none, and its report
+/// is byte for byte the one it always was.
+pub fn to_json(problem: &Problem, report: &StressReport, reduce: Option<&ReduceSummary>) -> String {
     let mut out = String::new();
     out.push_str("{\n");
     out.push_str(&format!(
@@ -573,6 +579,12 @@ pub fn to_json(problem: &Problem, report: &StressReport) -> String {
         "  \"top_fraction\": {},\n",
         json::number(constants::STRESS_TOP_FRACTION)
     ));
+    // Ahead of the load cases because that array closes the object: everything
+    // before it already ends in a comma, so a report without a schedule is the
+    // file it always was, to the byte.
+    if let Some(reduce) = reduce {
+        out.push_str(&reduce_json(reduce));
+    }
     out.push_str("  \"loadcases\": [\n");
     for (index, case) in report.cases.iter().enumerate() {
         out.push_str("    {\n");
@@ -603,15 +615,66 @@ pub fn to_json(problem: &Problem, report: &StressReport) -> String {
     out
 }
 
+/// The `reduce` object: what the schedule was held to, which stage shipped, and
+/// one record per stage in the order they ran.
+fn reduce_json(reduce: &ReduceSummary) -> String {
+    let mut out = String::new();
+    out.push_str("  \"reduce\": {\n");
+    out.push_str(&format!(
+        "    \"method\": {},\n",
+        json::string(reduce.method.label())
+    ));
+    out.push_str(&format!(
+        "    \"target_safety_factor\": {},\n",
+        json::number(reduce.target_safety_factor)
+    ));
+    out.push_str(&format!(
+        "    \"exported_stage\": {},\n",
+        reduce.exported.index
+    ));
+    out.push_str("    \"stages\": [\n");
+    for (position, stage) in reduce.stages.iter().enumerate() {
+        out.push_str("      {\n");
+        out.push_str(&format!("        \"index\": {},\n", stage.index));
+        out.push_str(&format!(
+            "        \"target_fraction\": {},\n",
+            json::number(stage.target_fraction)
+        ));
+        out.push_str(&format!(
+            "        \"achieved_fraction\": {},\n",
+            json::number(stage.achieved_fraction)
+        ));
+        out.push_str(&format!("        \"iterations\": {},\n", stage.iterations));
+        out.push_str(&format!(
+            "        \"safety_factor\": {},\n",
+            json::optional_number(stage.safety_factor)
+        ));
+        out.push_str(&format!("        \"passed\": {},\n", stage.passed));
+        out.push_str(&format!("        \"refine\": {}\n", stage.refine));
+        out.push_str(if position + 1 == reduce.stages.len() {
+            "      }\n"
+        } else {
+            "      },\n"
+        });
+    }
+    out.push_str("    ]\n  },\n");
+    out
+}
+
 /// Write the JSON report to `path`, creating the parent directory if needed.
-pub fn write_json(path: &Path, problem: &Problem, report: &StressReport) -> Result<()> {
+pub fn write_json(
+    path: &Path,
+    problem: &Problem,
+    report: &StressReport,
+    reduce: Option<&ReduceSummary>,
+) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating the directory {}", parent.display()))?;
     }
-    fs::write(path, to_json(problem, report))
+    fs::write(path, to_json(problem, report, reduce))
         .with_context(|| format!("writing the stress report to {}", path.display()))
 }
 
@@ -924,7 +987,7 @@ vector = [1000.0, 0.0, 0.0]
         let report = analyse(&problem, &densities).expect("analyse");
         assert!(report.cases[0].safety_factor.is_none());
         assert_eq!(report.worst_safety_factor(), None);
-        assert!(to_json(&problem, &report).contains("\"safety_factor\": null"));
+        assert!(to_json(&problem, &report, None).contains("\"safety_factor\": null"));
     }
 
     #[test]
@@ -954,7 +1017,7 @@ vector = [1000.0, 0.0, 0.0]
         let problem = bar();
         let densities = vec![1.0; problem.grid.n_cells()];
         let report = analyse(&problem, &densities).expect("analyse");
-        let text = to_json(&problem, &report);
+        let text = to_json(&problem, &report, None);
         assert!(text.contains("\"project\": \"bar\""));
         assert!(text.contains("\"name\": \"pull\""));
         assert!(text.contains("\"max_von_mises_mpa\""));
@@ -967,6 +1030,69 @@ vector = [1000.0, 0.0, 0.0]
         );
         assert_eq!(text.matches('[').count(), text.matches(']').count());
         assert!(!text.contains(",\n  ]"), "trailing comma in {text}");
+    }
+
+    #[test]
+    fn a_reduction_schedule_adds_one_object_and_leaves_the_rest_of_the_report_alone() {
+        use crate::config::ReduceMethod;
+        use crate::engine::ReduceStage;
+
+        let problem = bar();
+        let densities = vec![1.0; problem.grid.n_cells()];
+        let report = analyse(&problem, &densities).expect("analyse");
+        let plain = to_json(&problem, &report, None);
+        assert!(!plain.contains("reduce"), "{plain}");
+
+        let start = ReduceStage {
+            index: 1,
+            target_fraction: 1.0,
+            achieved_fraction: 1.0,
+            iterations: 60,
+            safety_factor: Some(9.4),
+            passed: true,
+            refine: false,
+        };
+        // A stage the load path gate failed: no factor was measured for it, and
+        // the report says null rather than a zero that reads as a measurement.
+        let broken = ReduceStage {
+            index: 2,
+            target_fraction: 0.8,
+            achieved_fraction: 0.802,
+            safety_factor: None,
+            passed: false,
+            refine: true,
+            ..start
+        };
+        let summary = ReduceSummary {
+            method: ReduceMethod::Beso,
+            target_safety_factor: 5.0,
+            exported: start,
+            stages: vec![start, broken],
+        };
+        let text = to_json(&problem, &report, Some(&summary));
+        // Take the schedule's object back out and the file is the one a run
+        // without the table writes, to the byte.
+        let block = reduce_json(&summary);
+        assert_eq!(text.replace(&block, ""), plain);
+        for expected in [
+            "\"method\": \"beso\"",
+            "\"target_safety_factor\": 5",
+            "\"exported_stage\": 1",
+            "\"index\": 2",
+            "\"achieved_fraction\": 0.802",
+            "\"safety_factor\": null",
+            "\"passed\": false",
+            "\"refine\": true",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from {text}");
+        }
+        assert_eq!(
+            text.matches('{').count(),
+            text.matches('}').count(),
+            "unbalanced braces in {text}"
+        );
+        assert_eq!(text.matches('[').count(), text.matches(']').count());
+        assert!(!text.contains(",\n    ]"), "trailing comma in {text}");
     }
 
     /// A structure with enough elements for the recovery to have something to

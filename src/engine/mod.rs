@@ -29,7 +29,7 @@ pub mod wireframe;
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 
-use crate::config::SymmetryParams;
+use crate::config::{ReduceMethod, SymmetryParams};
 use crate::constants;
 use crate::grid::{CellKind, Grid};
 use crate::problem::Problem;
@@ -102,18 +102,22 @@ pub struct DensityField {
     pub overhang_residual: Option<OverhangResidual>,
     /// What the growth engine grew, or `None` when another engine ran.
     pub growth: Option<GrowthSummary>,
+    /// What an `[optimization.reduce]` schedule removed, or `None` when the run
+    /// had no such table.
+    pub reduce: Option<ReduceSummary>,
 }
 
 /// Why an engine stopped iterating.
 ///
-/// Three of the four are outcomes a finished run reports, and all three are
-/// finished runs: a stalled run and a capped run export, are stress analysed and
-/// exit zero exactly as a converged one does. What separates them is what the
-/// design *is* - an answer, an iterate the problem will not improve on, or the
-/// iterate the budget happened to end on - and saying which is the whole point
-/// of reporting them apart.
+/// Four of the five are outcomes a finished run reports, and all four are
+/// finished runs: a stalled run, a capped run and a run that reached the end of
+/// its reduction schedule export, are stress analysed and exit zero exactly as a
+/// converged one does. What separates them is what the design *is* - an answer,
+/// an iterate the problem will not improve on, the iterate the budget happened
+/// to end on, or the stage a reduction schedule kept - and saying which is the
+/// whole point of reporting them apart.
 ///
-/// The fourth is not an outcome at all: it is the caller taking the run back.
+/// The fifth is not an outcome at all: it is the caller taking the run back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     /// The design settled: the largest design variable change fell below
@@ -135,13 +139,26 @@ pub enum StopReason {
     /// the editor's stop button and its auto-regrow can produce it; nothing is
     /// exported from a run that ends this way.
     Cancelled,
+    /// An `[optimization.reduce]` schedule ran out of stages: the design is the
+    /// one the schedule kept - the lightest stage that held the target safety
+    /// factor, or the fraction the run started from when no stage did. Which of
+    /// the two it was, and at what safety factor, is [`ReduceSummary`]'s to say.
+    ReduceComplete,
 }
 
 impl StopReason {
     /// True when the run reached a design it had stopped moving, rather than one
     /// of the three ways of stopping short of that.
+    ///
+    /// A finished reduction schedule counts: every stage of it ends on the same
+    /// convergence test a plain run ends on, so the design that comes back is one
+    /// that settled. Whether it *held* the safety factor it was aiming at is a
+    /// different question, and [`ReduceSummary`] is where that one is answered.
     pub fn converged(self) -> bool {
-        self == StopReason::Converged
+        match self {
+            StopReason::Converged | StopReason::ReduceComplete => true,
+            StopReason::Stalled | StopReason::IterationCap | StopReason::Cancelled => false,
+        }
     }
 
     /// Short label used in the run summary and the viewer panel.
@@ -151,6 +168,7 @@ impl StopReason {
             StopReason::Stalled => "stalled",
             StopReason::IterationCap => "iteration cap",
             StopReason::Cancelled => "stopped",
+            StopReason::ReduceComplete => "reduce complete",
         }
     }
 }
@@ -210,6 +228,67 @@ pub struct GrowthSymmetry {
     /// [`crate::engine::growth::symmetry::Symmetry::maps_cell_centres`] for
     /// which transforms qualify and what the others cost.
     pub exact_on_the_voxel_lattice: bool,
+}
+
+/// What a finished `[optimization.reduce]` run took away, stage by stage.
+///
+/// The reduction schedule's counterpart of [`GrowthSummary`]: every volume target
+/// the run asked for, what the design came back at, whether it still held the
+/// target safety factor, and which of those stages is the design in the file.
+/// `None` on every run without an `[optimization.reduce]` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReduceSummary {
+    /// How material was taken away, as `[optimization.reduce] method` named it.
+    pub method: ReduceMethod,
+    /// Safety factor the schedule was asked to hold, `target_safety_factor`.
+    pub target_safety_factor: f64,
+    /// The stage whose design was exported: the lightest one that held the
+    /// target, or the fraction the run started from when none did.
+    ///
+    /// A copy of its entry in [`ReduceSummary::stages`] rather than a second
+    /// reading of the design - the exported fraction and safety factor are the
+    /// stage's own - so a reader that only wants to know what shipped needs the
+    /// record and not the schedule.
+    pub exported: ReduceStage,
+    /// One record per stage the schedule ran, in the order it ran them.
+    pub stages: Vec<ReduceStage>,
+}
+
+impl ReduceSummary {
+    /// True when the exported design does not hold the target safety factor.
+    ///
+    /// The one way that happens: no stage held it, not even the fraction the run
+    /// started from, so what shipped is that starting design and the run has to
+    /// say so rather than let a lighter-is-better summary read as a pass.
+    pub fn missed_the_target(&self) -> bool {
+        !self.exported.passed
+    }
+}
+
+/// One stage of a reduction schedule: the volume target it was given, what it
+/// converged to, and whether that design still held the target safety factor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReduceStage {
+    /// One-based stage number, the number the console and the report print.
+    /// Stages are recorded in the order they ran, so it is also this record's
+    /// position in [`ReduceSummary::stages`] plus one.
+    pub index: usize,
+    /// Volume fraction the stage was asked for.
+    pub target_fraction: f64,
+    /// Mean physical density over the design cells the stage converged to.
+    pub achieved_fraction: f64,
+    /// Iterations the stage spent reaching it.
+    pub iterations: usize,
+    /// Yield strength over the peak von Mises stress of the stage's design.
+    /// `None` when no stress was solved for it - a stage whose load paths are
+    /// broken is failed on the geometry alone, which costs no solve.
+    pub safety_factor: Option<f64>,
+    /// True when the stage held the target safety factor.
+    pub passed: bool,
+    /// True when the stage is one of the `refine_stages` bisections between the
+    /// last target that held and the first that did not, rather than a step of
+    /// the `ratio` schedule.
+    pub refine: bool,
 }
 
 /// `|printed - blueprint|` over the design cells of a finished design.
@@ -316,6 +395,51 @@ mod tests {
                 constants::SOLID_ENGINE
             ]
         );
+    }
+
+    #[test]
+    fn every_stop_reason_is_labelled_and_says_whether_it_settled() {
+        let labelled = [
+            (StopReason::Converged, "converged", true),
+            (StopReason::Stalled, "stalled", false),
+            (StopReason::IterationCap, "iteration cap", false),
+            (StopReason::Cancelled, "stopped", false),
+            (StopReason::ReduceComplete, "reduce complete", true),
+        ];
+        for (reason, label, converged) in labelled {
+            assert_eq!(reason.label(), label);
+            assert_eq!(reason.converged(), converged, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_reduce_summary_reads_its_verdict_off_the_exported_stage() {
+        let stage = |index: usize, fraction: f64, factor: f64, passed: bool| ReduceStage {
+            index,
+            target_fraction: fraction,
+            achieved_fraction: fraction,
+            iterations: 40,
+            safety_factor: Some(factor),
+            passed,
+            refine: false,
+        };
+        let passing = stage(2, 0.8, 5.3, true);
+        let held = ReduceSummary {
+            method: ReduceMethod::Continuation,
+            target_safety_factor: 5.0,
+            exported: passing,
+            stages: vec![stage(1, 1.0, 7.1, true), passing],
+        };
+        assert!(!held.missed_the_target());
+        // Nothing held, so the design in the file is the one the run started
+        // from and the summary is the warning, whatever the stage list says.
+        let start = stage(1, 1.0, 3.2, false);
+        let missed = ReduceSummary {
+            exported: start,
+            stages: vec![start],
+            ..held
+        };
+        assert!(missed.missed_the_target());
     }
 
     #[test]

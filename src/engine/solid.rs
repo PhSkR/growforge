@@ -80,6 +80,7 @@ impl Engine for SolidEngine {
             stop: StopReason::Converged,
             overhang_residual: None,
             growth: None,
+            reduce: None,
         })
     }
 }

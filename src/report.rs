@@ -9,6 +9,7 @@ use crate::config::{
     IslandPolicy, ReduceMethodParams, SolverBackend, SolverParams, UpdateScheme, VoidPolicy,
 };
 use crate::constants;
+use crate::engine::{ReduceStage, ReduceSummary};
 use crate::flush::FlushReport;
 use crate::mesh::clamp::ClampReport;
 use crate::mesh::islands::{AnchorSet, IslandReport};
@@ -59,6 +60,22 @@ pub struct GrowthProgress {
     pub attractors_remaining: usize,
 }
 
+/// The part of a progress line that only a material reduction run has.
+///
+/// Everything else on the line - the compliance, the fraction, the change - is
+/// the inner loop of one stage of the schedule, which is the ordinary SIMP loop;
+/// this is what says which stage they belong to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReduceProgress {
+    /// One-based number of the stage now running, the number
+    /// [`crate::engine::ReduceStage::index`] carries once it is recorded.
+    pub stage: usize,
+    /// Volume fraction this stage is driving the design to.
+    pub target_fraction: f64,
+    /// Stages that have finished and been recorded before this one.
+    pub completed: usize,
+}
+
 /// One line of optimization progress.
 #[derive(Debug, Clone)]
 pub struct IterationStats {
@@ -90,6 +107,9 @@ pub struct IterationStats {
     /// SIMP engine leaves it `None`, and every consumer keeps its existing
     /// format for such a line.
     pub growth: Option<GrowthProgress>,
+    /// Which stage of an `[optimization.reduce]` schedule this line belongs to,
+    /// or `None` on a run without one - where the line is the one it always was.
+    pub reduce: Option<ReduceProgress>,
 }
 
 /// Sink for engine progress.
@@ -139,6 +159,90 @@ impl ConsoleReporter {
     }
 }
 
+/// The per-iteration line of every engine that has design variables, built as a
+/// string so its format can be read back by a test rather than off a terminal.
+fn iteration_line(stats: &IterationStats) -> String {
+    let cg: Vec<String> = stats.cg_iterations.iter().map(|c| c.to_string()).collect();
+    // The local cap's own column exists only while the cap does, and the stage
+    // prefix only while a reduction schedule does, so a run with neither prints
+    // exactly the line it always did.
+    let local = match stats.worst_local_fraction {
+        Some(worst) => format!("  local {worst:>6.4}"),
+        None => String::new(),
+    };
+    let stage = match stats.reduce {
+        Some(reduce) => format!("stage {:>2}  ", reduce.stage),
+        None => String::new(),
+    };
+    format!(
+        "{stage}iter {:>4}  compliance {:>12.6e}  vol {:>6.4}{local}  change {:>8.5}  cg [{}]  \
+         {:>7.2} s",
+        stats.iteration,
+        stats.compliance,
+        stats.volume_fraction,
+        stats.max_change,
+        cg.join(", "),
+        stats.elapsed_s
+    )
+}
+
+/// What one finished stage of a reduction schedule reports: the target it was
+/// given, the design it came back with, and the verdict on it.
+///
+/// A note rather than a progress line - it is said once, when the stage ends -
+/// so it reaches the console and the editor's panel through the one channel
+/// every other run-time announcement uses.
+pub fn reduce_stage_note(stage: &ReduceStage) -> String {
+    format!(
+        "reduce stage {}{}: target {:.4}, fraction {:.4}, {} iterations, safety factor {}, {}",
+        stage.index,
+        if stage.refine { " (refinement)" } else { "" },
+        stage.target_fraction,
+        stage.achieved_fraction,
+        stage.iterations,
+        safety_factor(stage.safety_factor),
+        if stage.passed { "pass" } else { "fail" }
+    )
+}
+
+/// What the whole schedule reports when it is done: which stage is the design in
+/// the file, and how its safety factor stands against the target.
+///
+/// A schedule that never found a design holding the target exports the fraction
+/// it started from, which is a warning: the part is the one the run was given,
+/// not a lighter one that passed.
+pub fn reduce_summary_note(summary: &ReduceSummary) -> String {
+    let stage = summary.exported;
+    if summary.missed_the_target() {
+        return format!(
+            "warning: [optimization.reduce]: no stage held the target safety factor of {:.2}; \
+             exporting stage {} at fraction {:.4}, safety factor {} - lower \
+             target_safety_factor, or give the design more material or a stiffer material to \
+             hold it with",
+            summary.target_safety_factor,
+            stage.index,
+            stage.achieved_fraction,
+            safety_factor(stage.safety_factor)
+        );
+    }
+    format!(
+        "reduce: exported stage {} at fraction {:.4}, safety factor {} >= {:.2}",
+        stage.index,
+        stage.achieved_fraction,
+        safety_factor(stage.safety_factor),
+        summary.target_safety_factor
+    )
+}
+
+/// A stage's safety factor as the console says it, with the same `n/a` the
+/// stress table uses for a design no yield strength can be measured against.
+fn safety_factor(factor: Option<f64>) -> String {
+    match factor {
+        Some(factor) => format!("{factor:.2}"),
+        None => "n/a".to_string(),
+    }
+}
+
 impl Reporter for ConsoleReporter {
     fn iteration(&self, stats: &IterationStats) {
         if self.quiet {
@@ -156,23 +260,7 @@ impl Reporter for ConsoleReporter {
             );
             return;
         }
-        let cg: Vec<String> = stats.cg_iterations.iter().map(|c| c.to_string()).collect();
-        // The local cap's own column exists only while the cap does, so a run
-        // without one prints exactly the line it always did.
-        let local = match stats.worst_local_fraction {
-            Some(worst) => format!("  local {worst:>6.4}"),
-            None => String::new(),
-        };
-        println!(
-            "iter {:>4}  compliance {:>12.6e}  vol {:>6.4}{local}  change {:>8.5}  cg [{}]  \
-             {:>7.2} s",
-            stats.iteration,
-            stats.compliance,
-            stats.volume_fraction,
-            stats.max_change,
-            cg.join(", "),
-            stats.elapsed_s
-        );
+        println!("{}", iteration_line(stats));
     }
 
     fn note(&self, message: &str) {
@@ -1100,6 +1188,7 @@ mod tests {
             cg_iterations: vec![7],
             elapsed_s: 0.0,
             growth: None,
+            reduce: None,
         }
     }
 
@@ -1121,6 +1210,104 @@ mod tests {
         assert_eq!(GrowthPhase::Backbone.label(), "backbone");
         assert_eq!(GrowthPhase::Branching.label(), "branching");
         assert_eq!(GrowthPhase::Thickening.label(), "thickening");
+    }
+
+    fn sample_stage() -> ReduceStage {
+        ReduceStage {
+            index: 3,
+            target_fraction: 0.512,
+            achieved_fraction: 0.5121,
+            iterations: 84,
+            safety_factor: Some(6.41),
+            passed: true,
+            refine: false,
+        }
+    }
+
+    #[test]
+    fn a_run_without_a_schedule_prints_the_line_it_always_did() {
+        // The pin on the format: a line with neither a local cap nor a stage
+        // keeps every column, and every space between them, byte for byte.
+        let plain = iteration_line(&sample_stats());
+        assert_eq!(
+            plain,
+            "iter    1  compliance   1.000000e0  vol 0.5000  change  0.10000  cg [7]     0.00 s"
+        );
+        let staged = IterationStats {
+            reduce: Some(ReduceProgress {
+                stage: 3,
+                target_fraction: 0.512,
+                completed: 2,
+            }),
+            ..sample_stats()
+        };
+        // The schedule adds a prefix and changes nothing behind it.
+        assert_eq!(iteration_line(&staged), format!("stage  3  {plain}"));
+        ConsoleReporter::new(false).iteration(&staged);
+        ConsoleReporter::new(true).iteration(&staged);
+        SilentReporter.iteration(&staged);
+    }
+
+    #[test]
+    fn a_stage_reports_its_target_its_design_and_its_verdict() {
+        assert_eq!(
+            reduce_stage_note(&sample_stage()),
+            "reduce stage 3: target 0.5120, fraction 0.5121, 84 iterations, safety factor 6.41, \
+             pass"
+        );
+        // A stage the load path gate failed never reached a stress solve, so it
+        // has no factor to quote and says so rather than quoting a zero.
+        let broken = ReduceStage {
+            index: 4,
+            safety_factor: None,
+            passed: false,
+            refine: true,
+            ..sample_stage()
+        };
+        assert_eq!(
+            reduce_stage_note(&broken),
+            "reduce stage 4 (refinement): target 0.5120, fraction 0.5121, 84 iterations, safety \
+             factor n/a, fail"
+        );
+    }
+
+    #[test]
+    fn the_schedule_summary_names_the_exported_stage_and_warns_when_none_held() {
+        let held = ReduceSummary {
+            method: crate::config::ReduceMethod::Continuation,
+            target_safety_factor: 5.0,
+            exported: sample_stage(),
+            stages: vec![sample_stage()],
+        };
+        assert_eq!(
+            reduce_summary_note(&held),
+            "reduce: exported stage 3 at fraction 0.5121, safety factor 6.41 >= 5.00"
+        );
+        let start = ReduceStage {
+            index: 1,
+            target_fraction: 1.0,
+            achieved_fraction: 1.0,
+            safety_factor: Some(3.2),
+            passed: false,
+            ..sample_stage()
+        };
+        let missed = ReduceSummary {
+            exported: start,
+            stages: vec![start],
+            ..held
+        };
+        let note = reduce_summary_note(&missed);
+        assert!(
+            note.starts_with("warning: [optimization.reduce]: "),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "no stage held the target safety factor of 5.00; exporting stage 1 at fraction \
+                 1.0000, safety factor 3.20"
+            ),
+            "{note}"
+        );
     }
 
     #[test]

@@ -227,7 +227,13 @@ pub(crate) fn run_worker(
         clamp,
         analysis_s,
         export_s,
-    }) = finish(problem, &mut field.densities, link, &stop)?
+    }) = finish(
+        problem,
+        &mut field.densities,
+        field.reduce.as_ref(),
+        link,
+        &stop,
+    )?
     else {
         return Ok(None);
     };
@@ -314,6 +320,10 @@ pub(crate) struct Finished {
 /// before the write - which is what keeps "nothing that was asked to stop ever
 /// exports" true of both callers; `Ok(None)` is that answer.
 ///
+/// `reduce` is the run's own record of its material reduction schedule, when it
+/// had one, and travels to the JSON report exactly as it does on the command
+/// line; a design that is exported without the run behind it has none.
+///
 /// The sequence itself is [`crate::complete`]'s, shared with the command line.
 /// What is this function's own is the window: the status line at each stage, the
 /// final frame with its stress layer, the note lines of the field passes, and
@@ -322,6 +332,7 @@ pub(crate) struct Finished {
 pub(crate) fn finish(
     problem: &Problem,
     densities: &mut [f64],
+    reduce: Option<&crate::engine::ReduceSummary>,
     link: &ViewLink,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<Finished>> {
@@ -330,6 +341,7 @@ pub(crate) fn finish(
         problem,
         densities,
         crate::stress::StressLimits::default(),
+        reduce,
         &stages,
     )
     .inspect_err(|error| link.set_status(RunStatus::Failed(format!("{error:#}"))))?;

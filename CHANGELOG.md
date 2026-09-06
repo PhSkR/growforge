@@ -12,6 +12,13 @@
   beside an `update` scheme under `method = "beso"`, and with a `[material]`
   that declares no `yield_strength_mpa` - the safety factor is measured against
   it. Nothing removes material yet; the stage loop is the next change.
+- **What a reduction run will report** is in place ahead of the stage loop that
+  fills it: a `reduce complete` stop reason, a per-stage record (target,
+  fraction, iterations, safety factor, pass, refinement) with the summary of
+  which stage was exported, the stage prefix on the progress line, the stage and
+  summary lines the console says, and a `reduce` object in the stress report
+  JSON. Nothing removes material yet, and a run without the table prints and
+  writes exactly what it did before, to the byte.
 - **Switching to the growth engine** in the editor now takes the four
   `[optimization]` tables that engine refuses with it (`overhang`, `wireframe`,
   `local_volume`, `reduce`), as the switch to `solid` already did.
