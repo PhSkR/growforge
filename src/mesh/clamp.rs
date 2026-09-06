@@ -19,11 +19,18 @@
 //! What fixes it is knowing where the boundary really is, which is what
 //! [`crate::geometry::Boundaries`] carries on the problem. Under the default
 //! `[output] boundaries = "exact"` this pass takes every exported vertex that
-//! violates one - inside a keepout, or outside the domain - and moves it onto
+//! violates one - inside a keepout, or outside the solid - and moves it onto
 //! the analytic surface it violates, plus
 //! [`constants::BOUNDARY_CLAMP_EPS_MM`] on the legal side so a containment test
 //! agrees. Where the part meets a bore, the bore becomes the cylinder that was
 //! asked for.
+//!
+//! **The solid is the domain union the keepins.** A keepin takes precedence over
+//! the domain in the classifier, so a keepin that sticks out of the domain is
+//! material out there and its own outer skin is the surface - not strayed
+//! material to be pulled back to the domain wall. That skin is a seat target
+//! exactly as a keepout's is, which is what makes a ring drawn as a `[[keepin]]`
+//! come out round rather than voxel-faceted.
 //!
 //! **The scatter goes both ways, and so does the correction.** The sampling
 //! above does not put a wall's vertices reliably outside the surface: it puts
@@ -47,7 +54,9 @@
 //!   ellipsoid, which has no closed form (see
 //!   [`crate::geometry::Shape::nearest_surface_point`]). The corrected position
 //!   is then tested again, because overlapping keepouts can hand a vertex to one
-//!   another and because leaving one can leave the domain. At most
+//!   another and because leaving one can leave the solid. A vertex outside the
+//!   solid altogether goes back onto whichever is nearer of the domain's own
+//!   surface and the nearest keepin's skin. At most
 //!   [`constants::BOUNDARY_CLAMP_MAX_PASSES`] rounds.
 //! * **A displacement cap.** The encroachment this exists for is sub-voxel by
 //!   construction, so a vertex that would have to move further than
@@ -139,9 +148,9 @@ impl ClampReport {
     /// than the mesh's:
     ///
     /// * **Drawn.** Under the solid engine the part is the shapes it was drawn
-    ///   from, so every exported surface belongs to a domain or keepout boundary
-    ///   and a vertex resting off one is a defect about to ship: a warning,
-    ///   always.
+    ///   from, so every exported surface belongs to a domain, keepin or keepout
+    ///   boundary and a vertex resting off one is a defect about to ship: a
+    ///   warning, always.
     /// * **Designed, and flushed out to the shapes.** An engine that designs the
     ///   material in between makes free surfaces everywhere, and one running near
     ///   a boundary is not by itself wrong. But a run that asked for
@@ -163,7 +172,8 @@ impl ClampReport {
         let mut notes = Vec::new();
         if self.vertices_moved == 0 {
             notes.push(
-                "every exported vertex was already inside the domain and clear of the keepouts"
+                "every exported vertex was already inside the domain or a keepin and clear of the \
+                 keepouts"
                     .to_string(),
             );
         } else {
@@ -195,8 +205,9 @@ impl ClampReport {
             match (solid, flushing) {
                 (true, _) => notes.push(format!(
                     "warning: {resting} up to {:.4} mm off the surface they belong to: this part \
-                     is the shapes it was drawn from, so every exported surface is a domain or \
-                     keepout surface and one standing off it ships as a face in the wrong place",
+                     is the shapes it was drawn from, so every exported surface is a domain, \
+                     keepin or keepout surface and one standing off it ships as a face in the \
+                     wrong place",
                     self.max_adrift_mm
                 )),
                 (false, true) => notes.push(format!(
@@ -219,7 +230,7 @@ impl ClampReport {
 /// What the clamp decided about one vertex.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Correction {
-    /// Inside the domain and clear of every keepout already.
+    /// Inside the solid and clear of every keepout already.
     Legal,
     /// Illegal, and this is where it belongs.
     Moved(Vec3),
@@ -303,41 +314,78 @@ fn adrift_by(vertex: Vec3, boundaries: &Boundaries, window: f64) -> Option<f64> 
     (distance.is_finite() && distance > seat && distance <= window).then_some(distance)
 }
 
+/// Which analytic surface a vertex was measured against, and with it the side of
+/// that surface the material is on.
+#[derive(Debug, Clone, Copy)]
+enum Surface<'a> {
+    /// The domain as a whole, a composite rather than a member: inside is solid.
+    Domain,
+    /// A keepout member: outside it is solid.
+    Keepout(&'a Shape),
+    /// A keepin member: inside it is solid, wherever it lies relative to the
+    /// domain.
+    Keepin(&'a Shape),
+}
+
+/// Which side of a surface a projection lands on, being the side the material
+/// is: outside a keepout, inside a keepin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Side {
+    Outside,
+    Inside,
+}
+
 /// The analytic boundary `p` is nearest to, whichever side of it `p` sits on: how
-/// far away it is, and which surface it is - a keepout member, or `None` for the
-/// domain as a whole, which is a composite rather than a member.
+/// far away it is, and which surface it is.
+///
+/// Keepouts, then keepins, then the domain, so that a tie is broken the way
+/// classification breaks it - keepout over keepin over domain - and a member is
+/// preferred to the composite it sits against.
 ///
 /// `None` when the caller described no boundary at all, which is a mesh held to
 /// nothing.
-fn nearest_boundary(p: Vec3, boundaries: &Boundaries) -> Option<(f64, Option<&Shape>)> {
-    let mut nearest: Option<(f64, Option<&Shape>)> = None;
-    for shape in boundaries.keepout.shapes() {
-        let distance = shape.signed_distance(p).abs();
+fn nearest_boundary<'a>(p: Vec3, boundaries: &'a Boundaries) -> Option<(f64, Surface<'a>)> {
+    let mut nearest: Option<(f64, Surface<'a>)> = None;
+    let mut consider = |distance: f64, surface: Surface<'a>| {
         if nearest.is_none_or(|(best, _)| distance < best) {
-            nearest = Some((distance, Some(shape)));
+            nearest = Some((distance, surface));
         }
+    };
+    for shape in boundaries.keepout.shapes() {
+        consider(shape.signed_distance(p).abs(), Surface::Keepout(shape));
+    }
+    for shape in boundaries.keepin.shapes() {
+        consider(shape.signed_distance(p).abs(), Surface::Keepin(shape));
     }
     if !boundaries.domain.is_empty() {
-        let distance = boundaries.domain.signed_distance(p).abs();
-        if nearest.is_none_or(|(best, _)| distance < best) {
-            nearest = Some((distance, None));
-        }
+        consider(boundaries.domain.signed_distance(p).abs(), Surface::Domain);
     }
     nearest
 }
 
-/// True when `p` is inside the domain and outside every keepout.
+/// True when `p` is inside the solid the mesh has to stay within: the domain, or
+/// any keepin, which is material by classification even where it leaves the
+/// domain.
 ///
-/// An empty half of `boundaries` constrains nothing: a caller with no keepouts,
-/// or none that carried a domain in, is asking about the other one alone.
+/// A caller that carried no domain in is held to nothing, and keepins do not
+/// change that: they only ever add to the solid, so a position that was inside
+/// it stays inside it however many are declared.
+fn inside_solid(p: Vec3, boundaries: &Boundaries) -> bool {
+    if boundaries.domain.is_empty() {
+        return true;
+    }
+    boundaries.domain.signed_distance(p) <= 0.0 || boundaries.keepin.contains(p)
+}
+
+/// True when `p` is inside the solid and outside every keepout.
+///
+/// An empty part of `boundaries` constrains nothing: a caller with no keepouts,
+/// or none that carried a domain in, is asking about the others alone.
 fn legal(p: Vec3, boundaries: &Boundaries) -> bool {
     if !boundaries.keepout.is_empty() && boundaries.keepout.signed_distance(p) < 0.0 {
         return false;
     }
-    if !boundaries.domain.is_empty() && boundaries.domain.signed_distance(p) > 0.0 {
-        return false;
-    }
-    true
+    inside_solid(p, boundaries)
 }
 
 /// Where one vertex belongs, or that it has to be left alone.
@@ -385,9 +433,9 @@ fn corrected(vertex: Vec3, boundaries: &Boundaries, cap: f64, capture: f64) -> C
 /// crosses a boundary", which is never true of these.
 fn seated(vertex: Vec3, boundaries: &Boundaries, cap: f64, capture: f64) -> Correction {
     // The boundary this vertex is nearest to, whichever side of it the vertex
-    // sits on: a keepout member, or the domain as a whole. The same selection
-    // [`adrift_by`] reads, so that what is counted as resting off a surface is
-    // measured against the surface this would have seated it onto.
+    // sits on: a keepout or keepin member, or the domain as a whole. The same
+    // selection [`adrift_by`] reads, so that what is counted as resting off a
+    // surface is measured against the surface this would have seated it onto.
     let Some((distance, which)) = nearest_boundary(vertex, boundaries) else {
         return Correction::Legal;
     };
@@ -398,8 +446,9 @@ fn seated(vertex: Vec3, boundaries: &Boundaries, cap: f64, capture: f64) -> Corr
         return Correction::Legal;
     }
     let target = match which {
-        Some(shape) => onto(vertex, shape),
-        None => pull_in(vertex, &boundaries.domain),
+        Surface::Keepout(shape) => onto(vertex, shape, Side::Outside),
+        Surface::Keepin(shape) => onto(vertex, shape, Side::Inside),
+        Surface::Domain => pull_in(vertex, &boundaries.domain),
     };
     match target {
         Some(to)
@@ -414,11 +463,12 @@ fn seated(vertex: Vec3, boundaries: &Boundaries, cap: f64, capture: f64) -> Corr
 }
 
 /// One correction: out of the keepout the point is deepest inside, or - when it
-/// is clear of them all - back inside the domain.
+/// is clear of them all - back into the solid.
 ///
 /// Deepest first because that is the correction with the furthest to go, and
 /// every other member is re-examined against the position it produces rather
-/// than against the one it started from.
+/// than against the one it started from. A keepout wins over both halves of the
+/// solid here exactly as it wins over them in the classifier.
 fn one_pass(at: Vec3, boundaries: &Boundaries) -> Option<Vec3> {
     let mut deepest: Option<(f64, &Shape)> = None;
     for shape in boundaries.keepout.shapes() {
@@ -428,23 +478,55 @@ fn one_pass(at: Vec3, boundaries: &Boundaries) -> Option<Vec3> {
         }
     }
     if let Some((_, shape)) = deepest {
-        return onto(at, shape);
+        return onto(at, shape, Side::Outside);
     }
-    if !boundaries.domain.is_empty() && boundaries.domain.signed_distance(at) > 0.0 {
-        return pull_in(at, &boundaries.domain);
+    if !inside_solid(at, boundaries) {
+        return back_into_solid(at, boundaries);
     }
     Some(at)
 }
 
-/// The point on `shape`'s surface that `at` belongs on, a hair outside it.
+/// The point a vertex outside the solid belongs on: whichever is nearer of the
+/// domain's own surface and the skin of the nearest keepin.
 ///
-/// Outside is the legal side of a keepout, so that is the side the offset of
-/// [`constants::BOUNDARY_CLAMP_EPS_MM`] is taken on whichever side `at` came
-/// from: the direction of travel for a vertex being pushed out of the shape,
-/// and the reverse of it for one being seated onto the surface from outside.
-/// The sign is read from the field rather than from the caller, so one statement
-/// of where a vertex belongs serves both.
-fn onto(at: Vec3, shape: &Shape) -> Option<Vec3> {
+/// Nearer rather than the domain always, because a keepin that sticks out of the
+/// domain carries the surface there, and pulling a vertex of *its* skin back to
+/// the domain wall would take the very facet this pass exists to round and press
+/// it flat against the box the keepin leaves.
+///
+/// Only ever reached from outside the solid, which an empty domain never is; an
+/// empty domain is infinitely far away in any case, so a keepin wins.
+///
+/// A keepin that names no surface point - a tube that overlaps itself, which
+/// [`Config::static_warnings`](crate::config::Config::static_warnings) warns
+/// about - falls back to the domain rather than giving up: a vertex is better
+/// pulled onto the surface further away than shipped outside the solid
+/// altogether.
+fn back_into_solid(at: Vec3, boundaries: &Boundaries) -> Option<Vec3> {
+    let to_domain = boundaries.domain.signed_distance(at).abs();
+    let nearest_keepin = boundaries
+        .keepin
+        .shapes()
+        .iter()
+        .map(|shape| (shape.signed_distance(at).abs(), shape))
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    match nearest_keepin {
+        Some((distance, shape)) if distance < to_domain => {
+            onto(at, shape, Side::Inside).or_else(|| pull_in(at, &boundaries.domain))
+        }
+        _ => pull_in(at, &boundaries.domain),
+    }
+}
+
+/// The point on `shape`'s surface that `at` belongs on, a hair to `side` of it.
+///
+/// The side is the material's: outside a keepout, inside a keepin. The offset of
+/// [`constants::BOUNDARY_CLAMP_EPS_MM`] is taken on that side whichever side
+/// `at` came from - the direction of travel for a vertex being pushed off the
+/// shape, and the reverse of it for one being seated onto the surface from the
+/// other side - so one statement of where a vertex belongs serves both, and the
+/// sign is read from the field rather than from the caller.
+fn onto(at: Vec3, shape: &Shape, side: Side) -> Option<Vec3> {
     let surface = shape.nearest_surface_point(at)?;
     let travelled = difference(surface, at);
     let reach = length(travelled);
@@ -455,10 +537,11 @@ fn onto(at: Vec3, shape: &Shape) -> Option<Vec3> {
         true => travelled,
         false => difference(at, surface),
     };
-    Some(sum(
-        surface,
-        scale(outward, constants::BOUNDARY_CLAMP_EPS_MM / reach),
-    ))
+    let offset = match side {
+        Side::Outside => constants::BOUNDARY_CLAMP_EPS_MM,
+        Side::Inside => -constants::BOUNDARY_CLAMP_EPS_MM,
+    };
+    Some(sum(surface, scale(outward, offset / reach)))
 }
 
 /// The point just inside the domain that `at` belongs on, from either side of
@@ -530,6 +613,16 @@ mod tests {
         Boundaries {
             domain: Csg::default(),
             keepout: ShapeUnion::new(shapes),
+            keepin: ShapeUnion::default(),
+        }
+    }
+
+    /// A box domain with the keepins that reach out of it.
+    fn held(domain: Shape, keepins: Vec<Shape>) -> Boundaries {
+        Boundaries {
+            domain: Csg::new(vec![(CsgOp::Add, domain)]),
+            keepout: ShapeUnion::default(),
+            keepin: ShapeUnion::new(keepins),
         }
     }
 
@@ -668,7 +761,8 @@ mod tests {
             assert_eq!(
                 report.notes(solid, flushing),
                 vec![
-                    "every exported vertex was already inside the domain and clear of the keepouts"
+                    "every exported vertex was already inside the domain or a keepin and clear of \
+                     the keepouts"
                         .to_string()
                 ]
             );
@@ -841,6 +935,7 @@ mod tests {
         let boundaries = Boundaries {
             domain,
             keepout: ShapeUnion::new(Vec::new()),
+            keepin: ShapeUnion::default(),
         };
         let mut mesh = loose(vec![[18.0, 0.0, 0.0]]);
         let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
@@ -951,7 +1046,7 @@ mod tests {
         // projection - out of the deeper one - lands inside the second.
         let start = [2.0, 0.5, 0.0];
         assert!(first.signed_distance(start) < 0.0 && second.signed_distance(start) < 0.0);
-        let once = onto(start, &first).expect("a projection");
+        let once = onto(start, &first, Side::Outside).expect("a projection");
         assert!(
             second.signed_distance(once) < 0.0,
             "the fixture no longer needs a second pass"
@@ -1051,7 +1146,7 @@ mod tests {
         // Through the pass: the vertex is left exactly where it was, counted,
         // and given up on in one round rather than eight.
         let boundaries = forbidden(vec![overlapping]);
-        assert_eq!(onto(inside, &overlapping), None);
+        assert_eq!(onto(inside, &overlapping, Side::Outside), None);
         assert_eq!(
             one_pass(inside, &boundaries),
             None,
@@ -1133,7 +1228,7 @@ mod tests {
         // And through the pass: one round to the give-up, vertex untouched.
         let boundaries = forbidden(vec![shape]);
         let vertex = [5.909, 0.3, 0.0];
-        assert_eq!(onto(vertex, &shape), None);
+        assert_eq!(onto(vertex, &shape, Side::Outside), None);
         assert_eq!(one_pass(vertex, &boundaries), None);
         let mut mesh = loose(vec![vertex]);
         let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
@@ -1242,6 +1337,7 @@ mod tests {
         let boundaries = Boundaries {
             domain,
             keepout: ShapeUnion::default(),
+            keepin: ShapeUnion::default(),
         };
         // Past the far face, and inside the bite the sphere takes out of it.
         let past_face = [20.4, 4.0, 4.0];
@@ -1293,6 +1389,201 @@ mod tests {
         assert_eq!(descend([1.0, 2.0, 3.0], 0.0, |_| 5.0), None);
         // And one that is not a number is refused rather than followed.
         assert_eq!(descend([1.0, 2.0, 3.0], 0.0, |_| f64::NAN), None);
+    }
+
+    /// A keepin that sticks out of the domain carries the surface out there: its
+    /// skin is seated onto, from either side, instead of the whole protrusion
+    /// being pressed back against the domain wall.
+    ///
+    /// The fixture is the shape the incident was about - a ring drawn as a
+    /// `[[keepin]]` on the outside of a box - reduced to the cylinder and the
+    /// vertices a marching-cubes skin scatters to both sides of it.
+    #[test]
+    fn a_keepin_outside_the_domain_seats_its_skin_onto_itself() {
+        let eps = constants::BOUNDARY_CLAMP_EPS_MM;
+        let cylinder = Shape::Cylinder {
+            p1: [10.0, 10.0, 15.0],
+            p2: [10.0, 10.0, 30.0],
+            radius: 5.0,
+        };
+        let boundaries = held(
+            Shape::axis_aligned_box([0.0, 0.0, 0.0], [20.0, 20.0, 20.0]),
+            vec![cylinder],
+        );
+
+        // A ring of skin vertices a millimetre inside and a millimetre proud of
+        // the cylinder, at a height where the domain's own top face is further
+        // away than the capture band: the scatter this pass exists for.
+        let ring: Vec<Vec3> = (0..8)
+            .map(|step| {
+                let angle = std::f64::consts::TAU * step as f64 / 8.0;
+                let radius = if step % 2 == 0 { 4.0 } else { 6.0 };
+                [
+                    10.0 + radius * angle.cos(),
+                    10.0 + radius * angle.sin(),
+                    27.0,
+                ]
+            })
+            .collect();
+        let mut mesh = loose(ring.clone());
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.vertices_moved, ring.len(), "{report:?}");
+        assert_eq!(report.gave_up, 0, "{report:?}");
+        for vertex in &mesh.vertices {
+            let radius = ((vertex[0] - 10.0).powi(2) + (vertex[1] - 10.0).powi(2)).sqrt();
+            assert!(
+                (radius - 5.0).abs() <= 2.0 * eps,
+                "{vertex:?} came to rest at radius {radius}"
+            );
+            assert!(
+                cylinder.signed_distance(*vertex) <= 0.0,
+                "{vertex:?} is proud of the keepin it belongs to"
+            );
+            assert!(
+                (vertex[2] - 27.0).abs() <= 1e-9,
+                "{vertex:?} slid along the axis"
+            );
+        }
+        assert_eq!(report.adrift, 0, "{report:?}");
+
+        // And the reading this changed: held to the domain alone, every one of
+        // them is strayed material and is pressed back onto the box's top face.
+        let without = Boundaries {
+            keepin: ShapeUnion::default(),
+            ..boundaries.clone()
+        };
+        let mut mesh = loose(ring);
+        let report = resolve(&mut mesh, &without, VOXEL_MM);
+        assert_eq!(report.vertices_moved, 8, "{report:?}");
+        for vertex in &mesh.vertices {
+            assert!(vertex[2] < 20.0, "{vertex:?} was left outside the domain");
+        }
+    }
+
+    /// Outside the domain *and* outside every keepin is still strayed material,
+    /// and it goes back onto whichever of the two surfaces is nearer.
+    #[test]
+    fn a_vertex_outside_both_is_pulled_onto_the_nearer_surface() {
+        let eps = constants::BOUNDARY_CLAMP_EPS_MM;
+        let cylinder = Shape::Cylinder {
+            p1: [10.0, 10.0, 15.0],
+            p2: [10.0, 10.0, 30.0],
+            radius: 5.0,
+        };
+        let boundaries = held(
+            Shape::axis_aligned_box([0.0, 0.0, 0.0], [20.0, 20.0, 20.0]),
+            vec![cylinder],
+        );
+        // Both are two millimetres above the domain's top face. The first is one
+        // millimetre off the cylinder's skin, the second nearly five.
+        let near_keepin = [16.0, 10.0, 22.0];
+        let near_domain = [3.0, 3.0, 22.0];
+        assert!(!legal(near_keepin, &boundaries) && !legal(near_domain, &boundaries));
+
+        let mut mesh = loose(vec![near_keepin, near_domain]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.vertices_moved, 2, "{report:?}");
+        assert_eq!(report.gave_up, 0, "{report:?}");
+
+        let seated = mesh.vertices[0];
+        let distance = cylinder.signed_distance(seated);
+        assert!(
+            distance < 0.0 && distance.abs() <= 2.0 * eps,
+            "{seated:?} rests {distance} mm from the keepin skin it was nearest"
+        );
+        assert!(
+            boundaries.domain.signed_distance(seated) > 0.0,
+            "{seated:?} was dragged back inside the domain the keepin sticks out of"
+        );
+
+        let pulled = mesh.vertices[1];
+        let distance = boundaries.domain.signed_distance(pulled);
+        assert!(
+            distance < 0.0 && distance.abs() <= 2.0 * eps,
+            "{pulled:?} rests {distance} mm from the domain surface it was nearest"
+        );
+    }
+
+    /// A keepin with no projection to offer - a tube that overlaps itself - is
+    /// not the end of the correction: the vertex is pulled into the domain
+    /// instead of being shipped outside the solid.
+    #[test]
+    fn a_keepin_that_names_no_surface_point_falls_back_to_the_domain() {
+        let eps = constants::BOUNDARY_CLAMP_EPS_MM;
+        // A half circle of centre-line radius 2.6 mm in the plane z = 24,
+        // inside a tube of radius 3: it reaches past the centre of its own bend.
+        let folded = Shape::Tube {
+            p1: [12.6, 5.0, 24.0],
+            p2: [7.4, 5.0, 24.0],
+            bend: Some([10.0, 7.6, 24.0]),
+            radius: 3.0,
+        };
+        assert!(folded.self_intersects());
+        let boundaries = held(
+            Shape::axis_aligned_box([0.0, 0.0, 0.0], [20.0, 20.0, 20.0]),
+            vec![folded],
+        );
+        // Above the domain's top face and clear of the tube, but nearer the tube
+        // (0.61 mm) than the domain (1.5 mm), so the keepin branch is the one
+        // taken - and it has no surface point to name.
+        let stray = [10.0, 5.0, 21.5];
+        assert!(!legal(stray, &boundaries));
+        assert!(folded.nearest_surface_point(stray).is_none());
+        assert!(folded.signed_distance(stray).abs() < 1.5);
+
+        let mut mesh = loose(vec![stray]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.gave_up, 0, "{report:?}");
+        assert_eq!(report.vertices_moved, 1, "{report:?}");
+        let pulled = mesh.vertices[0];
+        let distance = boundaries.domain.signed_distance(pulled);
+        assert!(
+            distance < 0.0 && distance.abs() <= 2.0 * eps,
+            "{pulled:?} rests {distance} mm from the domain it was pulled into"
+        );
+    }
+
+    /// Where a keepin and a keepout overlap the keepout wins, here as in the
+    /// classifier: the vertex is pushed off the keepout's surface, and being
+    /// inside a keepin is what makes the position it lands on legal.
+    #[test]
+    fn a_keepout_wins_over_the_keepin_it_overlaps() {
+        let cylinder = Shape::Cylinder {
+            p1: [10.0, 10.0, 15.0],
+            p2: [10.0, 10.0, 30.0],
+            radius: 5.0,
+        };
+        let sphere = Shape::Sphere {
+            center: [10.0, 10.0, 26.0],
+            radius: 3.0,
+        };
+        let mut boundaries = held(
+            Shape::axis_aligned_box([0.0, 0.0, 0.0], [20.0, 20.0, 20.0]),
+            vec![cylinder],
+        );
+        boundaries.keepout = ShapeUnion::new(vec![sphere]);
+
+        // Inside both, and outside the domain: a cell the classifier would have
+        // voided.
+        let inside_both = [10.0, 10.0, 25.0];
+        assert!(cylinder.signed_distance(inside_both) < 0.0);
+        assert!(sphere.signed_distance(inside_both) < 0.0);
+        assert!(!legal(inside_both, &boundaries));
+
+        let mut mesh = loose(vec![inside_both]);
+        let report = resolve(&mut mesh, &boundaries, VOXEL_MM);
+        assert_eq!(report.vertices_moved, 1, "{report:?}");
+        assert_eq!(report.gave_up, 0, "{report:?}");
+        let moved = mesh.vertices[0];
+        assert!(
+            sphere.signed_distance(moved) > 0.0,
+            "{moved:?} is still inside the keepout"
+        );
+        assert!(
+            cylinder.signed_distance(moved) < 0.0,
+            "{moved:?} left the keepin it was pushed along"
+        );
+        assert!(legal(moved, &boundaries), "{moved:?}");
     }
 
     /// Empty boundaries constrain nothing, which is what lets a caller hold a

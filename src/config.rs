@@ -3145,32 +3145,36 @@ impl Config {
     /// header and the editor's own validity line through the one channel all of
     /// them already use.
     ///
-    /// Scoped to the `[[keepout]]` entries, because that is where a
-    /// self-overlapping tube has a consequence. The export's boundary clamp
-    /// projects a vertex onto the surface of the *keepout member* it violates
-    /// ([`crate::mesh::clamp`]), and a tube that has swallowed its own inside has
-    /// no such projection to offer. The domain is held to its composite signed
-    /// distance rather than shape by shape, which stays exact for such a tube, and
-    /// a support, load or keepin region is never projected onto at all - warning
-    /// about those would name a consequence they do not have.
+    /// Scoped to the `[[keepout]]` and `[[keepin]]` entries, because those are
+    /// where a self-overlapping tube has a consequence. The export's boundary
+    /// clamp projects a vertex onto the surface of the *member* it violates or
+    /// rests against ([`crate::mesh::clamp`]) - a keepout's wall and a keepin's
+    /// skin alike - and a tube that has swallowed its own inside has no such
+    /// projection to offer. The domain is held to its composite signed distance
+    /// rather than shape by shape, which stays exact for such a tube, and a
+    /// support or load region is never projected onto at all - warning about
+    /// those would name a consequence they do not have.
     pub fn static_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-        for (idx, spec) in self.keepout.iter().enumerate() {
-            let what = format!("[[keepout]] entry {}", idx + 1);
-            // A shape that will not convert at all is `validate_static`'s to
-            // report, not this function's to guess about.
-            let Ok(shape) = spec.to_shape(&what) else {
-                continue;
-            };
-            if shape.self_intersects() {
-                warnings.push(format!(
-                    "{what}: this tube overlaps itself - its radius either reaches past the centre \
-                     of its own bend, or is more than half the distance between its two ends, \
-                     which have closed on each other across the gap the arc leaves open. Its \
-                     surface cannot be projected onto exactly, so [output] boundaries = \"exact\" \
-                     will leave violations of it in the exported surface instead of clamping them \
-                     (reduce radius, open the bend out, or shorten the span)"
-                ));
+        for (table, specs) in [("[[keepout]]", &self.keepout), ("[[keepin]]", &self.keepin)] {
+            for (idx, spec) in specs.iter().enumerate() {
+                let what = format!("{table} entry {}", idx + 1);
+                // A shape that will not convert at all is `validate_static`'s to
+                // report, not this function's to guess about.
+                let Ok(shape) = spec.to_shape(&what) else {
+                    continue;
+                };
+                if shape.self_intersects() {
+                    warnings.push(format!(
+                        "{what}: this tube overlaps itself - its radius either reaches past the \
+                         centre of its own bend, or is more than half the distance between its \
+                         two ends, which have closed on each other across the gap the arc leaves \
+                         open. Its surface cannot be projected onto exactly, so [output] \
+                         boundaries = \"exact\" will leave violations of it in the exported \
+                         surface instead of clamping them (reduce radius, open the bend out, or \
+                         shorten the span)"
+                    ));
+                }
             }
         }
         warnings
@@ -5067,6 +5071,41 @@ vector = [0.0, 0.0, -10.0]
         .expect("parse");
         assert!(straight.static_warnings().is_empty());
         assert!(Config::parse(MINIMAL).unwrap().static_warnings().is_empty());
+    }
+
+    /// The same warning for a `[[keepin]]`, whose skin the export's clamp seats
+    /// vertices onto exactly as it pushes them off a keepout's wall - so a tube
+    /// that cannot be projected onto costs the same thing there.
+    #[test]
+    fn a_self_overlapping_keepin_tube_is_warned_about_too() {
+        let keepin = |radius: f64| {
+            MINIMAL.replace(
+                "[[supports]]",
+                &format!(
+                    "[[keepin]]\nshape = \"tube\"\np1 = [12.6, 5.0, 5.0]\np2 = [7.4, 5.0, 5.0]\n\
+                     bend = [10.0, 7.6, 5.0]\nradius = {radius}\n\n[[supports]]"
+                ),
+            )
+        };
+        let overlapping = Config::parse(&keepin(3.0)).expect("parse");
+        overlapping
+            .validate_static()
+            .expect("a self-overlapping tube is a solid, not an error");
+        let warnings = overlapping.static_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("[[keepin]] entry 1:"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("overlaps itself"), "{warnings:?}");
+        assert!(warnings[0].contains("reduce radius"), "{warnings:?}");
+        // A hair under the threshold is an ordinary tube and is not mentioned.
+        assert!(
+            Config::parse(&keepin(0.99 * 2.6))
+                .expect("parse")
+                .static_warnings()
+                .is_empty()
+        );
     }
 
     /// The boundary fidelity, whose default is the one `[output]` policy that

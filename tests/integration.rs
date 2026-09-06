@@ -2792,14 +2792,16 @@ fn a_bore_is_exported_as_the_cylinder_that_was_asked_for() {
         let mut counted = 0usize;
         for vertex in vertices {
             // The nearest boundary, whichever it is: this part rests on the
-            // block's faces and on the bore wall, and the clamp seats a vertex
+            // block's faces, on the bore wall and on the keepin box's own sides
+            // where the design fell away from them, and the clamp seats a vertex
             // onto the one it is nearest to.
             let distance = exact
                 .boundaries
                 .domain
                 .signed_distance(*vertex)
                 .abs()
-                .min(exact.boundaries.keepout.signed_distance(*vertex).abs());
+                .min(exact.boundaries.keepout.signed_distance(*vertex).abs())
+                .min(exact.boundaries.keepin.signed_distance(*vertex).abs());
             if distance <= capture {
                 counted += 1;
                 worst = worst.max(distance);

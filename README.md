@@ -1184,11 +1184,23 @@ boundaries = "exact"       # optional, default "exact"; "voxel" is the old behav
 ```
 
 Under `"exact"`, after the island cull and before validation, every exported
-vertex that lies inside a keepout or outside the domain is projected onto the
+vertex that lies inside a keepout or outside the solid is projected onto the
 analytic surface it violates - the surface the configuration described, not the
 grid's idea of it - and left a documented ten nanometres on the legal side so a
 containment test agrees. Where the part meets a bore, the bore **is** the
 cylinder.
+
+The solid is the domain **union the keepins**. A keepin takes precedence over the
+domain when cells are classified, so a keepin that sticks out of the domain is
+material out there and its own outer skin is the surface: it is a seat target
+exactly as a keepout's wall is, and a vertex outside the solid altogether goes
+back onto whichever is nearer, the domain surface or the nearest keepin's skin.
+That is what makes a ring drawn as a `[[keepin]]` on the outside of a box come
+out round instead of voxel-faceted, without mirroring the ring into the domain.
+A keepin lying entirely inside the domain adds nothing to the solid, but its skin
+is a seat target and a flush surface all the same: a surface that already rested
+within half a voxel of it, or a `flush = "walls"` run, can come out different
+than it did before.
 
 The scatter goes both ways, so the correction does too. The sampling does not put
 a wall's vertices reliably *outside* the surface - it puts them on both sides of
@@ -1211,9 +1223,10 @@ resolve anyway, and the correction is always onto the legal side.
 | box, sphere, capped cylinder    | closed form, exactly the nearest surface point |
 | cone (frustum or true cone)     | closed form: the shape is a surface of revolution, so the nearest point lies in the sample's own meridian half plane, and there it is the nearest of three segments - the two caps and the slanted wall |
 | triangular prism                | closed form: the sample clamped into the triangle across its plane and into the slab along its normal, which is the box's rule on a shape whose sides are not axis aligned |
-| tube (straight or bent)         | closed form: the nearest point of its centre line, a radius out. A tube that overlaps itself - because it **folds** through the centre of its own bend, or because its two **ends have closed** on each other across the gap a bend of more than half a turn leaves open - has swallowed part of its own inside and is no longer offsettable that way; it is refused rather than answered wrongly, and a `[[keepout]]` holding one is **warned about** by `growforge check`, by every run and by the editor's validity line |
+| tube (straight or bent)         | closed form: the nearest point of its centre line, a radius out. A tube that overlaps itself - because it **folds** through the centre of its own bend, or because its two **ends have closed** on each other across the gap a bend of more than half a turn leaves open - has swallowed part of its own inside and is no longer offsettable that way; it is refused rather than answered wrongly, and a `[[keepout]]` or a `[[keepin]]` holding one is **warned about** by `growforge check`, by every run and by the editor's validity line |
 | ellipsoid                       | bounded Newton steps on its own field, which is exact on the surface (the nearest point is the root of a sextic and has no closed form) |
-| the domain                      | bounded descent onto the level set of the ordered CSG composite, which has seams and no nearest-point formula |
+| a keepin                        | whichever of the rows above its own shape is, projected onto the *inside* of its skin - the side the material is on |
+| the domain                      | bounded descent onto the level set of the ordered CSG composite, which has seams and no nearest-point formula. A vertex outside the solid takes this or the nearest keepin's skin, whichever is nearer |
 
 Three things bound it, because a projection allowed to do anything can wreck a
 surface:
@@ -1261,7 +1274,7 @@ says about it depends on what the run was. **A part that was drawn** - `engine =
 resting off one is a face about to ship in the wrong place:
 
 ```text
-boundaries     warning: 37 vertices rest up to 0.4400 mm off the surface they belong to: this part is the shapes it was drawn from, so every exported surface is a domain or keepout surface and one standing off it ships as a face in the wrong place
+boundaries     warning: 37 vertices rest up to 0.4400 mm off the surface they belong to: this part is the shapes it was drawn from, so every exported surface is a domain, keepin or keepout surface and one standing off it ships as a face in the wrong place
 ```
 
 on the console, and in the warning colour in the editor's panel.
@@ -1667,8 +1680,8 @@ raised to full density when all three hold:
 
 * it is not already there;
 * its centre lies within `flush_depth_mm` of a constraint surface - the domain's
-  own boundary or the wall of the nearest keepout, whichever is nearer - the
-  *band*;
+  own boundary, the wall of the nearest keepout or the skin of the nearest
+  keepin, whichever is nearest - the *band*;
 * the part's own material, **inside that band**, comes within `flush_depth_mm`
   of it, by an exact Euclidean distance transform seeded on those cells.
 
@@ -3050,9 +3063,9 @@ reinforce_thickness_mm = 3.0 # optional, default [optimization] min_feature_mm;
                              # a positive length in millimetres. The floor the
                              # pass above holds every member to
 flush = "off"                # optional, default "off"; "walls" fills the design
-                             # cells within flush_depth_mm of a domain or keepout
-                             # surface that the part's own material already
-                             # reaches into, so a wall resting against a shape
+                             # cells within flush_depth_mm of a domain, keepout
+                             # or keepin surface that the part's own material
+                             # already reaches into, so a wall resting on a shape
                              # the configuration drew comes out flush with it
                              # rather than rippled. Material that stopped within
                              # that depth of a surface is joined to it. Rejected
@@ -3411,7 +3424,9 @@ voxel to eight voxels of the grid the run is solved on, which is a range only
 the voxel size can be measured against and so is checked once the grid is known.
 
 Warned about but allowed: `min_feature_mm` smaller than about three voxels (the
-density filter cannot resolve it), keepout/keepin overlap, an enclosed cavity
+density filter cannot resolve it), keepout/keepin overlap (the keepout wins and
+the cells are void, and the export's boundary clamp reads the pair the same way:
+a vertex inside both is pushed off the keepout), an enclosed cavity
 under `voids = "warn"`, an exported field holding more than one connected body of
 material - always a defect for a tool that designs one part, never a reason to
 throw the part away - a surface that came out in more than one piece, whose
@@ -3482,9 +3497,9 @@ all, and a `hold_iterations` that outlasts `max_iterations`.
    once more, to remove the material of the part that carries none of the load -
    unless doing so would disconnect two declared regions, in which case the
    whole pass is refused and the run exports untrimmed. Under
-   `[output] flush` the design cells within a depth of a domain or keepout
-   surface that the part's own material already reaches into are then filled, so
-   a wall standing against a shape the configuration drew reaches it. And under
+   `[output] flush` the design cells within a depth of a domain, keepout or
+   keepin surface that the part's own material already reaches into are then
+   filled, so a wall standing against a shape the configuration drew reaches it. And under
    `[output] reinforce` a Euclidean distance transform over the part finds the
    spine of every member, and the ones whose inscribed ball is thinner than the
    floor are thickened into the design cells around them; a place the fill could
@@ -3504,9 +3519,10 @@ all, and a `hold_iterations` that outlasts `max_iterations`.
    without shrinking it. The surface is then partitioned into connected
    components and its floating fragments culled under the `[output] islands`
    policy. Under the default `[output] boundaries = "exact"` every vertex that
-   still lies inside a keepout or outside the domain is then projected onto the
-   analytic surface it violates - closed form for the box, sphere, capped
-   cylinder, tube, cone and triangular prism, a bounded iteration for the
+   still lies inside a keepout, or outside the solid the domain and the keepins
+   make between them, is then projected onto the analytic surface it violates -
+   closed form for the box, sphere, capped cylinder, tube, cone and triangular
+   prism, a bounded iteration for the
    ellipsoid and for the domain composite - so the shapes the configuration described survive the voxel grid.
    Only then is the mesh checked for watertightness, manifold edges, consistent
    winding and degenerate triangles and written as a binary STL: what is

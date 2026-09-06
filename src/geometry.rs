@@ -1618,19 +1618,27 @@ impl ShapeUnion {
 /// The analytic surfaces a part's geometry has to respect: the solid it must
 /// stay inside, and the union of regions it must stay out of.
 ///
-/// The pair the classifier voxelizes, kept as the shapes the configuration
-/// wrote rather than as the cells they produced. Classification samples a cell
-/// centre and can therefore resolve a boundary no finer than half a voxel; these
-/// are what the export's boundary clamp measures the extracted surface against
-/// so the exported bore is the cylinder that was asked for. Either half may be
+/// The set the classifier voxelizes, kept as the shapes the configuration wrote
+/// rather than as the cells they produced. Classification samples a cell centre
+/// and can therefore resolve a boundary no finer than half a voxel; these are
+/// what the export's boundary clamp measures the extracted surface against so
+/// the exported bore is the cylinder that was asked for. Any of them may be
 /// empty - a configuration with no `[[keepout]]`, or a caller that has no domain
-/// to hold the mesh to - and an empty half constrains nothing.
+/// to hold the mesh to - and an empty one constrains nothing.
+///
+/// The solid is the domain **union** the keepins: a keepin takes precedence over
+/// the domain ([`crate::grid::Grid::classify`]), so material inside one is
+/// material even where the keepin sticks out of the domain, and the keepin's own
+/// outer skin is the surface there. Keepins only ever enlarge the solid, so
+/// adding one can never make a position the clamp accepted illegal.
 #[derive(Debug, Clone, Default)]
 pub struct Boundaries {
     /// The design domain, as the ordered `[[domain]]` CSG tree.
     pub domain: Csg,
     /// The union of the `[[keepout]]` regions.
     pub keepout: ShapeUnion,
+    /// The union of the `[[keepin]]` regions.
+    pub keepin: ShapeUnion,
 }
 
 #[cfg(test)]

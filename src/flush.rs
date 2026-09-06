@@ -1,6 +1,6 @@
 //! Walls held flush against the surfaces they rest on: the field is filled out
-//! to the analytic domain and keepout boundaries wherever a wall already stands
-//! against one.
+//! to the analytic domain, keepout and keepin boundaries wherever a wall already
+//! stands against one.
 //!
 //! A density optimizer converges on a *field*, and the last cells of a wall
 //! pressed against the edge of the domain are the cells it has the least reason
@@ -30,9 +30,9 @@
 //! * it is not already there - a cell at full density is material the wall
 //!   already had, and raising it changes nothing;
 //! * its centre lies within `flush_depth_mm` of a constraint surface, which is
-//!   the domain's own boundary ([`crate::geometry::Csg::signed_distance`]) or
-//!   the wall of the nearest keepout
-//!   ([`crate::geometry::ShapeUnion::signed_distance`]), whichever is nearer,
+//!   the domain's own boundary ([`crate::geometry::Csg::signed_distance`]), the
+//!   wall of the nearest keepout or the skin of the nearest keepin
+//!   ([`crate::geometry::ShapeUnion::signed_distance`]), whichever is nearest,
 //!   taken unsigned - the *band*;
 //! * the part's own material, **inside that band**, comes within
 //!   `flush_depth_mm` of it, measured by the exact Euclidean transform of
@@ -111,8 +111,9 @@ pub struct FlushReport {
     /// which absent is [`constants::FLUSH_DEPTH_VOXELS`] of the voxel size.
     pub depth_mm: f64,
     /// Whether the problem described any surface for a wall to rest against at
-    /// all. False only for a caller that built a problem with no domain and no
-    /// keepout, where the pass can do nothing whatever the field holds.
+    /// all. False only for a caller that built a problem with no domain, no
+    /// keepout and no keepin, where the pass can do nothing whatever the field
+    /// holds.
     ///
     /// Carried on the report because [`FlushReport::notes`] is the whole
     /// contract a caller reads - it takes no arguments, and a pass that could
@@ -147,8 +148,8 @@ impl FlushReport {
         let mut notes = Vec::new();
         if !self.any_surface {
             notes.push(
-                "warning: this problem describes no domain or keepout surface, so there is nothing \
-                 for a wall to be flush with and the field is unchanged"
+                "warning: this problem describes no domain, keepout or keepin surface, so there is \
+                 nothing for a wall to be flush with and the field is unchanged"
                     .to_string(),
             );
             return notes;
@@ -208,13 +209,18 @@ fn part_mask(grid: &Grid, densities: &[f64], iso: f64) -> Vec<bool> {
 /// Distance from the centre of every cell to the nearest constraint surface, in
 /// millimetres, unsigned.
 ///
-/// The nearer of the domain's own boundary and the wall of the nearest keepout.
-/// Unsigned because what matters is proximity to the surface rather than which
-/// side of it a point is on: which side a *cell* is on is already settled by its
-/// [`CellKind`], and the fill only ever writes to design cells, which are inside
-/// the domain and outside every keepout by construction.
+/// The nearest of the domain's own boundary, the wall of the nearest keepout and
+/// the skin of the nearest keepin. Unsigned because what matters is proximity to
+/// the surface rather than which side of it a point is on: which side a *cell* is
+/// on is already settled by its [`CellKind`], and the fill only ever writes to
+/// design cells, which are inside the domain, outside every keepout and outside
+/// every keepin by construction.
 ///
-/// An empty half is infinitely far away, which is
+/// A keepin is a surface here for the same reason it is one to the export's
+/// boundary clamp: it is solid by classification, so a design cell lying against
+/// it is a wall resting on a shape and is what the fill exists to bring out to.
+///
+/// An empty one is infinitely far away, which is
 /// [`crate::geometry::ShapeUnion::signed_distance`]'s own reading of "nothing is
 /// forbidden here" and comes through the minimum unchanged.
 fn surface_distances_mm(grid: &Grid, boundaries: &Boundaries) -> Vec<f64> {
@@ -225,7 +231,8 @@ fn surface_distances_mm(grid: &Grid, boundaries: &Boundaries) -> Vec<f64> {
             let centre = grid.cell_center(i, j, k);
             let domain = boundaries.domain.signed_distance(centre).abs();
             let keepout = boundaries.keepout.signed_distance(centre).abs();
-            domain.min(keepout)
+            let keepin = boundaries.keepin.signed_distance(centre).abs();
+            domain.min(keepout).min(keepin)
         })
         .collect()
 }
@@ -247,7 +254,9 @@ pub fn flush(
     depth_mm: f64,
     local_volume_capped: bool,
 ) -> FlushReport {
-    let any_surface = !boundaries.domain.is_empty() || !boundaries.keepout.is_empty();
+    let any_surface = !boundaries.domain.is_empty()
+        || !boundaries.keepout.is_empty()
+        || !boundaries.keepin.is_empty();
     let report = |cells_raised: usize| FlushReport {
         cells_raised,
         volume_added_mm3: cells_raised as f64 * grid.cell_volume(),
@@ -353,6 +362,7 @@ mod tests {
                 Shape::axis_aligned_box(bounds.min, bounds.max),
             )]),
             keepout: ShapeUnion::default(),
+            keepin: ShapeUnion::default(),
         };
         (grid, boundaries)
     }
@@ -590,6 +600,62 @@ mod tests {
                 assert_eq!(densities[cell], before[cell], "cell {cell} was written");
             }
         }
+    }
+
+    /// A keepin's face is a surface the fill reaches out to, exactly as a
+    /// keepout's is: the keepin is solid by classification, so a wall standing a
+    /// cell short of it is a wall short of a shape and not a free surface.
+    #[test]
+    fn a_wall_against_a_keepin_face_is_filled_out_to_it() {
+        let (mut grid, mut boundaries) = walled_grid();
+        // A keepin slab over the top of the block, its underside at z = 7, and
+        // the cells it forces solid.
+        let keepin = Shape::axis_aligned_box(
+            [-1.0, -1.0, 7.0],
+            [N as f64 + 1.0, N as f64 + 1.0, N as f64 + 1.0],
+        );
+        boundaries.keepin = ShapeUnion::new(vec![keepin]);
+        for i in 0..N {
+            for j in 0..N {
+                for k in 7..N {
+                    let cell = grid.cell_index(i, j, k);
+                    grid.cells[cell] = CellKind::Solid;
+                }
+            }
+        }
+        // A wall a cell and a half under that face, deep enough in the block
+        // that no domain surface is within reach of it.
+        let mut densities = vec![0.0; grid.n_cells()];
+        for i in 0..N {
+            for j in 0..N {
+                densities[grid.cell_index(i, j, 5)] = 1.0;
+            }
+        }
+
+        let mut filled = densities.clone();
+        let report = flush(&grid, &boundaries, &mut filled, 0.5, 2.0, false);
+        assert!(report.any_surface);
+        assert!(report.cells_raised > 0, "{report:?}");
+        let against = grid.cell_index(N / 2, N / 2, 6);
+        let under = grid.cell_index(N / 2, N / 2, 4);
+        assert_eq!(filled[against], constants::DENSITY_MAX, "{report:?}");
+        assert_eq!(filled[under], 0.0, "the fill reached past its own depth");
+        for cell in 0..grid.n_cells() {
+            if grid.cells[cell] != CellKind::Design {
+                assert_eq!(
+                    filled[cell], densities[cell],
+                    "a {:?} cell was written",
+                    grid.cells[cell]
+                );
+            }
+        }
+
+        // Without the keepin term that gap is nowhere near a surface, which is
+        // the reading this changed.
+        boundaries.keepin = ShapeUnion::default();
+        let mut unheld = densities.clone();
+        flush(&grid, &boundaries, &mut unheld, 0.5, 2.0, false);
+        assert_eq!(unheld[against], 0.0);
     }
 
     /// Only design cells are ever written: a keepout, the space outside the

@@ -1747,12 +1747,12 @@ pub const GRAMS_PER_TONNE: f64 = 1e6;
 //
 // The export samples the density field on a lattice and Taubin-smooths what
 // marching cubes gives back, so an exported vertex can sit a fraction of a voxel
-// inside a keepout or outside the domain: neither pass knows the analytic
-// shapes, and cell-centre classification cannot resolve a boundary finer than
-// half a cell. Under the default `boundaries = "exact"` the vertices that do are
-// projected back onto the analytic surface they violate, which is what makes a
-// pin bore in the exported STL the cylinder the configuration asked for. These
-// control that projection.
+// inside a keepout or outside the solid - the domain union the keepins: neither
+// pass knows the analytic shapes, and cell-centre classification cannot resolve
+// a boundary finer than half a cell. Under the default `boundaries = "exact"`
+// the vertices that do are projected back onto the analytic surface they
+// violate, which is what makes a pin bore in the exported STL the cylinder the
+// configuration asked for. These control that projection.
 
 /// How far the clamp may move a single vertex, in voxels.
 ///

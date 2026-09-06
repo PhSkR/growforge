@@ -513,7 +513,11 @@ impl Problem {
             growth,
             solver,
             output,
-            boundaries: Boundaries { domain, keepout },
+            boundaries: Boundaries {
+                domain,
+                keepout,
+                keepin,
+            },
             fixed,
             load_cases,
             supports,

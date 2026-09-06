@@ -387,12 +387,12 @@ pub struct SurfaceExport {
 /// validation, so what the validator accepts is the file that ships and not a
 /// superset of it.
 ///
-/// `boundaries` are the analytic domain and keepout surfaces the field is a
-/// voxelization of, or `None` to export the isosurface exactly as that field
-/// produced it - which is `[output] boundaries = "voxel"`, and what a caller
-/// that has no shapes to hold the mesh to passes. With them, every vertex that
-/// ends up inside a keepout or outside the domain is projected back onto the
-/// surface it violates; see [`clamp`]. The clamp runs after the cull, so no work
+/// `boundaries` are the analytic domain, keepout and keepin surfaces the field
+/// is a voxelization of, or `None` to export the isosurface exactly as that
+/// field produced it - which is `[output] boundaries = "voxel"`, and what a
+/// caller that has no shapes to hold the mesh to passes. With them, every vertex
+/// that ends up inside a keepout or outside the solid - the domain union the
+/// keepins - is projected back onto the surface it violates; see [`clamp`]. The clamp runs after the cull, so no work
 /// goes into fragments that are about to be discarded and the culling verdicts
 /// see the geometry they always did, and before validation, so the positions
 /// that are validated are the positions that are written.
@@ -687,6 +687,77 @@ mod tests {
             (untouched.nx, untouched.ny, untouched.nz),
             (field.nx, field.ny, field.nz)
         );
+    }
+
+    /// A keepin *buried* inside the domain - further from the part's surface
+    /// than the capture band - adds nothing to the solid the clamp holds the
+    /// mesh to, and so changes nothing about the file that ships.
+    ///
+    /// Buried is the whole of the claim. A keepin's skin is a seat target and a
+    /// flush surface wherever it lies, so an interior keepin a surface already
+    /// rests within half a voxel of, or a `flush = "walls"` run, can change the
+    /// export; what this pins is the case the change was not supposed to reach,
+    /// which is most keepins.
+    #[test]
+    fn a_keepin_inside_the_domain_writes_the_same_stl() {
+        use crate::geometry::{Csg, CsgOp, Shape, ShapeUnion};
+
+        let h = 1.5;
+        let (grid, densities) = blob_grid(12, h);
+        let side = 12.0 * h;
+        let domain = Csg::new(vec![(
+            CsgOp::Add,
+            Shape::axis_aligned_box([0.0, 0.0, 0.0], [side, side, side]),
+        )]);
+        // Deep inside the blob's material: further from its surface than the
+        // capture band and than the adrift window, so nothing seats onto it and
+        // nothing is counted against it either.
+        let buried = Shape::Sphere {
+            center: [0.46 * side, 0.52 * side, 0.5 * side],
+            radius: 0.5,
+        };
+        let held = Boundaries {
+            domain: domain.clone(),
+            keepout: ShapeUnion::default(),
+            keepin: ShapeUnion::new(vec![buried]),
+        };
+        let plain = Boundaries {
+            domain,
+            keepout: ShapeUnion::default(),
+            keepin: ShapeUnion::default(),
+        };
+
+        let export = |boundaries: &Boundaries| {
+            surface_from_densities(
+                &grid,
+                &densities,
+                0.5,
+                6,
+                1,
+                IslandPolicy::Cull,
+                &islands::Anchors::none(),
+                Some(boundaries),
+            )
+            .expect("surface")
+        };
+        let reference = export(&plain);
+        let with_keepin = export(&held);
+        assert!(!reference.mesh.triangles.is_empty());
+        assert_eq!(with_keepin.clamp, reference.clamp);
+        assert_eq!(with_keepin.stats, reference.stats);
+
+        let directory = std::env::temp_dir();
+        let a = directory.join("growforge_interior_keepin_reference.stl");
+        let b = directory.join("growforge_interior_keepin.stl");
+        stl::write(&a, &reference.mesh).expect("write");
+        stl::write(&b, &with_keepin.mesh).expect("write");
+        assert_eq!(
+            std::fs::read(&a).expect("reference STL"),
+            std::fs::read(&b).expect("keepin STL"),
+            "a buried keepin must not change a single byte of the export"
+        );
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
     }
 
     #[test]

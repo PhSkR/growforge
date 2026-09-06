@@ -2,6 +2,20 @@
 
 ## 2026-09-05 - 0.43.0 - (title pending)
 
+- **A keepin is a boundary surface.** The solid the exported mesh is held
+  inside is now the domain *union* the keepins, so a keepin that sticks out of
+  the domain keeps its own skin: its surface is seated onto like a keepout's
+  wall, a vertex outside the solid goes back onto whichever is nearer of the
+  domain and the nearest keepin, and the flush pass fills walls out to keepin
+  faces too. A ring drawn as a `[[keepin]]` comes out round without being
+  mirrored into the domain. A keepin inside the domain adds nothing to the
+  solid, but its skin is a seat target and a flush surface there as well, so a
+  surface already resting within half a voxel of it - or a `flush = "walls"`
+  run - can come out different than it did before. Keepout over keepin over
+  domain is still the precedence, and a `[[keepin]]` tube that overlaps itself
+  is now warned about by `check` exactly as a `[[keepout]]` one is, since its
+  skin is projected onto too.
+
 - **`[optimization.reduce]`** is read, validated and echoed by `check`: a
   required `target_safety_factor`, a `method` of `"continuation"` or `"beso"`,
   and the schedule around them (`ratio`, `refine_stages`, `min_mass_fraction`,
