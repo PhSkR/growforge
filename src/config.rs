@@ -100,6 +100,12 @@ pub struct OptimizationConfig {
     /// by the one that has none: `engine = "solid"` fills the domain completely,
     /// so a fraction of it is not a thing that configuration can ask for. See
     /// [`Config::check_solid`].
+    ///
+    /// Optional in one other place, where it means something else:
+    /// under [`ReduceConfig`] the mass is what the run reports rather than what
+    /// it is told, and this is the fraction the reduction *starts* from - solid,
+    /// [`constants::REDUCE_START_FRACTION`], when it is left out, and anything
+    /// up to and including solid when it is not.
     pub mass_fraction: Option<f64>,
     /// Smallest structural feature the result should contain, in millimetres.
     pub min_feature_mm: f64,
@@ -134,6 +140,10 @@ pub struct OptimizationConfig {
     pub wireframe: Option<WireframeConfig>,
     /// Local volume constraint. Absent means the global volume target alone.
     pub local_volume: Option<LocalVolumeConfig>,
+    /// Safety-factor-targeted material reduction. Absent means `mass_fraction`
+    /// is the target the run meets; present makes it the point the run starts
+    /// from, and the safety factor the target.
+    pub reduce: Option<ReduceConfig>,
 }
 
 /// How the SIMP loop moves the design variables under the volume constraint.
@@ -242,6 +252,89 @@ pub struct LocalVolumeConfig {
     /// Defaults to [`constants::LOCAL_VOLUME_RADIUS_FACTOR`] times the density
     /// filter radius, which is itself `min_feature_mm / FILTER_RADIUS_DIVISOR`.
     pub radius_mm: Option<f64>,
+}
+
+/// `[optimization.reduce]`.
+///
+/// Present turns the mass target around: the design starts at `mass_fraction`,
+/// solid unless the file names a starting point of its own, and a stage loop
+/// lowers the volume target until the stress report on a stage's design no
+/// longer holds
+/// `target_safety_factor`, then bisects between the last target that held and
+/// the first that did not. What the run is told is the strength margin, and what
+/// it reports is the mass that margin cost.
+///
+/// Only `target_safety_factor` is required; the rest default from
+/// [`crate::constants`]. Two of the keys belong to `method = "beso"` alone and
+/// are refused under the other method, on the pattern `[growth.symmetry]` sets.
+/// SIMP only: the solid engine has nothing to remove material from and the
+/// growth engine has no density field to remove it from, and both refuse the
+/// table by name.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReduceConfig {
+    /// Safety factor the exported design has to hold: yield strength over the
+    /// peak von Mises stress of the stress report. Required, and above
+    /// [`constants::REDUCE_TARGET_SAFETY_FACTOR_MIN`].
+    pub target_safety_factor: f64,
+    /// How material is taken away. Defaults to [`ReduceMethod::Continuation`].
+    pub method: Option<ReduceMethod>,
+    /// Share of the previous stage's volume target the next stage asks for, in
+    /// [`constants::REDUCE_RATIO_MIN`] .. [`constants::REDUCE_RATIO_MAX`].
+    /// Defaults to [`constants::REDUCE_RATIO`].
+    pub ratio: Option<f64>,
+    /// Bisections between the last volume target that held the safety factor
+    /// and the first that did not, at most
+    /// [`constants::REDUCE_REFINE_STAGES_MAX`]. Defaults to
+    /// [`constants::REDUCE_REFINE_STAGES`]; zero exports the last target that
+    /// held without refining it.
+    pub refine_stages: Option<usize>,
+    /// Volume target the schedule will not go below, above zero and below the
+    /// starting fraction. Defaults to
+    /// [`constants::REDUCE_MIN_MASS_FRACTION`].
+    pub min_mass_fraction: Option<f64>,
+    /// `method = "beso"` only: share of the current volume removed in one
+    /// iteration, in [`constants::REDUCE_EVOLUTION_RATE_MIN`] ..
+    /// [`constants::REDUCE_EVOLUTION_RATE_MAX`]. Defaults to
+    /// [`constants::REDUCE_EVOLUTION_RATE`].
+    pub evolution_rate: Option<f64>,
+    /// `method = "beso"` only: largest share of the current volume that may come
+    /// back in one iteration, up to [`constants::REDUCE_ADD_RATIO_MAX`].
+    /// Defaults to [`constants::REDUCE_ADD_RATIO`]; zero makes the method
+    /// one-way.
+    pub add_ratio: Option<f64>,
+}
+
+/// How `[optimization.reduce]` takes material away.
+///
+/// The continuation method is the default and the reuse: every stage is the SIMP
+/// loop the rest of the configuration already describes, run at a lower volume
+/// target and warm started from the stage before it, so the filter, the penalty,
+/// the update scheme and the self-supporting constraint all go on meaning what
+/// they mean. The evolutionary method is the alternative, and it is its own
+/// update: elements are ranked and hard-removed a fixed share of the volume at a
+/// time, with a smaller share allowed back, so `update` has nothing left to
+/// choose and is refused alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReduceMethod {
+    /// Lower the volume target a stage at a time and re-converge the SIMP loop
+    /// at each one.
+    #[default]
+    Continuation,
+    /// Bi-directional evolutionary removal: rank the elements, take a share of
+    /// the volume away and let a smaller share back.
+    Beso,
+}
+
+impl ReduceMethod {
+    /// Config spelling, for reports and error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReduceMethod::Continuation => "continuation",
+            ReduceMethod::Beso => "beso",
+        }
+    }
 }
 
 /// `[solver]`: where the finite element linear solves run, and how far they are
@@ -1427,6 +1520,9 @@ pub struct OptimizationParams {
     /// Local volume constraint controls; `None` leaves the global volume target
     /// as the only constraint.
     pub local_volume: Option<LocalVolumeParams>,
+    /// Material reduction controls; `None` makes `mass_fraction` the target the
+    /// run meets rather than the fraction it starts from.
+    pub reduce: Option<ReduceParams>,
 }
 
 /// Resolved guide wireframe controls with defaults applied.
@@ -1453,6 +1549,55 @@ pub struct LocalVolumeParams {
     pub max_fraction: f64,
     /// Radius of that neighbourhood in millimetres.
     pub radius_mm: f64,
+}
+
+/// Resolved material reduction controls with defaults applied.
+///
+/// Copyable for the same reason [`WireframeParams`] is: a resolved control is a
+/// plain value that travels with the problem. The starting fraction is not in
+/// here - it is [`OptimizationParams::mass_fraction`], which is where every
+/// stage of the run already reads a volume target from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReduceParams {
+    /// Safety factor the exported design has to hold.
+    pub target_safety_factor: f64,
+    /// How material is taken away, with the controls that belong to the method.
+    pub method: ReduceMethodParams,
+    /// Share of the previous stage's volume target the next stage asks for.
+    pub ratio: f64,
+    /// Bisections between the last target that held and the first that did not.
+    pub refine_stages: usize,
+    /// Volume target the schedule will not go below.
+    pub min_mass_fraction: f64,
+}
+
+/// Resolved `[optimization.reduce] method`, carrying the keys that belong to it.
+///
+/// The controls of the evolutionary method live in its own variant, on the
+/// pattern [`SymmetryParams`] sets: a run that is not evolutionary has no
+/// removal rate, and one that is cannot be read without one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReduceMethodParams {
+    /// Stage the volume target down and re-converge the SIMP loop at each one.
+    Continuation,
+    /// Bi-directional evolutionary removal.
+    Beso {
+        /// Share of the current volume removed in one iteration.
+        evolution_rate: f64,
+        /// Largest share of the current volume that may come back in one
+        /// iteration.
+        add_ratio: f64,
+    },
+}
+
+impl ReduceMethodParams {
+    /// Method this resolved control came from.
+    pub fn kind(self) -> ReduceMethod {
+        match self {
+            ReduceMethodParams::Continuation => ReduceMethod::Continuation,
+            ReduceMethodParams::Beso { .. } => ReduceMethod::Beso,
+        }
+    }
 }
 
 /// Resolved mesh output controls with defaults applied.
@@ -1753,6 +1898,145 @@ fn local_volume_params(
     })
 }
 
+/// Resolve and validate an `[optimization.reduce]` table.
+///
+/// `start_fraction` is the `[optimization] mass_fraction` the reduction begins
+/// at, which the floor is checked against: a floor at or above the start is a
+/// schedule with nowhere to go, and it is the one bound here that cannot be
+/// stated as a number of its own.
+///
+/// The two evolutionary keys are refused under `method = "continuation"` rather
+/// than ignored, on the pattern [`symmetry_params`] sets for the keys of the
+/// other kind: a configuration that sets a removal rate expects material to be
+/// removed at it, and a continuation run removes it by a volume target instead.
+fn reduce_params(spec: &ReduceConfig, start_fraction: f64) -> Result<ReduceParams> {
+    let what = "[optimization.reduce]";
+    let target = spec.target_safety_factor;
+    if !(target.is_finite() && target > constants::REDUCE_TARGET_SAFETY_FACTOR_MIN) {
+        bail!(
+            "{what}: target_safety_factor must be above {} (got {target}); it is the yield \
+             strength over the peak von Mises stress the exported design is allowed to reach, so \
+             at {} the part is already at its yield strength and below it the reduction would \
+             stop at a design that fails",
+            constants::REDUCE_TARGET_SAFETY_FACTOR_MIN,
+            constants::REDUCE_TARGET_SAFETY_FACTOR_MIN
+        );
+    }
+    let ratio = spec.ratio.unwrap_or(constants::REDUCE_RATIO);
+    if !(constants::REDUCE_RATIO_MIN..=constants::REDUCE_RATIO_MAX).contains(&ratio) {
+        bail!(
+            "{what}: ratio must lie in [{}, {}] (got {ratio}); it is the share of the previous \
+             stage's volume target the next stage asks for, so a ratio above the upper bound \
+             removes too little a stage to arrive at anything, and one below the lower bound \
+             removes so much that the stage has nothing of its predecessor's design to warm start \
+             from - {} is the default",
+            constants::REDUCE_RATIO_MIN,
+            constants::REDUCE_RATIO_MAX,
+            constants::REDUCE_RATIO
+        );
+    }
+    let refine_stages = spec
+        .refine_stages
+        .unwrap_or(constants::REDUCE_REFINE_STAGES);
+    if refine_stages > constants::REDUCE_REFINE_STAGES_MAX {
+        bail!(
+            "{what}: refine_stages must be at most {} (got {refine_stages}); each one is a whole \
+             stage - a re-converged design and a stress report - bisecting between the last \
+             volume target that held the safety factor and the first that did not, and {} of them \
+             already close that bracket by a factor of 256",
+            constants::REDUCE_REFINE_STAGES_MAX,
+            constants::REDUCE_REFINE_STAGES_MAX
+        );
+    }
+    let min_mass_fraction = spec
+        .min_mass_fraction
+        .unwrap_or(constants::REDUCE_MIN_MASS_FRACTION);
+    if !(min_mass_fraction > constants::DENSITY_MIN && min_mass_fraction < start_fraction) {
+        // The key defaults, so a start fraction under the default floor fails
+        // this bound without the file having named a floor at all: quoting the
+        // number back as if it had been asked for would send the user looking
+        // for a key that is not in the file.
+        let floor = match spec.min_mass_fraction.is_some() {
+            true => format!("got {min_mass_fraction}"),
+            false => format!(
+                "the key is not set, so the floor is the default {min_mass_fraction}; a \
+                 reduction starting below the default has to name a lower floor with \
+                 min_mass_fraction"
+            ),
+        };
+        bail!(
+            "{what}: min_mass_fraction must lie strictly between {} and the fraction the \
+             reduction starts from ([optimization] mass_fraction, {start_fraction}) ({floor}); it \
+             is the floor the schedule stops at, and a floor at or above the start is a schedule \
+             with nowhere to go",
+            constants::DENSITY_MIN
+        );
+    }
+    let method = match spec.method.unwrap_or_default() {
+        ReduceMethod::Continuation => {
+            for (key, present) in [
+                ("evolution_rate", spec.evolution_rate.is_some()),
+                ("add_ratio", spec.add_ratio.is_some()),
+            ] {
+                if present {
+                    bail!(
+                        "{what}: {key} belongs to method = \"{}\" (this table uses \"{}\"): a \
+                         continuation run removes material by lowering the volume target a stage \
+                         at a time, and the share removed per iteration is not a thing it has. \
+                         Remove the key, or set method = \"{}\"",
+                        ReduceMethod::Beso.label(),
+                        ReduceMethod::Continuation.label(),
+                        ReduceMethod::Beso.label()
+                    );
+                }
+            }
+            ReduceMethodParams::Continuation
+        }
+        ReduceMethod::Beso => {
+            let evolution_rate = spec
+                .evolution_rate
+                .unwrap_or(constants::REDUCE_EVOLUTION_RATE);
+            if !(constants::REDUCE_EVOLUTION_RATE_MIN..=constants::REDUCE_EVOLUTION_RATE_MAX)
+                .contains(&evolution_rate)
+            {
+                bail!(
+                    "{what}: evolution_rate must lie in [{}, {}] (got {evolution_rate}); it is \
+                     the share of the current volume removed in one iteration, and below the \
+                     lower bound the schedule spends the whole iteration budget getting anywhere \
+                     while above the upper one step reaches well past the elements the \
+                     sensitivity ranking is confident about - {} is the default",
+                    constants::REDUCE_EVOLUTION_RATE_MIN,
+                    constants::REDUCE_EVOLUTION_RATE_MAX,
+                    constants::REDUCE_EVOLUTION_RATE
+                );
+            }
+            let add_ratio = spec.add_ratio.unwrap_or(constants::REDUCE_ADD_RATIO);
+            if !(constants::DENSITY_MIN..=constants::REDUCE_ADD_RATIO_MAX).contains(&add_ratio) {
+                bail!(
+                    "{what}: add_ratio must lie in [{}, {}] (got {add_ratio}); it is the largest \
+                     share of the current volume that may come back in one iteration, which is \
+                     what makes the method bi-directional rather than a one-way erosion - zero is \
+                     legal and makes it exactly that, and {} is the default",
+                    constants::DENSITY_MIN,
+                    constants::REDUCE_ADD_RATIO_MAX,
+                    constants::REDUCE_ADD_RATIO
+                );
+            }
+            ReduceMethodParams::Beso {
+                evolution_rate,
+                add_ratio,
+            }
+        }
+    };
+    Ok(ReduceParams {
+        target_safety_factor: target,
+        method,
+        ratio,
+        refine_stages,
+        min_mass_fraction,
+    })
+}
+
 /// Reject a number that is not finite.
 ///
 /// TOML has `nan`, `inf` and `-inf` literals and serde accepts all three into
@@ -1925,6 +2209,21 @@ impl Config {
                 )?;
             }
         }
+        if let Some(r) = &o.reduce {
+            finite(
+                "[optimization.reduce]",
+                "target_safety_factor",
+                r.target_safety_factor,
+            )?;
+            for (key, value) in [
+                ("ratio", r.ratio),
+                ("min_mass_fraction", r.min_mass_fraction),
+                ("evolution_rate", r.evolution_rate),
+                ("add_ratio", r.add_ratio),
+            ] {
+                finite("[optimization.reduce]", key, value.unwrap_or_default())?;
+            }
+        }
 
         if let Some(s) = &self.solver {
             finite("[solver]", "tolerance", s.tolerance.unwrap_or_default())?;
@@ -2090,13 +2389,31 @@ impl Config {
     pub fn optimization_params(&self) -> Result<OptimizationParams> {
         let o = &self.optimization;
         let solid = self.is_solid();
-        let mass_fraction = match solid {
+        let mass_fraction = match (solid, o.reduce.is_some()) {
             // Every design cell is filled, so the fraction of them that ends up
             // as material is one. It is what the summary lines, the self weight
             // estimate and the stress pass read, and it is the truth about the
             // field the engine returns rather than a stand-in for a missing key.
-            true => constants::DENSITY_MAX,
-            false => {
+            (true, _) => constants::DENSITY_MAX,
+            // Under a reduction the key is where the run starts rather than
+            // where it has to end up, so it is optional - a reduction starts
+            // from a solid design space unless the file names somewhere further
+            // down to start - and solid is itself a legal thing to name, which
+            // is why the upper bound is closed here and open below.
+            (false, true) => {
+                let start = o.mass_fraction.unwrap_or(constants::REDUCE_START_FRACTION);
+                if !(start > constants::DENSITY_MIN && start <= constants::DENSITY_MAX) {
+                    bail!(
+                        "[optimization]: mass_fraction is where [optimization.reduce] starts \
+                         removing material and must lie in ({}, {}] (got {start}); leave the key \
+                         out to start from a solid design space",
+                        constants::DENSITY_MIN,
+                        constants::DENSITY_MAX
+                    );
+                }
+                start
+            }
+            (false, false) => {
                 let engine = self.engine_name()?;
                 let mass = o.mass_fraction.ok_or_else(|| {
                     anyhow!(
@@ -2161,6 +2478,71 @@ impl Config {
         if convergence_tol <= 0.0 || convergence_tol.is_nan() {
             bail!("[optimization]: convergence_tol must be positive (got {convergence_tol})");
         }
+        // Resolved before the two tables it cannot share a run with, and skipped
+        // for the two engines that have no material to reduce: `check_solid` and
+        // `growth_params` refuse the table by name, and resolving it here would
+        // answer such a configuration with a bound or a combination in place of
+        // the message that says why the table is not that engine's to set.
+        let reduce = match solid || self.is_growth() {
+            true => None,
+            false => match o.reduce.as_ref() {
+                None => None,
+                Some(spec) => {
+                    let params = reduce_params(spec, mass_fraction)?;
+                    // The stop test is the stress report's safety factor, which
+                    // is `n/a` without a yield strength: no stage could pass or
+                    // fail, and the run would have nothing to export.
+                    if self.material()?.yield_strength_mpa.is_none() {
+                        bail!(
+                            "[optimization.reduce] needs a material with a yield strength: \
+                             target_safety_factor is yield_strength_mpa over the peak von Mises \
+                             stress the design reaches, and this [material] declares none, so the \
+                             stress report reads n/a and no stage could be passed or failed. Set \
+                             [material] yield_strength_mpa, or name a preset - every one carries \
+                             it"
+                        );
+                    }
+                    if o.wireframe.is_some() {
+                        bail!(
+                            "[optimization.reduce] cannot be combined with \
+                             [optimization.wireframe]: the guide seeds a load path into a design \
+                             field that starts near empty and holds it there while one forms, and \
+                             a reduction starts from a field that is already full - there is \
+                             nothing left for the guide to offer, and the floor it holds would be \
+                             material the reduction is not allowed to take away. Drop one of the \
+                             two tables"
+                        );
+                    }
+                    if o.local_volume.is_some() {
+                        bail!(
+                            "[optimization.reduce] cannot be combined with \
+                             [optimization.local_volume]: the local cap is priced against the \
+                             global volume target, and a reduction moves that target every stage \
+                             rather than holding it at one value - a cap that leaves room above \
+                             the fraction the run starts from is a different constraint by the \
+                             time the schedule has halved it, and an infeasible one before the \
+                             run ends. Drop one of the two tables"
+                        );
+                    }
+                    if params.method.kind() == ReduceMethod::Beso
+                        && let Some(update) = o.update
+                    {
+                        bail!(
+                            "[optimization.reduce] method = \"{}\" cannot be combined with \
+                             [optimization] update = \"{}\": the evolutionary method is its own \
+                             update - it ranks the elements and hard-removes a share of the \
+                             volume, letting a smaller share back - so there is no design variable \
+                             step left for a scheme to take. Remove update, or set method = \
+                             \"{}\"",
+                            ReduceMethod::Beso.label(),
+                            update.label(),
+                            ReduceMethod::Continuation.label()
+                        );
+                    }
+                    Some(params)
+                }
+            },
+        };
         let wireframe = o.wireframe.as_ref().map(wireframe_params).transpose()?;
         let filter_radius_mm = o.min_feature_mm / constants::FILTER_RADIUS_DIVISOR;
         let update = o.update.unwrap_or_default();
@@ -2203,6 +2585,7 @@ impl Config {
             overhang: o.overhang.as_ref().map(|o| o.build_direction),
             wireframe,
             local_volume,
+            reduce,
         })
     }
 
@@ -2282,11 +2665,11 @@ impl Config {
     /// The rejecting half of a `*_params` pass with nothing to resolve: the
     /// solid engine has no controls of its own, so what it needs from the
     /// configuration is that nothing in it describes an optimization that is not
-    /// going to happen. Six things do - a mass target, a build direction, a
-    /// guide, a porosity cap, and either of the two passes over the finished
-    /// field - and each is refused by name rather than ignored, because a
-    /// configuration that asks for one is a configuration whose author expects
-    /// something this engine does not do.
+    /// going to happen. Eight things do - a mass target, a build direction, a
+    /// guide, a porosity cap, a reduction schedule, and each of the three passes
+    /// over the finished field - and each is refused by name rather than
+    /// ignored, because a configuration that asks for one is a configuration
+    /// whose author expects something this engine does not do.
     ///
     /// The keys that are merely *unused* are left alone, exactly as the growth
     /// engine leaves them: `penalty`, `stiffness_floor`, `min_feature_mm`,
@@ -2338,6 +2721,18 @@ impl Config {
                  everywhere - no design satisfies a cap below one, and the solid engine has no \
                  design variable to move towards one anyway. Drop the table, or run this problem \
                  with engine = \"{}\"",
+                constants::SOLID_ENGINE,
+                constants::DEFAULT_ENGINE
+            );
+        }
+        if self.optimization.reduce.is_some() {
+            bail!(
+                "engine = \"{}\" cannot be combined with [optimization.reduce]: the reduction \
+                 takes material away stage by stage until the safety factor reaches the target, \
+                 and the solid engine exports the design space itself - it optimizes nothing and \
+                 there is nothing it is allowed to take away. The stress report it already prints \
+                 is that part's safety factor; to have a target for it drive the mass instead, \
+                 run this problem with engine = \"{}\"",
                 constants::SOLID_ENGINE,
                 constants::DEFAULT_ENGINE
             );
@@ -2451,6 +2846,20 @@ impl Config {
                  either, and none is needed: a grown canopy is already a network of many thin \
                  members rather than a solid block. Drop the table, or run this problem with \
                  engine = \"{}\"",
+                constants::GROWTH_ENGINE,
+                constants::DEFAULT_ENGINE
+            );
+        }
+        if self.optimization.reduce.is_some() {
+            bail!(
+                "engine = \"{}\" cannot be combined with [optimization.reduce]: the reduction \
+                 lowers a volume target stage by stage and re-converges a density field against \
+                 it, and the growth engine has no density field and no objective to re-converge - \
+                 it places struts and sizes them by Murray's law from the load each one carries. \
+                 There is no growth equivalent either: a grown structure meets its mass target in \
+                 one pass, and what its stress report says about the result is a reading rather \
+                 than something the run can be steered by. Drop the table, or run this problem \
+                 with engine = \"{}\"",
                 constants::GROWTH_ENGINE,
                 constants::DEFAULT_ENGINE
             );
@@ -3154,6 +3563,318 @@ vector = [0.0, 0.0, -10.0]
             !error.contains("update = \"mma\""),
             "the growth engine has no update scheme to switch to: {error}"
         );
+    }
+
+    /// `MINIMAL` with an `[optimization.reduce]` table and without the
+    /// `mass_fraction` that table makes optional. `optimization` is written into
+    /// the `[optimization]` table itself, `keys` into the reduce table under it,
+    /// and the one required key is there so that a test only has to say what it
+    /// is about.
+    fn with_reduce(optimization: &str, keys: &str) -> String {
+        MINIMAL.replace("mass_fraction = 0.3\n", "").replace(
+            "min_feature_mm = 6.0",
+            &format!(
+                "min_feature_mm = 6.0{optimization}\n\n[optimization.reduce]\n\
+                 target_safety_factor = 2.0\n{keys}"
+            ),
+        )
+    }
+
+    /// Parse and resolve a configuration built by [`with_reduce`].
+    fn reduce_of(optimization: &str, keys: &str) -> Result<OptimizationParams> {
+        Config::parse(&with_reduce(optimization, keys))?.optimization_params()
+    }
+
+    /// The reduction turns the mass target around: `mass_fraction` stops being
+    /// what the run has to reach and becomes where it starts - solid when the
+    /// file leaves it out - while every other key of the table defaults.
+    #[test]
+    fn a_reduction_starts_from_the_mass_fraction_and_defaults_the_rest() {
+        let params = reduce_of("", "").expect("params");
+        assert_eq!(params.mass_fraction, constants::REDUCE_START_FRACTION);
+        let reduce = params.reduce.expect("a reduction");
+        assert_eq!(reduce.target_safety_factor, 2.0);
+        assert_eq!(reduce.method, ReduceMethodParams::Continuation);
+        assert_eq!(reduce.method.kind(), ReduceMethod::Continuation);
+        assert_eq!(reduce.ratio, constants::REDUCE_RATIO);
+        assert_eq!(reduce.refine_stages, constants::REDUCE_REFINE_STAGES);
+        assert_eq!(
+            reduce.min_mass_fraction,
+            constants::REDUCE_MIN_MASS_FRACTION
+        );
+
+        // A starting point the file names is kept, up to and including solid,
+        // which is the one value the key cannot take without the table.
+        for start in [0.6, 1.0] {
+            let params = reduce_of(&format!("\nmass_fraction = {start}"), "").expect("params");
+            assert_eq!(params.mass_fraction, start);
+        }
+        for bad in ["0.0", "-0.2", "1.5"] {
+            let error = reduce_of(&format!("\nmass_fraction = {bad}"), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("mass_fraction") && error.contains("[optimization.reduce]"),
+                "for {bad}: {error}"
+            );
+        }
+
+        // Pinned values reach the params unchanged, zero refinements included.
+        let pinned = reduce_of(
+            "",
+            "ratio = 0.9\nrefine_stages = 0\nmin_mass_fraction = 0.05\n",
+        )
+        .expect("params")
+        .reduce
+        .expect("a reduction");
+        assert_eq!(pinned.ratio, 0.9);
+        assert_eq!(pinned.refine_stages, 0);
+        assert_eq!(pinned.min_mass_fraction, 0.05);
+
+        // The table's keys are its own, and without the table nothing about the
+        // mass fraction changes.
+        let unknown = Config::parse(&with_reduce("", "rate = 0.5\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("rate"), "{unknown}");
+        let missing = Config::parse(&MINIMAL.replace("mass_fraction = 0.3\n", ""))
+            .expect("parse")
+            .optimization_params()
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("mass_fraction is required"), "{missing}");
+    }
+
+    /// Every bound of the table, refused by the key's own name and with the
+    /// figure that was asked for in the message.
+    #[test]
+    fn every_reduce_bound_is_refused_by_name() {
+        // The one required key. A factor of one is a part at its yield strength,
+        // which is not a margin, and the key cannot be left out at all.
+        let target = |value: &str| {
+            Config::parse(&with_reduce("", "").replace(
+                "target_safety_factor = 2.0",
+                &format!("target_safety_factor = {value}"),
+            ))
+            .and_then(|c| c.optimization_params())
+            .unwrap_err()
+            .to_string()
+        };
+        for bad in ["1.0", "0.9", "-3.0", "nan"] {
+            let error = target(bad);
+            assert!(error.contains("target_safety_factor"), "for {bad}: {error}");
+        }
+        let absent =
+            Config::parse(&with_reduce("", "").replace("target_safety_factor = 2.0\n", ""))
+                .unwrap_err()
+                .to_string();
+        assert!(absent.contains("target_safety_factor"), "{absent}");
+
+        for bad in ["0.4", "0.96", "2.0", "-1.0"] {
+            let error = reduce_of("", &format!("ratio = {bad}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("ratio") && error.contains(&constants::REDUCE_RATIO_MAX.to_string()),
+                "for {bad}: {error}"
+            );
+        }
+        let stages = reduce_of(
+            "",
+            &format!(
+                "refine_stages = {}\n",
+                constants::REDUCE_REFINE_STAGES_MAX + 1
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(stages.contains("refine_stages"), "{stages}");
+
+        // The floor is bounded by the fraction the reduction starts from, which
+        // is the one bound that is not a number of its own.
+        for (start, bad) in [("", "0.0"), ("", "1.0"), ("\nmass_fraction = 0.6", "0.7")] {
+            let error = reduce_of(start, &format!("min_mass_fraction = {bad}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("min_mass_fraction")
+                    && error.contains("mass_fraction")
+                    && error.contains("got"),
+                "for {start:?} {bad}: {error}"
+            );
+        }
+        // A start below the default floor fails the same bound with no floor in
+        // the file at all, and the message says the number is the default and
+        // what to do about it rather than quoting it back as the user's.
+        let defaulted = reduce_of("\nmass_fraction = 0.01", "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            defaulted.contains("min_mass_fraction")
+                && defaulted.contains("the key is not set")
+                && defaulted.contains(&constants::REDUCE_MIN_MASS_FRACTION.to_string()),
+            "{defaulted}"
+        );
+        // And a non-finite number is refused by the parse, like every other one.
+        let nan = Config::parse(&with_reduce("", "ratio = nan\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(nan.contains("ratio"), "{nan}");
+    }
+
+    /// The stop test is the stress report's safety factor, and that report reads
+    /// `n/a` without a yield strength: a `[material]` that declares none is
+    /// refused with the table rather than run to a schedule nothing can pass.
+    #[test]
+    fn a_reduction_needs_a_material_that_declares_a_yield_strength() {
+        // The preset the rest of these tests use carries one; this is the same
+        // material written out, with the strength left off.
+        const CUSTOM: &str =
+            "youngs_modulus_mpa = 2300.0\npoisson_ratio = 0.35\ndensity_g_cm3 = 1.24";
+        let without = with_reduce("", "").replace("preset = \"pla\"", CUSTOM);
+        let error = Config::parse(&without)
+            .expect("parse")
+            .optimization_params()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[optimization.reduce]")
+                && error.contains("yield_strength_mpa")
+                && error.contains("preset"),
+            "{error}"
+        );
+
+        // Declared, and the same file resolves.
+        let declared = without.replace(CUSTOM, &format!("{CUSTOM}\nyield_strength_mpa = 45.0"));
+        Config::parse(&declared)
+            .expect("parse")
+            .optimization_params()
+            .expect("params")
+            .reduce
+            .expect("a reduction");
+
+        // Without the table the material is legal as it always was: a run that
+        // never reads a safety factor never needed a yield strength.
+        Config::parse(&MINIMAL.replace("preset = \"pla\"", CUSTOM))
+            .expect("parse")
+            .optimization_params()
+            .expect("params");
+    }
+
+    /// The two evolutionary keys belong to `method = "beso"`, on the pattern
+    /// `[growth.symmetry]` sets: refused under the other method by name rather
+    /// than read and ignored.
+    #[test]
+    fn the_evolutionary_keys_belong_to_the_evolutionary_method() {
+        for key in ["evolution_rate", "add_ratio"] {
+            for method in ["", "method = \"continuation\"\n"] {
+                let error = reduce_of("", &format!("{method}{key} = 0.02\n"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(key) && error.contains("beso"),
+                    "for {key}: {error}"
+                );
+            }
+        }
+        let beso = |keys: &str| {
+            reduce_of("", &format!("method = \"beso\"\n{keys}"))
+                .expect("params")
+                .reduce
+                .expect("a reduction")
+                .method
+        };
+        assert_eq!(
+            beso(""),
+            ReduceMethodParams::Beso {
+                evolution_rate: constants::REDUCE_EVOLUTION_RATE,
+                add_ratio: constants::REDUCE_ADD_RATIO,
+            }
+        );
+        // Zero is the one-way method and is legal.
+        assert_eq!(
+            beso("evolution_rate = 0.05\nadd_ratio = 0.0\n"),
+            ReduceMethodParams::Beso {
+                evolution_rate: 0.05,
+                add_ratio: 0.0,
+            }
+        );
+        for bad in [
+            "evolution_rate = 0.001",
+            "evolution_rate = 0.2",
+            "add_ratio = 0.06",
+            "add_ratio = -0.01",
+        ] {
+            let error = reduce_of("", &format!("method = \"beso\"\n{bad}\n"))
+                .unwrap_err()
+                .to_string();
+            let key = bad.split(' ').next().expect("a key");
+            assert!(error.contains(key), "for {bad}: {error}");
+        }
+    }
+
+    /// The evolutionary method is its own update, so a configuration that also
+    /// names an update scheme is asking for two of them.
+    #[test]
+    fn the_evolutionary_method_is_refused_beside_an_update_scheme() {
+        for scheme in [UpdateScheme::Oc, UpdateScheme::Mma] {
+            let error = reduce_of(
+                &format!("\nupdate = \"{}\"", scheme.label()),
+                "method = \"beso\"\n",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("[optimization.reduce]")
+                    && error.contains("update")
+                    && error.contains(ReduceMethod::Continuation.label()),
+                "for {}: {error}",
+                scheme.label()
+            );
+        }
+        // The default scheme is not a scheme the file asked for, and the
+        // continuation method keeps every choice the SIMP loop has.
+        reduce_of("", "method = \"beso\"\n").expect("beso with no scheme named");
+        reduce_of("\nupdate = \"mma\"", "").expect("continuation keeps its scheme");
+    }
+
+    /// The two tables a reduction cannot share a run with, refused before either
+    /// of them is resolved so that the message is the combination rather than a
+    /// bound priced against a starting fraction of one.
+    #[test]
+    fn a_reduction_is_refused_beside_the_guide_and_the_local_cap() {
+        for table in ["wireframe", "local_volume"] {
+            let error = reduce_of(&format!("\n\n[optimization.{table}]"), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("[optimization.reduce]")
+                    && error.contains(&format!("[optimization.{table}]")),
+                "for {table}: {error}"
+            );
+        }
+    }
+
+    /// The engine gate, on the pattern the overhang, wireframe and local volume
+    /// tables set: neither of the two engines without a density field to reduce
+    /// takes the table, and each says why in its own terms.
+    #[test]
+    fn a_reduction_is_refused_by_the_solid_and_growth_engines() {
+        for engine in [constants::SOLID_ENGINE, constants::GROWTH_ENGINE] {
+            let text = with_reduce("", "").replace(
+                "name = \"unit\"",
+                &format!("name = \"unit\"\nengine = \"{engine}\""),
+            );
+            let error = Config::parse(&text)
+                .expect("parse")
+                .validate_static()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("[optimization.reduce]") && error.contains(engine),
+                "for {engine}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -4881,6 +5602,10 @@ max_steps = 25
                 "\n[optimization.local_volume]\nmax_fraction = 0.6\n",
                 "local_volume",
             ),
+            (
+                "\n[optimization.reduce]\ntarget_safety_factor = 2.0\n",
+                "reduce",
+            ),
         ] {
             let err = Config::parse(&solid(body))
                 .expect("parse")
@@ -5382,6 +6107,21 @@ max_steps = 25
             );
             let parsed = Config::parse(&text).expect("parse");
             assert_eq!(parsed.output.flush, Some(policy));
+        }
+        for method in [ReduceMethod::Continuation, ReduceMethod::Beso] {
+            let text = MINIMAL.replace(
+                "min_feature_mm = 6.0",
+                &format!(
+                    "min_feature_mm = 6.0\n\n[optimization.reduce]\ntarget_safety_factor = \
+                     2.0\nmethod = \"{}\"",
+                    method.label()
+                ),
+            );
+            let parsed = Config::parse(&text).expect("parse");
+            assert_eq!(
+                parsed.optimization.reduce.expect("a reduction").method,
+                Some(method)
+            );
         }
         for op in [CsgOpSpec::Add, CsgOpSpec::Subtract] {
             let text = MINIMAL.replace("op = \"add\"", &format!("op = \"{}\"", op.label()));

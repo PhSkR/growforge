@@ -1502,6 +1502,10 @@ impl Section {
                 // invent for it: how heavy the part may be is what the user
                 // came to decide. It keeps its value, and the button says so.
                 let mass_fraction = config.optimization.mass_fraction;
+                // Design intent for the same reason, and the panel has no row
+                // for it yet: a reset that dropped the table would leave it
+                // written in the file the editor is holding open.
+                let reduce = config.optimization.reduce.clone();
                 let min_feature_mm = voxel_mm.map_or(config.optimization.min_feature_mm, |h| {
                     constants::VIEW_EDIT_RESET_MIN_FEATURE_VOXELS * h
                 });
@@ -1516,6 +1520,7 @@ impl Section {
                     overhang: None,
                     wireframe: None,
                     local_volume: None,
+                    reduce,
                 };
             }
             Section::Growth => {
@@ -1704,11 +1709,18 @@ fn select_engine(config: &mut crate::config::Config, engine: &str) {
         // A `[growth]` table is only legal with that engine.
         config.growth = None;
     }
-    if engine == constants::SOLID_ENGINE {
-        config.optimization.mass_fraction = None;
+    if engine == constants::SOLID_ENGINE || engine == constants::GROWTH_ENGINE {
+        // The four tables both of the other engines refuse, each of them a
+        // control over a density field: the solid engine exports the domain it
+        // is given, and the growth engine places struts and sizes them by
+        // Murray's law.
         config.optimization.overhang = None;
         config.optimization.wireframe = None;
         config.optimization.local_volume = None;
+        config.optimization.reduce = None;
+    }
+    if engine == constants::SOLID_ENGINE {
+        config.optimization.mass_fraction = None;
         // Absent is off, and off is what these three have to be: the solid
         // engine exports the domain exactly, and every one of the passes alters
         // it. The flush depth goes with its policy, unlike the trim's fraction
@@ -4144,6 +4156,7 @@ mod tests {
                     max_fraction: Some(0.55),
                     radius_mm: Some(9.0),
                 }),
+                reduce: None,
             };
             config.growth = Some(GrowthConfig {
                 seed: Some(3),
@@ -4567,7 +4580,9 @@ mod tests {
     /// would alter the very domain the engine exports, and the other gives back
     /// the one key every other engine requires. A switch that did only its half
     /// would leave the session on a file that cannot run, in the middle of an
-    /// edit the user has not finished making.
+    /// edit the user has not finished making. The growth engine is the third
+    /// direction and has the same obligation: it refuses four of the same
+    /// tables, and a switch onto it that left them behind would not build.
     #[test]
     fn switching_to_the_solid_engine_and_back_keeps_the_configuration_valid() {
         let (_dir, path) = write_temp("engine_solid_switch", fixture());
@@ -4641,11 +4656,47 @@ mod tests {
         editor
             .state
             .edit(|config| config.optimization.mass_fraction = Some(0.42));
+        // And the four tables the growth engine refuses go with the switch, put
+        // back here because the trip through the solid engine took them.
+        editor.state.edit(|config| {
+            config.optimization.overhang = Some(OverhangConfig {
+                build_direction: BuildDirection::ZPlus,
+            });
+            config.optimization.wireframe = Some(WireframeConfig {
+                radius_mm: Some(3.0),
+                hold_iterations: None,
+                seed_density: None,
+            });
+            config.optimization.local_volume = Some(LocalVolumeConfig {
+                max_fraction: Some(0.55),
+                radius_mm: None,
+            });
+            config.optimization.reduce = Some(crate::config::ReduceConfig {
+                target_safety_factor: 2.0,
+                method: None,
+                ratio: None,
+                refine_stages: None,
+                min_mass_fraction: None,
+                evolution_rate: None,
+                add_ratio: None,
+            });
+        });
         editor
             .state
             .edit(|config| select_engine(config, constants::GROWTH_ENGINE));
-        assert_eq!(editor.state.config().optimization.mass_fraction, Some(0.42));
-        assert!(editor.state.config().is_growth());
+        editor.state.revalidate();
+        let config = editor.state.config();
+        assert_eq!(config.optimization.mass_fraction, Some(0.42));
+        assert!(config.is_growth());
+        assert_eq!(config.optimization.overhang, None);
+        assert_eq!(config.optimization.wireframe, None);
+        assert_eq!(config.optimization.local_volume, None);
+        assert_eq!(config.optimization.reduce, None);
+        assert!(
+            editor.state.is_valid(),
+            "the switch to the growth engine landed on a configuration that does not build: {:?}",
+            editor.state.error()
+        );
     }
 
     /// The engine reset is the other way onto the default engine, and it has the

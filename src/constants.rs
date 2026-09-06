@@ -784,6 +784,143 @@ pub const WIREFRAME_RESAMPLE_RADII: f64 = 2.0;
 pub const WIREFRAME_CELL_THRESHOLD: f64 = 0.5;
 
 // ---------------------------------------------------------------------------
+// Material reduction
+// ---------------------------------------------------------------------------
+//
+// `[optimization.reduce]` turns the mass target around. Without it a run is told
+// what fraction of the design space to keep and reports the safety factor that
+// came out; with it the run is told the safety factor to hold and reports the
+// fraction it took. The design starts at `mass_fraction` - solid, unless the file
+// names a starting point of its own - and a stage loop lowers the volume target
+// until the stress report on a stage's design falls short of the target, then
+// bisects between the last design that held and the first that did not and
+// exports the lightest one that held.
+//
+// The numbers below are the *schedule*: how large a step the loop takes, how far
+// down it may go, and how finely it closes on the crossing. What a stage is
+// optimized with - the filter, the penalty, the update scheme, the iteration
+// budget - stays with the keys that already govern it.
+
+/// Smallest `[optimization.reduce] target_safety_factor`, exclusive.
+///
+/// A safety factor of one is a part loaded to exactly its yield strength, with
+/// nothing left over for the model's own idealizations: a target at or below it
+/// asks the reduction to stop at a design that is already failing. The bound is
+/// the physical one rather than a recommended margin - what margin a part needs
+/// is the user's to decide, and this only refuses the ones that are not margins.
+pub const REDUCE_TARGET_SAFETY_FACTOR_MIN: f64 = 1.0;
+
+/// Default `[optimization] mass_fraction` when `[optimization.reduce]` is
+/// present: where the reduction starts.
+///
+/// [`DENSITY_MAX`], the solid design space, which is what a reduction starts from
+/// by definition - everything the domain describes is material and the run takes
+/// it away. A file that names its own `mass_fraction` starts there instead, which
+/// is a head start past the stages that would only have removed the obvious.
+pub const REDUCE_START_FRACTION: f64 = DENSITY_MAX;
+
+/// Default `[optimization.reduce] ratio`: the share of the previous stage's
+/// volume target the next stage asks for.
+///
+/// A fifth of the material a stage. That reaches a tenth of the domain in ten
+/// stages and hands the refinement a bracket a fifth of a fraction wide. A
+/// coarser step gets there in fewer full re-convergences and leaves a wider
+/// bracket to close; a finer one pays a whole stage - a SIMP re-convergence and a
+/// stress report - for a bracket the refinement would have closed anyway.
+pub const REDUCE_RATIO: f64 = 0.8;
+
+/// Smallest `[optimization.reduce] ratio`, inclusive.
+///
+/// Half the material in one step is past what a warm start can follow: the stage
+/// begins from a design converged at twice its target, far from anything feasible
+/// for it, and spends a full run's iterations finding its way back. Below that
+/// the stage loop is no longer a schedule but a sequence of unrelated runs.
+pub const REDUCE_RATIO_MIN: f64 = 0.5;
+
+/// Largest `[optimization.reduce] ratio`, inclusive.
+///
+/// A step of five percent of the volume target is the finest step that still
+/// moves the design further than a converged stage's own last iterations do, and
+/// even it costs fourteen stages to halve the mass. Anything closer to one is a
+/// run that never arrives.
+pub const REDUCE_RATIO_MAX: f64 = 0.95;
+
+/// Default `[optimization.reduce] refine_stages`: bisections between the last
+/// volume target that held the safety factor and the first that did not.
+///
+/// Two, which closes the default bracket - a fifth of the fraction - to about a
+/// twentieth of it for two more converged stages. Zero is legal and exports the
+/// last design that held, which is then only as light as the coarse schedule
+/// happened to land.
+pub const REDUCE_REFINE_STAGES: usize = 2;
+
+/// Largest `[optimization.reduce] refine_stages`.
+///
+/// Eight bisections narrow any bracket by a factor of 256, which is finer than
+/// the mass a change of voxel size moves, and each one of them is a full stage:
+/// a SIMP re-convergence and a stress solve. The cap is about the cost rather
+/// than about the arithmetic.
+pub const REDUCE_REFINE_STAGES_MAX: usize = 8;
+
+/// Default `[optimization.reduce] min_mass_fraction`: the volume target the
+/// schedule will not go below.
+///
+/// Two percent of the design space. A design that still holds the target there is
+/// a sign that the loads, the supports or the domain are not what the run was
+/// meant to be given, and it is a design a stress report on a handful of voxels
+/// is in no position to vouch for. Reaching the floor with the target still met
+/// stops the run and exports that design; the floor is a stop, not a failure.
+pub const REDUCE_MIN_MASS_FRACTION: f64 = 0.02;
+
+/// Default `[optimization.reduce] evolution_rate`, `method = "beso"` only: the
+/// share of the current volume removed in one iteration.
+///
+/// Two percent an iteration, the figure the bi-directional evolutionary method is
+/// written around: fast enough to cross tens of percent of the volume in tens of
+/// iterations, slow enough that the elements a step removes are ones the
+/// sensitivity ranking really put last rather than a slab of everything near the
+/// cut.
+///
+/// X. Huang, Y.M. Xie, "Convergent and mesh-independent solutions for the
+/// bi-directional evolutionary structural optimization method", Finite Elements
+/// in Analysis and Design 43 (2007) 1039-1049.
+pub const REDUCE_EVOLUTION_RATE: f64 = 0.02;
+
+/// Smallest `[optimization.reduce] evolution_rate`, inclusive.
+///
+/// Half a percent an iteration takes about 140 iterations to halve the volume,
+/// which is the whole of a normal iteration budget spent on the schedule rather
+/// than on the design.
+pub const REDUCE_EVOLUTION_RATE_MIN: f64 = 0.005;
+
+/// Largest `[optimization.reduce] evolution_rate`, inclusive.
+///
+/// A tenth of the volume in one hard step: the elements it removes reach well
+/// past the ones the ranking is confident about, and the displacements the next
+/// sensitivity is read from are those of a structure that lost a member rather
+/// than a layer of one.
+pub const REDUCE_EVOLUTION_RATE_MAX: f64 = 0.1;
+
+/// Default `[optimization.reduce] add_ratio`, `method = "beso"` only: the largest
+/// share of the current volume that may come back in one iteration.
+///
+/// Half the removal rate, so a step is always a net removal and the schedule
+/// keeps moving, while a member the loads want back can still return - which is
+/// the whole of what makes the method bi-directional rather than a one-way
+/// erosion that can never undo a cut it should not have made.
+pub const REDUCE_ADD_RATIO: f64 = 0.01;
+
+/// Largest `[optimization.reduce] add_ratio`, inclusive.
+///
+/// Half of [`REDUCE_EVOLUTION_RATE_MAX`], so that a step at the top of the
+/// removal range still takes away twice what it gives back. Nothing here forbids
+/// the pairings that add back more than they remove - what that costs is a
+/// schedule that stops descending, which the stage loop is the one to report -
+/// and zero is legal at the other end, making the method the one-way evolutionary
+/// structural optimization it descends from.
+pub const REDUCE_ADD_RATIO_MAX: f64 = 0.05;
+
+// ---------------------------------------------------------------------------
 // Growth engine
 // ---------------------------------------------------------------------------
 //

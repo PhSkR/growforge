@@ -387,6 +387,7 @@ mod tests {
                 overhang: None,
                 wireframe: None,
                 local_volume: None,
+                reduce: None,
             },
             growth: None,
             solver: crate::config::SolverParams {

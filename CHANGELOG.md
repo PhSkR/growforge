@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-09-05 - 0.43.0 - (title pending)
+
+- **`[optimization.reduce]`** is read, validated and echoed by `check`: a
+  required `target_safety_factor`, a `method` of `"continuation"` or `"beso"`,
+  and the schedule around them (`ratio`, `refine_stages`, `min_mass_fraction`,
+  and `evolution_rate` / `add_ratio` for the evolutionary method alone). With
+  the table present `mass_fraction` is optional and means the fraction the run
+  *starts* from - solid when it is left out. Refused by the solid and growth
+  engines, beside `[optimization.wireframe]` or `[optimization.local_volume]`,
+  beside an `update` scheme under `method = "beso"`, and with a `[material]`
+  that declares no `yield_strength_mpa` - the safety factor is measured against
+  it. Nothing removes material yet; the stage loop is the next change.
+- **Switching to the growth engine** in the editor now takes the four
+  `[optimization]` tables that engine refuses with it (`overhang`, `wireframe`,
+  `local_volume`, `reduce`), as the switch to `solid` already did.
+
 ## 2026-08-17 - 0.42.0 - Copy and paste an object
 
 Building a part out of four of the same bracket meant drawing it four times.

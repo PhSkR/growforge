@@ -5,7 +5,9 @@
 //! (a viewer, a batch runner) can consume the same stream.
 
 use crate::bench::BenchReport;
-use crate::config::{IslandPolicy, SolverBackend, SolverParams, UpdateScheme, VoidPolicy};
+use crate::config::{
+    IslandPolicy, ReduceMethodParams, SolverBackend, SolverParams, UpdateScheme, VoidPolicy,
+};
 use crate::constants;
 use crate::flush::FlushReport;
 use crate::mesh::clamp::ClampReport;
@@ -330,6 +332,43 @@ pub fn print_problem_summary(problem: &Problem) {
                 );
             }
             None => {
+                // First in the block because it changes what the mass target
+                // line above it means: under a reduction that fraction is where
+                // the run starts rather than where it has to end up.
+                println!(
+                    "reduce         {}",
+                    match problem.optimization.reduce {
+                        Some(reduce) => format!(
+                            "{}, material removed until the safety factor reaches {:.3}; the \
+                             volume target starts at {} and takes {:.3} of itself a stage down to \
+                             a floor of {:.3}, {}{}",
+                            reduce.method.kind().label(),
+                            reduce.target_safety_factor,
+                            problem.optimization.mass_fraction,
+                            reduce.ratio,
+                            reduce.min_mass_fraction,
+                            match reduce.refine_stages {
+                                0 => "and the lightest target that holds is exported unrefined"
+                                    .to_string(),
+                                n => format!(
+                                    "then {n} bisections between the last target that holds and \
+                                     the first that does not"
+                                ),
+                            },
+                            match reduce.method {
+                                ReduceMethodParams::Beso {
+                                    evolution_rate,
+                                    add_ratio,
+                                } => format!(
+                                    "; each iteration removes {evolution_rate:.3} of the volume \
+                                     and lets up to {add_ratio:.3} of it back"
+                                ),
+                                ReduceMethodParams::Continuation => String::new(),
+                            }
+                        ),
+                        None => "off, mass_fraction is the target the run meets".to_string(),
+                    }
+                );
                 println!(
                     "filter radius  {:.3} mm ({:.2} voxels) from min_feature_mm {:.3}",
                     problem.optimization.filter_radius_mm,

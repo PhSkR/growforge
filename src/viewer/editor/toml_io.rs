@@ -278,6 +278,19 @@ impl Document {
             }
             None => drop(optimization.remove("local_volume")),
         }
+        match &config.optimization.reduce {
+            Some(reduce) => {
+                let table = sub_table(optimization, "reduce", Style::Table);
+                set_float(table, "target_safety_factor", reduce.target_safety_factor);
+                set_opt_str(table, "method", reduce.method.map(|m| m.label()));
+                set_opt_float(table, "ratio", reduce.ratio);
+                sink.count(table, "refine_stages", reduce.refine_stages);
+                set_opt_float(table, "min_mass_fraction", reduce.min_mass_fraction);
+                set_opt_float(table, "evolution_rate", reduce.evolution_rate);
+                set_opt_float(table, "add_ratio", reduce.add_ratio);
+            }
+            None => drop(optimization.remove("reduce")),
+        }
 
         match &config.solver {
             Some(solver) => {
@@ -1220,6 +1233,97 @@ mod tests {
         config.optimization.update = None;
         document.sync(&config).expect("sync");
         assert_eq!(document.render(), text, "the table outlived the cap");
+    }
+
+    /// The reduction table: one required key written, the optional ones only
+    /// when they are pinned, and the whole table out of the file again when the
+    /// configuration no longer has it.
+    #[test]
+    fn the_reduce_table_round_trips_with_the_keys_that_were_pinned() {
+        use crate::config::{ReduceConfig, ReduceMethod, ReduceMethodParams};
+
+        let text = fixture();
+        let (mut config, mut document) = open(text);
+
+        config.optimization.reduce = Some(ReduceConfig {
+            target_safety_factor: 2.5,
+            method: None,
+            ratio: None,
+            refine_stages: None,
+            min_mass_fraction: None,
+            evolution_rate: None,
+            add_ratio: None,
+        });
+        document.sync(&config).expect("sync");
+        let saved = document.render();
+        assert!(saved.contains("[optimization.reduce]"), "{saved}");
+        assert!(saved.contains("target_safety_factor = 2.5"), "{saved}");
+        // "ratio" on its own is a substring of max_iterations, so it is asked
+        // for the way it would be written.
+        for key in [
+            "method",
+            "\nratio",
+            "refine_stages",
+            "min_mass_fraction",
+            "evolution_rate",
+            "add_ratio",
+        ] {
+            assert!(!saved.contains(key), "{key} was written unpinned: {saved}");
+        }
+        let reparsed = Config::parse(&saved).expect("reparse");
+        reparsed
+            .validate_static()
+            .expect("the saved file has to run");
+        let reduce = reparsed
+            .optimization_params()
+            .expect("params")
+            .reduce
+            .expect("a reduction");
+        assert_eq!(reduce.target_safety_factor, 2.5);
+        assert_eq!(reduce.method, ReduceMethodParams::Continuation);
+        // The mass fraction the fixture already carries is where it starts.
+        assert_eq!(
+            reparsed
+                .optimization_params()
+                .expect("params")
+                .mass_fraction,
+            0.3
+        );
+
+        // Pinned keys, the two evolutionary ones included, arrive and read back
+        // as themselves.
+        config.optimization.reduce = Some(ReduceConfig {
+            target_safety_factor: 2.5,
+            method: Some(ReduceMethod::Beso),
+            ratio: Some(0.9),
+            refine_stages: Some(3),
+            min_mass_fraction: Some(0.05),
+            evolution_rate: Some(0.03),
+            add_ratio: Some(0.0),
+        });
+        document.sync(&config).expect("sync");
+        let saved = document.render();
+        let reduce = Config::parse(&saved)
+            .expect("reparse")
+            .optimization_params()
+            .expect("params")
+            .reduce
+            .expect("a reduction");
+        assert_eq!(reduce.ratio, 0.9);
+        assert_eq!(reduce.refine_stages, 3);
+        assert_eq!(reduce.min_mass_fraction, 0.05);
+        assert_eq!(
+            reduce.method,
+            ReduceMethodParams::Beso {
+                evolution_rate: 0.03,
+                add_ratio: 0.0,
+            }
+        );
+
+        // And unset, the whole table goes: the file is what it was.
+        config.optimization.reduce = None;
+        document.sync(&config).expect("sync");
+        assert_eq!(document.render(), text, "the table outlived the reduction");
     }
 
     /// `[optimization] stiffness_floor` is written in exponent notation, and
