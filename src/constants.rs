@@ -2382,6 +2382,20 @@ pub const VIEW_EDIT_FILE_FILTER: &str = "growforge 3D configuration";
 /// the file the session was editing.
 pub const VIEW_EDIT_RECOVERY_EXTENSION: &str = "recovered.toml";
 
+/// Extension of the STL an editing session writes beside the configured one
+/// when the viewer dies with a design still in it.
+///
+/// The same second-extension convention as [`VIEW_EDIT_RECOVERY_EXTENSION`] and
+/// for the same reason: a rescue is not a run that finished, so it may never
+/// land on the path the configuration names. What is there may be the part a run
+/// that *did* finish wrote, and the one-output-path-per-session rule that keeps
+/// two editors from fighting over it is the last thing a dying one may break.
+pub const VIEW_EDIT_RESCUE_STL_EXTENSION: &str = "recovered.stl";
+
+/// Extension of the JSON stress report the same rescue writes beside the
+/// configured one, when the configuration asked for a report at all.
+pub const VIEW_EDIT_RESCUE_REPORT_EXTENSION: &str = "recovered.json";
+
 /// Title of the dialog the "open" button raises.
 pub const VIEW_EDIT_OPEN_DIALOG_TITLE: &str = "open a growforge 3D configuration";
 

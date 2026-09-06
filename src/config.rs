@@ -442,7 +442,8 @@ pub struct SolverParams {
     pub backend: SolverBackend,
     /// True when the configuration named the backend itself, which is what
     /// makes it an instruction rather than a preference: a named backend that
-    /// cannot be provided is an error, and is never quietly softened.
+    /// cannot be provided is an error, and is never quietly softened - neither
+    /// when it is opened nor when it fails half way through a run.
     pub explicit: bool,
     /// Set when the default asked for a backend this build or this machine
     /// could not provide, so the summary can say what is running instead.

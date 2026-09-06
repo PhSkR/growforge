@@ -305,6 +305,43 @@ impl<'a> ViewerApp<'a> {
         self.rescue_unsaved_edits();
         self.error = Some(error);
         self.begin_teardown();
+        // After the teardown rather than before it: the teardown stops the
+        // session's runs, and a rescue started ahead of it would be stopped with
+        // them. The loop then goes on servicing its message queue until the
+        // export's thread ends, exactly as it does for a run winding down - see
+        // [`ViewerApp::should_keep_pumping`].
+        self.rescue_retained_design();
+    }
+
+    /// Export the design a dying editing session still holds, and say where it
+    /// is going and why.
+    ///
+    /// The other half of the rescue above: the document is what was typed and
+    /// this is what was computed - a run's hours, which the window dying would
+    /// otherwise take with it. It goes beside the configured files rather than
+    /// onto them, exactly as the document does, so nothing a session that died
+    /// writes can land on a good part. A `view` or `run --view` window has no
+    /// session and nothing to do here.
+    ///
+    /// Reported on the console, because the panel that would have carried it
+    /// belongs to the window that has just died; the export says where the file
+    /// went when it is there.
+    fn rescue_retained_design(&mut self) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        match editor.rescue_design() {
+            Some(path) => println!(
+                "editor rescue the viewer stopped with the run's design in it; it is being \
+                 written to {}\n\
+                 editor rescue the configured output is left as it is",
+                path.display()
+            ),
+            None => println!(
+                "editor rescue the viewer stopped with no design behind it; there is nothing to \
+                 write"
+            ),
+        }
     }
 
     /// Write an editing session's unsaved document beside the file it came
@@ -823,8 +860,15 @@ impl<'a> ViewerApp<'a> {
                 }
             }
             WindowEvent::Resized(size) => {
-                if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.resize(size.width, size.height);
+                // A device that will not give the new size a surface or a depth
+                // texture has rejected a frame, which is the renderer's own
+                // bounded retry; only the end of that retry gets here.
+                let refused = self
+                    .gpu
+                    .as_mut()
+                    .and_then(|gpu| gpu.resize(size.width, size.height).err());
+                if let Some(error) = refused {
+                    self.fail(error);
                 }
                 self.surface_size = Some((size.width, size.height));
             }

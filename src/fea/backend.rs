@@ -23,6 +23,15 @@ use crate::problem::Problem;
 pub struct LinearSolver {
     backend: Backend,
     fallbacks: usize,
+    /// Set when the configuration expressed a preference rather than naming a
+    /// backend, which is what decides who finishes a solve the device could
+    /// not: the CPU, or nobody.
+    ///
+    /// The same line [`LinearSolver::new`] draws when it opens a backend at
+    /// all, held for the rest of the run - a device that fails half way
+    /// through a run is the same machine that could have failed to open, and
+    /// the answer to it is the same one.
+    may_fall_back: bool,
 }
 
 #[derive(Debug)]
@@ -41,6 +50,7 @@ impl LinearSolver {
         LinearSolver {
             backend: Backend::Cpu,
             fallbacks: 0,
+            may_fall_back: false,
         }
     }
 
@@ -50,11 +60,15 @@ impl LinearSolver {
     /// this build cannot provide; the message says how to fall back to the CPU.
     /// A backend nobody asked for by name - the default - falls back to the CPU
     /// instead of failing, and says so once: a machine with no adapter is a
-    /// machine to run on, not a configuration error.
+    /// machine to run on, not a configuration error. The same softness carries
+    /// into the run: see [`LinearSolver::may_fall_back`].
     pub fn new(problem: &Problem) -> Result<LinearSolver> {
         let wanted = problem.solver.backend;
         match LinearSolver::for_backend(wanted, &problem.grid, &problem.fixed) {
-            Ok(solver) => Ok(solver),
+            Ok(mut solver) => {
+                solver.may_fall_back = !problem.solver.explicit;
+                Ok(solver)
+            }
             Err(error) if !problem.solver.explicit && wanted != SolverBackend::Cpu => {
                 report_fallback(&error);
                 LinearSolver::for_backend(SolverBackend::Cpu, &problem.grid, &problem.fixed)
@@ -88,9 +102,13 @@ impl LinearSolver {
                 )
             }
         };
+        // A backend asked for by name, until a caller that knows better says
+        // otherwise: this is the entry point a library caller and the benchmark
+        // name one through, and neither wants a different one silently.
         Ok(LinearSolver {
             backend,
             fallbacks: 0,
+            may_fall_back: false,
         })
     }
 
@@ -112,8 +130,9 @@ impl LinearSolver {
         }
     }
 
-    /// How many solves this solver has had to finish on the CPU because single
-    /// precision could not resolve the system it was handed.
+    /// How many solves this solver has had to finish on the CPU: the ones
+    /// single precision could not resolve, and the ones the device itself would
+    /// not do.
     ///
     /// Zero for a CPU backend, and zero for a GPU backend on every design the
     /// device can actually solve. A non-zero count is the machine-readable half
@@ -124,22 +143,38 @@ impl LinearSolver {
     }
 
     /// Bind the operator of one design, ready for its load cases.
+    ///
+    /// A device that will not take the design is the same event as one that
+    /// fails a solve of it, and answered the same way: the load cases of this
+    /// design run on the CPU when nobody named the device, and the error is the
+    /// caller's when somebody did.
     pub fn bind<'a>(
         &'a mut self,
         operator: &'a StiffnessOperator<'a>,
         diagonal: &'a [f64],
         fixed: &'a [bool],
     ) -> Result<BoundSolver<'a>> {
-        match &mut self.backend {
-            Backend::Cpu => {}
+        let refused = match &mut self.backend {
+            Backend::Cpu => false,
             #[cfg(feature = "gpu")]
-            Backend::Gpu(gpu) => gpu.bind(operator, diagonal, fixed)?,
-        }
+            Backend::Gpu(gpu) => match gpu.bind(operator, diagonal, fixed) {
+                Ok(()) => false,
+                Err(error) => {
+                    if !self.may_fall_back {
+                        report_device_failure(&error);
+                        return Err(error);
+                    }
+                    report_device_fallback(&error);
+                    true
+                }
+            },
+        };
         Ok(BoundSolver {
             solver: self,
             operator,
             diagonal,
             fixed,
+            refused,
         })
     }
 }
@@ -151,6 +186,9 @@ pub struct BoundSolver<'a> {
     operator: &'a StiffnessOperator<'a>,
     diagonal: &'a [f64],
     fixed: &'a [bool],
+    /// Set when the device would not take this design: what is on it is another
+    /// design's, so every load case of this one runs on the CPU.
+    refused: bool,
 }
 
 impl BoundSolver<'_> {
@@ -165,25 +203,46 @@ impl BoundSolver<'_> {
     /// passes [`SolveLimits::new`] - which is every command line path - is
     /// running the arithmetic it always ran.
     pub fn solve(&mut self, b: &[f64], x: &mut [f64], limits: SolveLimits<'_>) -> Result<Solve> {
+        if self.refused {
+            // The bind already said so, once. Every load case of this design is
+            // one more solve the CPU is doing.
+            self.solver.fallbacks += 1;
+            return self.on_the_cpu(b, x, limits);
+        }
         match &mut self.solver.backend {
             Backend::Cpu => {}
-            // A device that could not resolve this system in single precision
-            // has not failed the caller: it has said which of the two backends
-            // has to do this one. Falling through to the CPU here rather than
-            // returning the error is what keeps a run alive across the handful
-            // of optimization iterations whose design has run past what f32 can
-            // describe. Every other error - a lost device, a buffer that would
-            // not map - is still an error.
             #[cfg(feature = "gpu")]
             Backend::Gpu(gpu) => match gpu.solve(self.operator, self.fixed, b, x, limits) {
-                Err(error)
-                    if error
-                        .downcast_ref::<crate::fea::gpu::SinglePrecisionLimit>()
-                        .is_some() =>
-                {
-                    report_single_precision_fallback(&error);
-                    self.solver.fallbacks += 1;
-                }
+                Err(error) => match unfinished(&error, self.solver.may_fall_back) {
+                    // A device that could not resolve this system in single
+                    // precision has not failed the caller: it has said which of
+                    // the two backends has to do this one. Falling through to
+                    // the CPU here rather than returning the error is what
+                    // keeps a run alive across the handful of optimization
+                    // iterations whose design has run past what f32 can
+                    // describe.
+                    Unfinished::Precision => {
+                        report_single_precision_fallback(&error);
+                        self.solver.fallbacks += 1;
+                    }
+                    // The device itself - gone away, or with no memory left for
+                    // the buffers this solve wanted. Nobody named it, so it was
+                    // a preference, and the answer is the one a machine with no
+                    // adapter at all gets: the CPU does the work and the run
+                    // goes on. Said in the device's own words, never the
+                    // arithmetic's - see [`report_device_fallback`].
+                    Unfinished::Device => {
+                        report_device_fallback(&error);
+                        self.solver.fallbacks += 1;
+                    }
+                    // Named, and therefore an instruction: a run told to solve
+                    // on a device that has failed is not a run to finish
+                    // somewhere else.
+                    Unfinished::Fatal => {
+                        report_device_failure(&error);
+                        return Err(error);
+                    }
+                },
                 other => return other,
             },
         }
@@ -200,6 +259,40 @@ impl BoundSolver<'_> {
             x,
             limits,
         )
+    }
+}
+
+/// What a solve the compute backend did not finish means for the run.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unfinished {
+    /// Single precision could not resolve this system. The CPU finishes it
+    /// whichever backend the configuration named: a solve completed at higher
+    /// precision is not a backend anybody can forbid.
+    Precision,
+    /// The device failed, and nobody named it. The CPU finishes it, exactly as
+    /// it finishes the work of a machine that had no adapter to open.
+    Device,
+    /// The device failed, and the configuration named it. The run ends.
+    Fatal,
+}
+
+/// Read one for what it is.
+///
+/// The whole of the policy, in one place and testable without a device: what
+/// separates the first case from the other two is the error's own type, and what
+/// separates those two is whether the configuration said `backend = "gpu"`.
+#[cfg(feature = "gpu")]
+fn unfinished(error: &anyhow::Error, may_fall_back: bool) -> Unfinished {
+    if error
+        .downcast_ref::<crate::fea::gpu::SinglePrecisionLimit>()
+        .is_some()
+    {
+        Unfinished::Precision
+    } else if may_fall_back {
+        Unfinished::Device
+    } else {
+        Unfinished::Fatal
     }
 }
 
@@ -227,6 +320,73 @@ fn report_single_precision_fallback(error: &anyhow::Error) {
     );
 }
 
+/// Say that a solve the *device* would not do was finished on the CPU.
+///
+/// The single precision notice above says the arithmetic was too hard for the
+/// device; this one says the device was in no state to do arithmetic at all -
+/// something else on the machine has its memory, or it has gone away. What a
+/// user does about the two could not be less alike, so they are never said in
+/// the same words. Once per process with the advice and one line each after it,
+/// exactly as the notice above: a card with nothing left answers every later
+/// solve the same way, and a wall of identical lines would bury the first.
+#[cfg(feature = "gpu")]
+fn report_device_fallback(error: &anyhow::Error) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        println!("solver         again on the CPU ({})", device_note(error));
+        return;
+    }
+    println!(
+        "solver         this solve was finished on the CPU: {} ({error:#}). The answer meets the \
+         same tolerance the GPU one would have, at CPU speed; set [solver] backend = \"cpu\" to \
+         stop the device trying.",
+        device_note(error)
+    );
+}
+
+/// What to call a device that would not do the work: the memory when it said
+/// that was why, the device itself otherwise.
+#[cfg(feature = "gpu")]
+fn device_note(error: &anyhow::Error) -> &'static str {
+    if out_of_memory(error) {
+        "the compute device had no memory left for it"
+    } else {
+        "the compute device failed rather than the arithmetic"
+    }
+}
+
+/// Whether a device said in so many words that its memory had run out.
+#[cfg(feature = "gpu")]
+fn out_of_memory(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::device::Refused>()
+        .is_some_and(crate::device::Refused::out_of_memory)
+}
+
+/// Say that a solve ended because the *device* failed, not because single
+/// precision could not resolve the system.
+///
+/// The two arrive at the same place and read alike, and what to do about them
+/// could not be more different: one is a design the CPU finishes in seconds, the
+/// other is a machine that cannot carry this run at all. This is the end of a
+/// run rather than a fallback, because the configuration named the device it is
+/// about - see [`Unfinished`]. Once per process, because a device that has gone
+/// away or run out of memory answers every solve after this one the same way,
+/// and the run ends on the first.
+#[cfg(feature = "gpu")]
+fn report_device_failure(error: &anyhow::Error) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    println!(
+        "solver         the compute device failed this solve rather than the arithmetic \
+         ({error:#}); set [solver] backend = \"cpu\" to run without it"
+    );
+}
+
 /// Say once per process that the default backend could not be opened and what
 /// is running instead.
 ///
@@ -242,10 +402,28 @@ fn report_fallback(error: &anyhow::Error) {
     if SAID.swap(true, Ordering::Relaxed) {
         return;
     }
-    println!(
-        "solver         {} ({error:#})",
-        crate::config::SolverFallback::NoAdapter.note()
-    );
+    println!("solver         {} ({error:#})", fallback_note(error));
+}
+
+/// What to call a default backend that could not be opened.
+///
+/// Almost always the machine: no adapter, or no `gpu` feature. A device that
+/// refused because it had *no memory left* is the other thing entirely - the
+/// card is there and something else is using it - and calling that "no compute
+/// adapter on this machine" would send the user looking for a driver they have.
+#[cfg(feature = "gpu")]
+fn fallback_note(error: &anyhow::Error) -> &'static str {
+    if out_of_memory(error) {
+        return "the compute device had no memory left for this problem, so the default backend \
+                fell back to the cpu";
+    }
+    crate::config::SolverFallback::NoAdapter.note()
+}
+
+/// A build with no compute backend has only ever the one reason.
+#[cfg(not(feature = "gpu"))]
+fn fallback_note(_error: &anyhow::Error) -> &'static str {
+    crate::config::SolverFallback::NoAdapter.note()
 }
 
 /// Build a GPU solver for a test, or explain why the test is being skipped.
@@ -447,6 +625,115 @@ mod tests {
         // And a named CPU backend is the CPU backend, fallback or not.
         let cpu = LinearSolver::new(&problem(SolverBackend::Cpu, true)).expect("cpu");
         assert_eq!(cpu.kind(), SolverBackend::Cpu);
+
+        // The same reading holds for the rest of the run, not just for the
+        // opening: a device that fails half way through a run of hours is the
+        // same machine that could have failed to open one.
+        assert!(
+            soft.may_fall_back,
+            "a backend nobody named stays a preference once it is open"
+        );
+        assert!(
+            !cpu.may_fall_back,
+            "a backend the configuration named stays an instruction"
+        );
+    }
+
+    /// What a solve the compute backend did not finish means for the run.
+    ///
+    /// Three cases and two questions. Single precision that could not resolve
+    /// the system is the CPU's whoever named the backend - a solve completed at
+    /// higher precision is nobody's instruction to countermand. The device
+    /// failing is the CPU's for a backend nobody named, and the end of the run
+    /// for one the configuration asked for by name. And the two are never
+    /// reported in the same words: "the arithmetic was too hard" sends a user
+    /// after their design, where what happened was that something else on the
+    /// machine had taken the card's memory.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_device_that_fails_a_solve_is_the_cpus_unless_the_configuration_named_it() {
+        let precision = crate::fea::gpu::defeated("the device stopped improving".to_string());
+        assert_eq!(unfinished(&precision, true), Unfinished::Precision);
+        assert_eq!(
+            unfinished(&precision, false),
+            Unfinished::Precision,
+            "a solve finished at higher precision is no backend choice's business"
+        );
+
+        let exhausted = crate::device::refused(
+            "run a solve on the compute device",
+            &crate::device::Refusal::of(wgpu::Error::OutOfMemory {
+                source: Box::new(std::io::Error::other("no memory")),
+            }),
+        );
+        assert_eq!(unfinished(&exhausted, true), Unfinished::Device);
+        assert_eq!(
+            unfinished(&exhausted, false),
+            Unfinished::Fatal,
+            "a run told to solve on the device does not quietly solve somewhere else"
+        );
+        assert_eq!(
+            device_note(&exhausted),
+            "the compute device had no memory left for it",
+            "the one cause a user can act on has to be the one they are told"
+        );
+
+        // Everything else the device answers with - a buffer that would not map,
+        // a device that has gone away - is the device failing too, and is named
+        // as the device rather than as the arithmetic.
+        let lost = anyhow::anyhow!("the solution buffer could not be mapped");
+        assert_eq!(unfinished(&lost, true), Unfinished::Device);
+        assert_eq!(unfinished(&lost, false), Unfinished::Fatal);
+        assert_eq!(
+            device_note(&lost),
+            "the compute device failed rather than the arithmetic"
+        );
+    }
+
+    /// A design the device will not take is bound to the CPU instead, and its
+    /// load cases run there.
+    ///
+    /// The bind is where a card somebody else is using refuses first: the design
+    /// is what crosses the bus. What is on trial is that the solves after such a
+    /// bind happen at all, that they happen on the CPU rather than against
+    /// whatever design is still on the device, and that they are counted. A
+    /// healthy card is asked for a design of a grid it was not built for, which
+    /// is the one bind it refuses without another program taking its memory.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_design_the_device_will_not_take_runs_on_the_cpu_instead() {
+        let grid = solid_grid();
+        let fixed = vec![false; grid.n_dof()];
+        let Some(mut solver) = gpu_or_skip("the bind fallback test", &grid, &fixed) else {
+            return;
+        };
+        // What a configuration with no backend named in it opens.
+        solver.may_fall_back = true;
+
+        let other = fixture();
+        let moduli = vec![2300.0; other.grid.n_cells()];
+        let operator = StiffnessOperator::new(&other.grid, &other.ke0, &moduli);
+        let diagonal = operator.diagonal();
+        let mut x = vec![0.0; other.grid.n_dof()];
+        let solved = solver
+            .bind(&operator, &diagonal, &other.fixed)
+            .expect("a backend nobody named must bind to the CPU rather than fail")
+            .solve(&other.forces, &mut x, limits())
+            .expect("the CPU must finish the solve the device would not take");
+        assert!(
+            solved.converged().is_some(),
+            "the fallback solve answered nothing: {solved:?}"
+        );
+        assert_eq!(
+            solver.cpu_fallbacks(),
+            1,
+            "a solve the CPU had to do went uncounted"
+        );
+        assert_eq!(
+            solver.kind(),
+            SolverBackend::Gpu,
+            "one design the device refused is not the run giving up on it"
+        );
     }
 
     /// A cantilever bar clamped on its `x = 0` face and pulled down at the far

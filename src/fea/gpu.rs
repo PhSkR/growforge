@@ -92,6 +92,7 @@ use crate::constants::{
     self, DOF_PER_ELEMENT, GPU_DISPATCH_WORKGROUPS, GPU_SCALAR_BREAKDOWN, GPU_SCALAR_COUNT,
     GPU_SCALAR_RESIDUAL_SQ,
 };
+use crate::device::{Scopes, refused_with};
 use crate::fea::{CancelProbe, CgSolution, Solve, SolveLimits, StiffnessOperator, solver};
 use crate::grid::Grid;
 
@@ -166,7 +167,7 @@ impl std::fmt::Display for SinglePrecisionLimit {
 impl std::error::Error for SinglePrecisionLimit {}
 
 /// Wrap a reason as the outcome the CPU fallback watches for.
-fn defeated(reason: String) -> anyhow::Error {
+pub(crate) fn defeated(reason: String) -> anyhow::Error {
     anyhow::Error::new(SinglePrecisionLimit { reason })
 }
 
@@ -285,6 +286,14 @@ impl GpuSolver {
             )
         })?;
 
+        // Everything below is asked of the device, and a device with no memory
+        // left refuses - which wgpu answers with a panic unless somebody is
+        // reading. The vectors here are one f32 per degree of freedom each and
+        // there are eight of them, so this is the allocation another program's
+        // hold on the card is felt in first. Read at the end, where it becomes
+        // the error this constructor has always been able to return and
+        // [`crate::fea::backend::LinearSolver::new`] falls back from.
+        let scopes = Scopes::open(&device);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("growforge_pcg"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -433,6 +442,13 @@ impl GpuSolver {
             finish_update: pipeline("finish_update"),
             update_p: pipeline("update_p"),
         };
+        if let Some(refusal) = scopes.close() {
+            return Err(refused_with(
+                &format!("give the compute solver on \"{}\" its buffers", info.name),
+                &refusal,
+                "set [solver] backend = \"cpu\" to solve on the CPU",
+            ));
+        }
 
         Ok(GpuSolver {
             device,
@@ -491,6 +507,10 @@ impl GpuSolver {
             );
         }
 
+        // Everything the design costs the device, under one reading: a card
+        // with no memory left refuses a write to a buffer it has invalidated,
+        // and the alternative to reading that is the process dying of it.
+        let scopes = Scopes::open(&self.device);
         let mut flat = vec![0.0f32; DOF_PER_ELEMENT * DOF_PER_ELEMENT];
         for (row, values) in operator.ke0().iter().enumerate() {
             for (column, value) in values.iter().enumerate() {
@@ -520,6 +540,18 @@ impl GpuSolver {
             .collect();
         self.queue
             .write_buffer(&self.buffers.minv, 0, bytemuck::cast_slice(&inverse));
+        if let Some(refusal) = scopes.close() {
+            // Half a design is on the device, so nothing may solve against it
+            // until a later bind replaces it: the moduli left there are another
+            // design's, and a solve reading them would answer the wrong
+            // question rather than fail.
+            self.bound = false;
+            return Err(refused_with(
+                "give the compute solver this design",
+                &refusal,
+                "set [solver] backend = \"cpu\" to solve on the CPU",
+            ));
+        }
         self.bound = true;
         Ok(())
     }
@@ -537,6 +569,35 @@ impl GpuSolver {
     /// the latency of a stop is one batch of
     /// [`constants::GPU_RESIDUAL_CHECK_INTERVAL`] device iterations.
     pub fn solve(
+        &mut self,
+        operator: &StiffnessOperator,
+        fixed: &[bool],
+        b: &[f64],
+        x: &mut [f64],
+        limits: SolveLimits<'_>,
+    ) -> Result<Solve> {
+        // One reading for the whole solve: the encoders, the submissions and
+        // the readback buffers of every pass are asked for inside it, and a
+        // device that refuses any of them is why this solve ended - whatever
+        // the refinement below made of what came back afterwards.
+        let scopes = Scopes::open(&self.device);
+        let solved = self.refine(operator, fixed, b, x, limits);
+        match scopes.close() {
+            None => solved,
+            Some(refusal) => Err(refused_with(
+                "run a solve on the compute device",
+                &refusal,
+                "set [solver] backend = \"cpu\" to solve on the CPU",
+            )),
+        }
+    }
+
+    /// The mixed precision refinement itself, inside [`GpuSolver::solve`]'s
+    /// reading of what the device refused.
+    ///
+    /// Split out for that reading alone: the loop returns from a dozen places,
+    /// and a scope has to be closed on every one of them.
+    fn refine(
         &mut self,
         operator: &StiffnessOperator,
         fixed: &[bool],

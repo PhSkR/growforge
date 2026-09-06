@@ -8,6 +8,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::constants;
+use crate::device::{Scopes, ask, refused, refused_with};
 use crate::viewer::camera::{self, Mat4};
 use crate::viewer::scene::{LAYERS, Layer, LayerMesh, Scene, Vertex};
 
@@ -36,19 +37,25 @@ struct LayerBuffer {
 /// policy below is decided - and tested - without a device to acquire from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceStatus {
-    /// A frame came back and can be drawn into.
+    /// A frame came back and was drawn into.
     Acquired,
     /// No frame this time, and nothing is wrong with the surface: the
     /// compositor was busy, or the window is not visible.
     Skipped,
     /// The surface no longer matches the window and has to be reconfigured.
     Stale,
-    /// The device refused to hand a frame over at all.
+    /// The device refused: it would not hand a frame over, or it would not
+    /// give a frame it had handed over what drawing into it needs - the depth
+    /// texture, a layer's vertex buffer, egui's own. Both are the renderer
+    /// asking the device for something and being told no.
     Rejected,
 }
 
 impl SurfaceStatus {
     /// Read what wgpu answered.
+    ///
+    /// Only the acquisition: whether an acquired frame was really drawn is the
+    /// device's next answer, and [`Gpu::render`] observes that one instead.
     fn of(acquired: &wgpu::CurrentSurfaceTexture) -> SurfaceStatus {
         match acquired {
             wgpu::CurrentSurfaceTexture::Success(_)
@@ -84,13 +91,15 @@ pub enum SurfaceAction {
 /// How the drawing surface is behaving, frame by frame.
 ///
 /// A rejected frame used to end the viewer where it stood. It is instead a
-/// device that may be resetting: the surface is reconfigured and the frame
-/// skipped, exactly as a stale surface is, and only a rejection that goes on
-/// for [`constants::VIEW_SURFACE_REJECTION_LIMIT`] consecutive frames is a
-/// device that is not coming back. A frame that *is* acquired is what clears
-/// the streak - the recovery is proven by drawing, not by any other answer the
-/// surface gives - so a skipped or stale frame neither counts towards the limit
-/// nor forgives what came before it.
+/// device that may be resetting, or busy with somebody else's memory: the
+/// surface is reconfigured and the frame skipped, exactly as a stale surface
+/// is, and only a rejection that goes on for
+/// [`constants::VIEW_SURFACE_REJECTION_LIMIT`] consecutive frames is a device
+/// that is not coming back. A frame that was *drawn* is what clears the streak,
+/// because the recovery is proven by drawing and by no other answer the surface
+/// gives: a skipped or stale frame neither counts towards the limit nor forgives
+/// what came before it, and neither does a frame that was handed over and then
+/// refused what it needed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SurfaceHealth {
     rejections: u32,
@@ -148,6 +157,15 @@ pub struct Gpu {
     /// Consecutive rejected frames, which is what tells a device resetting
     /// apart from one that is gone.
     health: SurfaceHealth,
+    /// What the device last refused outside a frame - a layer's vertex buffer -
+    /// waiting for the next frame to count it.
+    ///
+    /// An upload is not a frame and reconfiguring the surface would not retry
+    /// it, so it is not the streak's business where it happens. It is the next
+    /// frame's: the device that would not take a layer is the one that frame is
+    /// about to ask for more, and the frame loop is where the bounded retry
+    /// lives.
+    refused: Option<String>,
     /// Human readable description of the adapter the viewer picked.
     pub adapter_description: String,
 }
@@ -211,6 +229,13 @@ impl Gpu {
                 anyhow!("the GPU adapter cannot present to this window; run without --view")
             })?;
         config.format = format;
+        // Everything the device is asked to make for this window, under one
+        // reading: a machine whose video memory is already spoken for refuses
+        // here as readily as it does mid-session, and wgpu's answer to a refusal
+        // nobody caught is to panic. What comes back instead is the same "run
+        // without --view" this function has always answered a device it could
+        // not use with.
+        let scopes = Scopes::open(&device);
         surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -258,12 +283,19 @@ impl Gpu {
             build_pipeline(&device, &pipeline_layout, &shader, config.format, false);
         let translucent_pipeline =
             build_pipeline(&device, &pipeline_layout, &shader, config.format, true);
-        let depth_view = create_depth_view(&device, &config);
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
             config.format,
             egui_wgpu::RendererOptions::default(),
         );
+        if let Some(refusal) = scopes.close() {
+            return Err(refused_with(
+                "set the viewer's renderer up",
+                &refusal,
+                "close what else is using the card, or run the same command without --view",
+            ));
+        }
+        let depth_view = create_depth_view(&device, &config)?;
 
         Ok(Gpu {
             surface,
@@ -278,6 +310,7 @@ impl Gpu {
             buffers: (0..LAYERS.len()).map(|_| None).collect(),
             egui_renderer,
             health: SurfaceHealth::default(),
+            refused: None,
             adapter_description,
         })
     }
@@ -288,32 +321,128 @@ impl Gpu {
     }
 
     /// Reconfigure the surface after a resize.
-    pub fn resize(&mut self, width: u32, height: u32) {
+    ///
+    /// A device that refuses the surface or the depth texture the new size needs
+    /// has rejected this frame exactly as one that refuses a frame has: the
+    /// streak counts it, the next frame tries again, and the error only comes
+    /// back once the streak has run out - see [`SurfaceHealth`].
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         if width == 0 || height == 0 {
-            return;
+            return Ok(());
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth_view(&self.device, &self.config);
+        match self.reconfigure() {
+            None => Ok(()),
+            Some(failure) => self.frame_over(SurfaceStatus::Rejected, Some(failure)),
+        }
     }
 
     /// Upload (or clear) the vertex buffer of one layer.
+    ///
+    /// A device that refuses the buffer leaves the layer empty instead of taking
+    /// the process down with it, and what it said waits for the next frame: see
+    /// [`Gpu::refused`].
     pub fn upload(&mut self, layer: Layer, mesh: Option<&LayerMesh>) {
         let slot = layer.slot();
-        self.buffers[slot] = match mesh {
-            Some(mesh) if !mesh.is_empty() => Some(LayerBuffer {
-                buffer: self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("growforge_layer"),
-                        contents: bytemuck::cast_slice(&mesh.vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                vertices: mesh.vertices.len() as u32,
-            }),
-            _ => None,
+        let Some(mesh) = mesh.filter(|mesh| !mesh.is_empty()) else {
+            self.buffers[slot] = None;
+            return;
         };
+        let uploaded = ask(&self.device, "take a layer of the scene", || {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("growforge_layer"),
+                    contents: bytemuck::cast_slice(&mesh.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        match uploaded {
+            Ok(buffer) => {
+                self.buffers[slot] = Some(LayerBuffer {
+                    buffer,
+                    vertices: mesh.vertices.len() as u32,
+                });
+            }
+            Err(error) => {
+                self.buffers[slot] = None;
+                self.refused = Some(format!("{error:#}"));
+            }
+        }
+    }
+
+    /// Configure the surface for the size in the current configuration and make
+    /// the depth texture that goes with it. Answers what the device refused
+    /// with, if it refused.
+    ///
+    /// What it had before is left in place: the frame that asked is over either
+    /// way, and a depth texture that is no longer valid is a frame the device
+    /// will refuse again, which is what the streak is counting.
+    fn reconfigure(&mut self) -> Option<String> {
+        if let Err(error) = ask(&self.device, "reconfigure the drawing surface", || {
+            self.surface.configure(&self.device, &self.config)
+        }) {
+            return Some(format!("{error:#}"));
+        }
+        match create_depth_view(&self.device, &self.config) {
+            Ok(view) => {
+                self.depth_view = view;
+                None
+            }
+            Err(error) => Some(format!("{error:#}")),
+        }
+    }
+
+    /// What one frame came to, and what the renderer does about it.
+    ///
+    /// The one place the streak is advanced, so a frame counts once however it
+    /// ended. `failure` is what the device said when it refused, when it said
+    /// anything: a frame the surface would not hand over says nothing beyond
+    /// having been refused.
+    fn frame_over(&mut self, status: SurfaceStatus, failure: Option<String>) -> Result<()> {
+        match self.health.observe(status) {
+            SurfaceAction::Draw | SurfaceAction::Skip => Ok(()),
+            // A surface that has to be reconfigured and cannot be is a device
+            // refusing this frame rather than a window that moved, and it is
+            // counted as one: a device answering "outdated" for ever, with
+            // every reconfigure refused, would otherwise be retried for ever
+            // and never reach the give-up the rescue hangs off. One level deep
+            // only - a rejected frame reconfigures too, and what *that* refuses
+            // is the next frame's verdict.
+            SurfaceAction::Reconfigure => match self.reconfigure() {
+                None => Ok(()),
+                Some(failure) => self.frame_over(SurfaceStatus::Rejected, Some(failure)),
+            },
+            SurfaceAction::Retry { streak } => {
+                // Once per streak, on the frame that opened it. A device that
+                // is resetting rejects frames as fast as they are asked for,
+                // and a line each would be a wall of them for what is usually
+                // over before it can be read.
+                if streak == 1 {
+                    match &failure {
+                        Some(failure) => {
+                            println!("viewer surface {failure}; reconfiguring and retrying")
+                        }
+                        None => println!(
+                            "viewer surface the GPU rejected a frame; reconfiguring and retrying \
+                             (the device may be resetting)"
+                        ),
+                    }
+                }
+                let _ = self.reconfigure();
+                Ok(())
+            }
+            SurfaceAction::GiveUp { streak } => Err(match failure {
+                Some(failure) => anyhow!(
+                    "{failure}, and {streak} consecutive frames of the viewer went the same way; \
+                     the device did not come back"
+                ),
+                None => anyhow!(
+                    "the GPU rejected {streak} consecutive frames of the viewer; the device was \
+                     likely reset and did not come back"
+                ),
+            }),
+        }
     }
 
     /// Draw the scene and the egui overlay into the next surface frame.
@@ -321,6 +450,11 @@ impl Gpu {
     /// `scene_width` is how many pixels of the surface the 3D view owns; the
     /// rest is where egui puts its panel, and drawing geometry under it would
     /// only ever be hidden.
+    ///
+    /// One request stays outside every scope here: dropping a frame that was
+    /// not presented discards its texture, and wgpu reports a failed discard
+    /// fatally whatever scope is open. A device that refuses *that* still ends
+    /// the process, as every refusal used to.
     pub fn render(
         &mut self,
         view_projection: &Mat4,
@@ -328,6 +462,87 @@ impl Gpu {
         scene_width: u32,
         egui: EguiFrame,
     ) -> Result<()> {
+        // A layer the device would not take is this frame's verdict before the
+        // frame is even asked for: it is the same device, and it is about to be
+        // asked for more.
+        if let Some(failure) = self.refused.take() {
+            return self.frame_over(SurfaceStatus::Rejected, Some(failure));
+        }
+        // Acquiring is a request like any other: a surface whose configuration
+        // the device refused has no presentation left to hand a frame from, and
+        // answers that through the handler rather than in the value below.
+        let acquired = match ask(&self.device, "hand a frame over", || {
+            self.surface.get_current_texture()
+        }) {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                return self.frame_over(SurfaceStatus::Rejected, Some(format!("{error:#}")));
+            }
+        };
+        let status = SurfaceStatus::of(&acquired);
+        if status != SurfaceStatus::Acquired {
+            return self.frame_over(status, None);
+        }
+        let (wgpu::CurrentSurfaceTexture::Success(frame)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(frame)) = acquired
+        else {
+            // Those two are the whole of an acquisition; this arm is the
+            // compiler's share of the destructuring, not a case.
+            return Ok(());
+        };
+        match self.draw(&frame, view_projection, scene, scene_width, egui) {
+            // Presenting is the last thing the device is asked for and is
+            // refused like the rest: a frame drawn into a surface that went
+            // invalid in the meantime is a frame that never reached the screen.
+            Ok(()) => match ask(&self.device, "present the frame it drew", || {
+                frame.present()
+            }) {
+                Ok(()) => self.frame_over(SurfaceStatus::Acquired, None),
+                Err(error) => self.frame_over(SurfaceStatus::Rejected, Some(format!("{error:#}"))),
+            },
+            // Nothing was drawn, so nothing is presented: the frame is dropped
+            // and the streak decides whether the device gets another.
+            Err(error) => self.frame_over(SurfaceStatus::Rejected, Some(format!("{error:#}"))),
+        }
+    }
+
+    /// Draw one acquired frame, with everything the device is asked for inside
+    /// one reading of its errors.
+    ///
+    /// The frame's own view, egui's textures and buffers, the encoder, the
+    /// passes and the submission are all in here, so one scope covers every
+    /// allocation a device under memory pressure can refuse - and refusing any
+    /// of them is a frame that was not drawn rather than a process that is over.
+    fn draw(
+        &mut self,
+        frame: &wgpu::SurfaceTexture,
+        view_projection: &Mat4,
+        scene: &Scene,
+        scene_width: u32,
+        egui: EguiFrame,
+    ) -> Result<()> {
+        let scopes = Scopes::open(&self.device);
+        self.paint(frame, view_projection, scene, scene_width, egui);
+        match scopes.close() {
+            None => Ok(()),
+            Some(refusal) => Err(refused("draw a frame", &refusal)),
+        }
+    }
+
+    /// The drawing itself.
+    ///
+    /// Nothing here reports a failure, because nothing here can: what the device
+    /// refuses it answers for through the error scope [`Gpu::draw`] holds open
+    /// over the whole of it, and an invalid resource is drawn with rather than
+    /// panicked on until that scope is read.
+    fn paint(
+        &mut self,
+        frame: &wgpu::SurfaceTexture,
+        view_projection: &Mat4,
+        scene: &Scene,
+        scene_width: u32,
+        egui: EguiFrame,
+    ) {
         self.queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -343,44 +558,6 @@ impl Gpu {
             }),
         );
 
-        let acquired = self.surface.get_current_texture();
-        match self.health.observe(SurfaceStatus::of(&acquired)) {
-            SurfaceAction::Draw => {}
-            SurfaceAction::Skip => return Ok(()),
-            SurfaceAction::Reconfigure => {
-                let (width, height) = self.size();
-                self.resize(width, height);
-                return Ok(());
-            }
-            SurfaceAction::Retry { streak } => {
-                // Once per streak, on the frame that opened it. A device that
-                // is resetting rejects frames as fast as they are asked for,
-                // and a line each would be a wall of them for what is usually
-                // over before it can be read.
-                if streak == 1 {
-                    println!(
-                        "viewer surface the GPU rejected a frame; reconfiguring and retrying (the \
-                         device may be resetting)"
-                    );
-                }
-                let (width, height) = self.size();
-                self.resize(width, height);
-                return Ok(());
-            }
-            SurfaceAction::GiveUp { streak } => {
-                return Err(anyhow!(
-                    "the GPU rejected {streak} consecutive frames of the viewer; the device was \
-                     likely reset and did not come back"
-                ));
-            }
-        }
-        let (wgpu::CurrentSurfaceTexture::Success(frame)
-        | wgpu::CurrentSurfaceTexture::Suboptimal(frame)) = acquired
-        else {
-            // Those two are the whole of `Draw`; this arm is the compiler's
-            // share of the destructuring, not a case.
-            return Ok(());
-        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -487,11 +664,9 @@ impl Gpu {
 
         self.queue
             .submit(user_buffers.into_iter().chain([encoder.finish()]));
-        frame.present();
         for id in &egui.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
-        Ok(())
     }
 }
 
@@ -517,25 +692,32 @@ pub fn probe_adapter() -> Result<String> {
     Ok(format!("{} ({:?})", info.name, info.backend))
 }
 
+/// The depth buffer the 3D pass writes, sized to the configured surface.
+///
+/// Both calls are read together, because the second is only ever refused when
+/// the first was: a texture the device had no memory for comes back invalid, and
+/// making a view of it is the validation error the session used to die of.
 fn create_depth_view(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
-) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("growforge_depth"),
-        size: wgpu::Extent3d {
-            width: config.width.max(1),
-            height: config.height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
+) -> Result<wgpu::TextureView> {
+    ask(device, "make the viewer's depth texture", || {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("growforge_depth"),
+            size: wgpu::Extent3d {
+                width: config.width.max(1),
+                height: config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        texture.create_view(&wgpu::TextureViewDescriptor::default())
+    })
 }
 
 fn build_pipeline(
@@ -670,5 +852,98 @@ mod tests {
             SurfaceAction::Retry { streak: 2 },
             "the streak carries across the answers that are not about the device"
         );
+    }
+
+    /// A frame the device handed over and then refused what it needed - the
+    /// depth texture, a layer's vertex buffer, egui's own - is a rejected frame
+    /// like one it never handed over, and [`Gpu::render`] observes it as one.
+    ///
+    /// Which is the whole reason the acquisition is not what clears the streak:
+    /// a device that keeps handing over frames it will not let anyone draw into
+    /// would otherwise start the count again every frame and never be given up
+    /// on, however long it went on refusing.
+    #[test]
+    fn a_frame_that_was_acquired_and_then_refused_counts_towards_the_same_limit() {
+        let mut health = SurfaceHealth::default();
+        // The surface would not hand this one over - either by answering that
+        // it could not, or by refusing the acquisition outright, which is what
+        // a surface whose reconfigure was refused does.
+        assert_eq!(
+            health.observe(SurfaceStatus::Rejected),
+            SurfaceAction::Retry { streak: 1 }
+        );
+        // ... and the device would not give this one its depth texture.
+        assert_eq!(
+            health.observe(SurfaceStatus::Rejected),
+            SurfaceAction::Retry { streak: 2 },
+            "where the refusal happened is not what the streak counts"
+        );
+        // A frame that really drew is what clears them both.
+        assert_eq!(health.observe(SurfaceStatus::Acquired), SurfaceAction::Draw);
+        assert_eq!(
+            health.observe(SurfaceStatus::Rejected),
+            SurfaceAction::Retry { streak: 1 }
+        );
+    }
+
+    /// A stale surface the device will not reconfigure is a rejected frame, and
+    /// the streak is what ends it.
+    ///
+    /// The case is a device that has stopped working while still answering:
+    /// every frame comes back outdated, every reconfigure is refused, and
+    /// nothing is ever drawn. Counting the refused reconfigure - which is what
+    /// [`Gpu::frame_over`] does with one - is what gets such a session to the
+    /// give-up, and from there to the teardown that writes its work out.
+    #[test]
+    fn a_reconfigure_the_device_refuses_ends_a_surface_that_is_always_stale() {
+        let mut health = SurfaceHealth::default();
+        let mut last = SurfaceAction::Skip;
+        for _ in 0..constants::VIEW_SURFACE_REJECTION_LIMIT {
+            assert_eq!(
+                health.observe(SurfaceStatus::Stale),
+                SurfaceAction::Reconfigure
+            );
+            // And the reconfigure it asks for is refused.
+            last = health.observe(SurfaceStatus::Rejected);
+        }
+        assert_eq!(
+            last,
+            SurfaceAction::GiveUp {
+                streak: constants::VIEW_SURFACE_REJECTION_LIMIT
+            },
+            "a surface nobody can reconfigure would otherwise be retried for ever"
+        );
+    }
+
+    /// The depth texture on this machine's own device: an extent the device
+    /// cannot make comes back as an error rather than as the panic that ended a
+    /// session mid-run.
+    ///
+    /// The real trigger - a card with no memory left for a texture this size -
+    /// cannot be staged in a test, but it arrives through the same handler as
+    /// this one, and what is on trial is that somebody is reading it.
+    #[test]
+    fn a_depth_texture_the_device_cannot_make_is_an_error_rather_than_a_panic() {
+        let Some(device) = crate::device::device_or_skip("the depth texture test") else {
+            return;
+        };
+        let mut config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            width: device.limits().max_texture_dimension_2d.saturating_add(1),
+            height: 1,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: Vec::new(),
+        };
+        let error = create_depth_view(&device, &config)
+            .expect_err("the device made a texture wider than it says it can");
+        println!("the device refused as expected: {error:#}");
+
+        // And the window sizes it really gets are unaffected by the reading.
+        config.width = constants::VIEW_WINDOW_WIDTH;
+        config.height = constants::VIEW_WINDOW_HEIGHT;
+        create_depth_view(&device, &config).expect("a depth texture of a window's own size");
     }
 }

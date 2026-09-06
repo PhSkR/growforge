@@ -2056,6 +2056,22 @@ impl Editor {
         self.worker.stop();
     }
 
+    /// Write the deliverables of the design this session still holds, beside the
+    /// files it was configured to write, and answer where the STL is going.
+    ///
+    /// The design's half of what a dying window leaves behind; the document's
+    /// half is the recovered configuration `ViewerApp::fail` writes. Only the
+    /// fatal path takes it: a window the user closed asked for nothing, and a
+    /// session that ends normally leaves its design where every other stopped run
+    /// leaves one - on screen, for the panel's "generate stl" - while this one
+    /// has no screen left to leave it on.
+    ///
+    /// `None` when no run of this session ever produced a design, which is the
+    /// only reason there is nothing to write.
+    pub fn rescue_design(&mut self) -> Option<PathBuf> {
+        self.worker.rescue()
+    }
+
     /// Collect the threads of whatever was running. Called after the event loop
     /// stops, which - because the loop watches [`Editor::run_probe`] - is after
     /// they have ended: this makes it certain rather than likely, and it never

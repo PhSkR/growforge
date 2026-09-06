@@ -774,6 +774,13 @@ A stage is a whole optimization at one volume target, and it answers for itself:
   when it is on - held to that stage's volume target, with the run's own
   `max_iterations` as a per-stage cap and the usual
   [convergence and stall tests](#when-a-run-stops) deciding when it has arrived.
+  The cap is **per stage**, so the longest a schedule can run is the number of
+  stages it takes times `max_iterations`, plus a stress solve for each: a stage
+  whose design will not settle runs to the cap on its own. Set a
+  `max_iterations` you are willing to pay that many times over for a long part,
+  and run the reduction from the console with `growforge run` rather than beside
+  other work on the same card - a card another program takes the memory of is
+  a card this run has to finish without.
 * **Then it is measured.** The connectivity gate the
   [stress report](#stress-report) runs first is asked before anything is solved,
   so a stage whose design has no load path left fails for nothing; then the von
@@ -1708,6 +1715,11 @@ them softly would be at its worst under `engine = "growth"` with
 `backend = "gpu"`, where growth performs no solves of its own and the stress pass
 is the *first* place a backend is opened at all.
 
+Hard for a backend you **named**, that is. A device nobody named is a preference:
+one that cannot be opened, that will not take a design, or that fails a solve
+half way through hands that work to the CPU and says so, and the run goes on. See
+[Solver backend](#solver-backend).
+
 One failure mode is caught before the solve rather than by it. A load whose
 region reaches no support **through material** drives a system whose only path
 from the loaded nodes to the constrained ones runs through cells at the SIMP
@@ -2232,6 +2244,25 @@ was not one, so the CPU takes over from the best iterate the device reached and
 returns a solution at the caller's tolerance. It is also rare and transient: on
 the 1.5 mm `mma` cantilever above, iterations 2 and 3 fall back and every one
 after them runs on the device.
+
+**A device that fails is the same fallback for a different reason.** A card
+another program has taken the memory of - or one that has gone away - refuses a
+request rather than answering it, and a refusal is a value here rather than a
+panic. For a backend nobody named, the CPU finishes that solve exactly as it
+finishes one single precision could not resolve, and the notice says which of
+the two happened rather than blaming the arithmetic:
+
+```text
+solver         this solve was finished on the CPU: the compute device had no memory
+               left for it (the GPU refused to run a solve on the compute device: the
+               device is out of memory ...). The answer meets the same tolerance the
+               GPU one would have, at CPU speed; set [solver] backend = "cpu" to stop
+               the device trying.
+```
+
+A design the device will not take is the same: the load cases of that design run
+on the CPU. `backend = "gpu"` remains an instruction - a run that named the
+device ends when the device fails.
 
 Measured against the CPU reference (the parity tests in `fea::backend`,
 `engine::simp` and `stress`):
@@ -3168,6 +3199,25 @@ byte for byte what `Ctrl+S` would have written and is a configuration `edit` and
 recovered file is replaced rather than added to, and a write that could not be
 made says so instead of being lost. The window still ends in failure - a rescue
 is not a recovery of the session, only of the document.
+
+**The design goes with it.** The same fatal path exports whatever design the
+session's run had reached - the last kept field, the one the panel's
+`generate stl` would have written - to `<name>.recovered.stl`, with its stress
+report beside it as `<name>.recovered.json` when the configuration asks for one:
+
+```
+editor rescue the viewer stopped with the run's design in it; it is being written to parts/bracket.recovered.stl
+editor rescue the configured output is left as it is
+editor wrote  parts/bracket.recovered.stl
+```
+
+The window is gone by then and the export runs on, so the console is where it
+reports; hours of optimization therefore survive a viewer that could not go on.
+The deliverables are the same ones `generate stl` produces - the cavity pass,
+the stress solve, the mesh - only written beside the configured paths instead of
+onto them, because a session that died is not a run that finished and what is on
+`stl_path` may be a good part. A session whose runs had produced no design yet
+says so in one line and writes nothing.
 
 ### Opening and starting files
 

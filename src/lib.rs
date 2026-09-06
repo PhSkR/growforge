@@ -18,6 +18,8 @@
 pub mod bench;
 pub mod config;
 pub mod constants;
+#[cfg(any(feature = "gpu", feature = "viewer"))]
+pub mod device;
 pub mod engine;
 pub mod fea;
 pub mod flush;

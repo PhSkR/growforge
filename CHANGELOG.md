@@ -1,5 +1,62 @@
 # Changelog
 
+## 2026-09-06 - 0.43.1 - A card with no memory left does not end the session
+
+An editing session died mid-run - 28 minutes of a reduction gone, no file, no
+report - because wgpu answers a request a device refuses by panicking, and
+something else on the machine had taken the video memory. Every allocation the
+viewer and the compute solver make is now read for that answer, and a viewer
+that still cannot go on takes the run's design with it.
+
+- **A refused request is an error, not a panic.** Both devices' allocations
+  run inside wgpu error scopes over all three refusal filters: the viewer's
+  depth texture, the frame it is handed and the frame it presents, the layer
+  vertex buffers, egui's textures and the surface reconfigure; the solver's
+  buffers, bind groups and pipelines, every design it binds and everything a
+  solve asks for while it runs. A refusal names what was asked for and says
+  when the device was out of memory instead of quoting wgpu's four indented
+  lines.
+- **The viewer's bounded retry covers it.** A frame the device refuses part
+  way through is a rejected frame like one the surface never handed over: the
+  same streak counts it, the same reconfigure retries it, and only
+  `VIEW_SURFACE_REJECTION_LIMIT` of them in a row ends the session - through
+  the existing teardown, with the recovered configuration it already wrote.
+  What clears the streak is now a frame that was *drawn*, not one that was
+  handed over, so a device that hands over frames nobody can draw into is
+  given up on rather than retried for ever. A resize that cannot be given a
+  depth texture is the same rejected frame, a reconfigure the device refuses
+  is another - so a surface that is stale for ever reaches the give-up too -
+  and a launch the device refuses is the same "run without --view" it always
+  was.
+- **A dying window writes the design out.** Beside the unsaved configuration
+  it already rescued, a fatal teardown now exports whatever design the
+  session's run had reached - the deliverables `generate stl` would have
+  written - to `<name>.recovered.stl` and `<name>.recovered.json`, never onto
+  the configured paths, and the event loop stays alive until the file is
+  there. Hours of optimization survive a viewer that could not.
+- **The solver falls back with the right reason.** A compute device that
+  refuses the solver's buffers is the error the constructor already returned,
+  so the default backend falls back to the CPU as it does for a machine with
+  no adapter - and says the memory was the reason rather than blaming the
+  adapter. A device that fails half way through a run is now the same
+  fallback: the CPU finishes the design it would not take and the solve it
+  would not do, said in the device's own words rather than the arithmetic's,
+  and the run goes on. `backend = "gpu"` stays an instruction - a run that
+  named the device still ends when the device fails.
+- **Docs.** The reduce section says the iteration cap is per stage, so an
+  unattended schedule's length is stages times `max_iterations`, and advises
+  running long reductions from the console rather than beside other GPU work;
+  the editor section documents the recovered STL and report, and the solver
+  backend section what a device that fails mid-run costs and does not.
+- Tests: a refused request comes back as an error on this machine's own
+  device, a depth texture the device cannot make is an error rather than a
+  panic, a frame acquired and then refused counts towards the same limit, a
+  surface nobody can reconfigure reaches the give-up, a solve the device fails
+  is the CPU's unless the configuration named the device, a design the device
+  will not take runs on the CPU instead, and a rescue writes both sibling
+  files while leaving the configured ones alone.
+- Version 0.43.1.
+
 ## 2026-09-06 - 0.43.0 - Say how strong, not how heavy
 
 `mass_fraction` was always the question and the safety factor was always the

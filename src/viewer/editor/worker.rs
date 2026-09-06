@@ -674,6 +674,7 @@ impl Worker {
         self.launch(RunKind::Export, move |link, cancel, output_write| {
             export_retained(
                 &retained,
+                Export::Asked,
                 link,
                 cancel,
                 output_write,
@@ -681,6 +682,40 @@ impl Worker {
             );
         });
         true
+    }
+
+    /// Export the design a dying window still holds, beside the files the
+    /// configuration names, and answer where the STL is going.
+    ///
+    /// Not the panel's "generate stl" under another name: the window is gone,
+    /// nobody is left to ask for anything, and what would otherwise go with it
+    /// is a run's hours. It is the same export all the same - [`export_retained`]
+    /// on the same kept design, through the same [`crate::viewer::finish`] - only
+    /// addressed to [`rescued`]'s sibling paths, so a session that died can never
+    /// land on a good file.
+    ///
+    /// Whatever was running is stopped first. A run that is still going owns the
+    /// worker, and the rescue has to be the run this worker counts: the window's
+    /// event loop keeps servicing its message queue until the count is zero, and
+    /// that is what gives the export the time to write its file. `None` when no
+    /// run of this session ever produced a design.
+    pub fn rescue(&mut self) -> Option<PathBuf> {
+        self.stop();
+        let kept = self.retained()?;
+        let retained = Arc::new(rescued(&kept));
+        let path = retained.problem().output.stl_path.clone();
+        self.startup_error = None;
+        self.launch(RunKind::Export, move |link, cancel, output_write| {
+            export_retained(
+                &retained,
+                Export::Rescue,
+                link,
+                cancel,
+                output_write,
+                &mut std::io::stdout(),
+            );
+        });
+        Some(path)
     }
 
     /// Make `body` the current run of `kind`, on a thread this worker counts.
@@ -816,9 +851,12 @@ fn full(
 /// problem it was computed on.
 ///
 /// `out` is the session's console, as it is for [`full`], and what is said there
-/// is the same: where the file went, and what the part came out at.
+/// is the same: where the file went, and what the part came out at. `export`
+/// changes none of that - only what a failure is told to the user as, because a
+/// rescue has no session left to try again in.
 fn export_retained(
     retained: &Retained,
+    export: Export,
     link: &ViewLink,
     cancel: &AtomicBool,
     output_write: &Mutex<Option<OutputWrite>>,
@@ -851,10 +889,63 @@ fn export_retained(
         Ok(None) => {
             let _ = writeln!(out, "editor stl    stopped; no file was written");
         }
-        Err(error) => eprintln!(
-            "editor stl    failed and wrote nothing: {error:#}\n\
-             editor stl    the session is unaffected; the design is still there to try again from"
-        ),
+        // What a failure leaves behind is the whole difference between the two
+        // exports, and it is the opposite difference: the session is still
+        // there to try again in, or it is the thing that is ending.
+        Err(error) => match export {
+            Export::Asked => eprintln!(
+                "editor stl    failed and wrote nothing: {error:#}\n\
+                 editor stl    the session is unaffected; the design is still there to try again \
+                 from"
+            ),
+            Export::Rescue => eprintln!(
+                "editor stl    the rescue failed and wrote nothing: {error:#}\n\
+                 editor stl    the window is closing, so there is nothing left to try again from; \
+                 the design goes with it"
+            ),
+        },
+    }
+}
+
+/// Which of the two exports of a kept design this is, which is a difference in
+/// one thing only: what a failure means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Export {
+    /// The panel's "generate stl", asked for by somebody who is still there.
+    Asked,
+    /// A dying window's last act - see [`Worker::rescue`].
+    Rescue,
+}
+
+/// The same design, addressed to the files beside the ones it was configured to
+/// write.
+///
+/// What a rescue exports and where it goes: `part.stl` becomes
+/// `part.recovered.stl` and the stress report beside it `part.recovered.json`,
+/// which is the convention the recovered configuration of a dying session
+/// already set. The configured paths stay untouched, because a session that died
+/// is not a run that finished: what is on the output path may be a good part, and
+/// another session may be about to write it.
+///
+/// The problem travels with the field as it does everywhere else - a field is
+/// only ever a design of the problem it was computed on - so it is copied and
+/// its output paths redirected, never rebuilt from the configuration as it
+/// stands.
+fn rescued(retained: &Retained) -> Retained {
+    let mut problem = retained.problem().clone();
+    problem.output.stl_path = problem
+        .output
+        .stl_path
+        .with_extension(constants::VIEW_EDIT_RESCUE_STL_EXTENSION);
+    problem.output.stress_json = problem
+        .output
+        .stress_json
+        .as_ref()
+        .map(|path| path.with_extension(constants::VIEW_EDIT_RESCUE_REPORT_EXTENSION));
+    Retained {
+        problem: Arc::new(problem),
+        densities: retained.densities().to_vec(),
+        reduce: retained.reduce().cloned(),
     }
 }
 
@@ -1697,7 +1788,14 @@ vector = [0.0, 0.0, -20.0]
         let writes = Mutex::new(None);
         let mut console: Vec<u8> = Vec::new();
 
-        export_retained(&retained, &link, &cancel, &writes, &mut console);
+        export_retained(
+            &retained,
+            Export::Asked,
+            &link,
+            &cancel,
+            &writes,
+            &mut console,
+        );
         let printed = String::from_utf8(console).expect("console lines");
         assert!(
             printed.contains(&format!("editor wrote  {}", stl.display())),
@@ -1719,7 +1817,14 @@ vector = [0.0, 0.0, -20.0]
         // numbers.
         let stopped = AtomicBool::new(true);
         let mut console: Vec<u8> = Vec::new();
-        export_retained(&retained, &ViewLink::new(), &stopped, &writes, &mut console);
+        export_retained(
+            &retained,
+            Export::Asked,
+            &ViewLink::new(),
+            &stopped,
+            &writes,
+            &mut console,
+        );
         let printed = String::from_utf8(console).expect("console lines");
         assert!(
             printed.contains("editor stl    stopped"),
@@ -1789,7 +1894,14 @@ vector = [0.0, 0.0, -20.0]
         let writes = Mutex::new(None);
         let mut console: Vec<u8> = Vec::new();
 
-        export_retained(&retained, &link, &cancel, &writes, &mut console);
+        export_retained(
+            &retained,
+            Export::Asked,
+            &link,
+            &cancel,
+            &writes,
+            &mut console,
+        );
         let written = std::fs::read_to_string(&report).expect("the stress report");
         assert!(written.contains("\"reduce\": {"), "{written}");
         assert!(written.contains("\"exported_stage\": 2,"), "{written}");
@@ -1848,7 +1960,14 @@ vector = [0.0, 0.0, -20.0]
         let writes = Mutex::new(None);
         let mut console: Vec<u8> = Vec::new();
 
-        export_retained(&retained, &link, &cancel, &writes, &mut console);
+        export_retained(
+            &retained,
+            Export::Asked,
+            &link,
+            &cancel,
+            &writes,
+            &mut console,
+        );
         let printed = String::from_utf8(console).expect("console lines");
         let summary = link
             .progress()
@@ -2171,5 +2290,82 @@ vector = [0.0, 0.0, -20.0]
         assert!(!probe.is_running());
         // A stopped full run writes nothing, probe or no probe.
         assert!(!directory.join(&config.output.stl_path).exists());
+    }
+
+    /// What a dying window leaves of the run behind it: the same deliverables an
+    /// stl generation writes, beside the configured files instead of on them.
+    ///
+    /// Both halves matter. The design has to survive - a run of hours is what is
+    /// being saved - and the configured output may not be touched, because a
+    /// session that died is not a run that finished and what is on that path may
+    /// be a good part.
+    #[test]
+    fn a_rescue_writes_the_design_beside_the_configured_files() {
+        let text = CANTILEVER.replace(
+            "stl_path = \"kept.stl\"",
+            "stl_path = \"kept.stl\"
+stress_json = \"kept.json\"",
+        );
+        let (_dir, path) = write_temp("worker_rescue", &text);
+        let directory = path.parent().expect("a directory").to_path_buf();
+        let config = Config::parse(&text).expect("parse");
+        let problem = Arc::new(Problem::build(&config, &directory).expect("build"));
+        let configured_stl = problem.output.stl_path.clone();
+        let configured_report = problem.output.stress_json.clone().expect("a report path");
+        let retained = Retained {
+            densities: vec![1.0; problem.grid.n_cells()],
+            problem,
+            reduce: None,
+        };
+
+        let rescued = rescued(&retained);
+        let stl = rescued.problem().output.stl_path.clone();
+        let report = rescued
+            .problem()
+            .output
+            .stress_json
+            .clone()
+            .expect("the report travels with the design");
+        assert_eq!(stl, directory.join("kept.recovered.stl"));
+        assert_eq!(report, directory.join("kept.recovered.json"));
+
+        let mut console: Vec<u8> = Vec::new();
+        export_retained(
+            &rescued,
+            Export::Rescue,
+            &ViewLink::new(),
+            &AtomicBool::new(false),
+            &Mutex::new(None),
+            &mut console,
+        );
+        let printed = String::from_utf8(console).expect("console lines");
+        assert!(
+            printed.contains(&format!("editor wrote  {}", stl.display())),
+            "the rescue never said what it wrote: {printed}"
+        );
+        assert!(stl.is_file(), "the rescue wrote no {}", stl.display());
+        assert!(report.is_file(), "the rescue wrote no {}", report.display());
+        assert!(
+            !configured_stl.exists() && !configured_report.exists(),
+            "a rescue landed on the configured output: {} / {}",
+            configured_stl.display(),
+            configured_report.display()
+        );
+        // The kept design itself is untouched by having been rescued from, so
+        // the same session could still generate from it.
+        assert_eq!(retained.problem().output.stl_path, configured_stl);
+    }
+
+    /// A session whose runs never produced a design has nothing to rescue, and
+    /// says so by starting nothing.
+    #[test]
+    fn a_session_with_no_design_rescues_nothing() {
+        let mut worker = Worker::new();
+        let probe = worker.probe();
+        assert!(worker.rescue().is_none());
+        assert!(
+            !probe.is_running(),
+            "a rescue with nothing to write started a thread anyway"
+        );
     }
 }
