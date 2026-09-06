@@ -45,7 +45,7 @@
 //! optimizer's free surface through the middle of the domain - and is left
 //! exactly where the smoothing put it.
 //!
-//! Three things bound it, because a projection that is allowed to do anything is
+//! Four things bound it, because a projection that is allowed to do anything is
 //! a projection that can wreck a surface:
 //!
 //! * **Member by member.** A vertex is pushed out of the keepout it is deepest
@@ -62,10 +62,18 @@
 //!   construction, so a vertex that would have to move further than
 //!   [`constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS`] voxels is not this
 //!   defect and is left alone.
+//! * **No triangle collapsed.** A correction is decided for one vertex against
+//!   the surfaces and nothing else, which is blind to what that vertex is a
+//!   corner of: a seat target's own face draws two corners of one triangle onto
+//!   the same point wherever they share the two coordinates that face keeps. So
+//!   the corrections of a pass are read back against the triangles before they
+//!   are applied, and a triangle whose corrected corners would span no area has
+//!   the corrections of all three refused. See [`refuse_collapses`].
 //! * **An honest give-up.** A vertex that is still illegal when the budget runs
-//!   out, or whose correction is past the cap, keeps the position it had and is
-//!   counted in [`ClampReport::gave_up`]. Nothing here loops forever and nothing
-//!   here claims a surface is clean when it is not.
+//!   out, whose correction is past the cap, or whose correction was withdrawn
+//!   above and left it crossing, keeps the position it had and is counted in
+//!   [`ClampReport::gave_up`]. Nothing here loops forever and nothing here
+//!   claims a surface is clean when it is not.
 //!
 //! **And what it leaves alone is counted.** Leaving a vertex where it is, is the
 //! right answer for a free surface and the wrong one for a face that was drawn
@@ -87,8 +95,12 @@
 //! geometry they always did, and **before** validation, so what the validator
 //! accepts is the file that ships. Collapsing two vertices onto one point is the
 //! real risk of moving them, and [`constants::MIN_TRIANGLE_AREA_MM2`] stays the
-//! arbiter of that: a clamp that produces a degenerate triangle fails the export
-//! rather than shipping one.
+//! arbiter of that - the validator's floor, read through the validator's own
+//! function, so this pass cannot disagree with the gate it hands the mesh to.
+//! What that floor decides here is which corrections are refused, not whether
+//! the export lives: a triangle this pass would have flattened keeps the corners
+//! the sampling gave it, a fraction of a voxel off the surface, and is counted
+//! in [`ClampReport::refused`].
 //!
 //! The live preview never reaches here - `viewer::scene::preview_surface` runs
 //! marching cubes alone, skipping smoothing, culling and validation - so a
@@ -100,7 +112,7 @@ use rayon::prelude::*;
 
 use crate::constants;
 use crate::geometry::{Boundaries, Csg, Shape, Vec3, difference, length, scale, sum};
-use crate::mesh::Mesh;
+use crate::mesh::{Mesh, validate};
 
 /// What the boundary clamp found and did.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,10 +124,42 @@ pub struct ClampReport {
     /// moved.
     pub max_displacement_mm: f64,
     /// Vertices left where they were because no legal position was reached
-    /// inside the pass budget, or because the one that was lay past the
-    /// displacement cap. The exported surface still crosses a boundary at each
-    /// of them.
+    /// inside the pass budget, because the one that was lay past the
+    /// displacement cap, or because the correction was withdrawn to save a
+    /// triangle and the position it handed back was the illegal one - see
+    /// [`ClampReport::refused_crossings`]. The exported surface still crosses a
+    /// boundary at each of them.
     pub gave_up: usize,
+    /// Vertices whose correction was withdrawn because applying it would have
+    /// left a triangle they are a corner of with no area at all, and which are
+    /// legal where they stand.
+    ///
+    /// A correction is decided for one vertex against the analytic surfaces
+    /// alone, and a surface draws vertices together: two corners of one triangle
+    /// that share the two coordinates a face keeps are seated onto that face at
+    /// the same point. Refusing all three corrections keeps the triangle the
+    /// sampling made - the surface this pass exists to improve on, and still a
+    /// surface - rather than the zero-area triangle
+    /// [`crate::mesh::validate::validate`] refuses to export.
+    ///
+    /// Counted rather than warned about: what ships at those vertices is what
+    /// shipped everywhere before this pass existed, under a voxel of the
+    /// boundary, and on the legal side of it. The number is here so a surface
+    /// that came out a fraction of a voxel off can be accounted for.
+    pub refused: usize,
+    /// How far the furthest of them would have travelled, in millimetres. Zero
+    /// when none were refused.
+    pub max_refused_mm: f64,
+    /// The withdrawals that handed back an *illegal* position instead: they are
+    /// counted in [`ClampReport::gave_up`], not in [`ClampReport::refused`], and
+    /// this says how many of that count came from here.
+    ///
+    /// A refusal gives a vertex back the position it came in with. Where that
+    /// was legal, the surface merely rests a fraction of a voxel off a boundary.
+    /// Where it was the crossing the correction existed to fix, the exported
+    /// surface crosses a boundary there - which is what `gave_up` counts and
+    /// warns about, whatever stopped the pass from correcting it.
+    pub refused_crossings: usize,
     /// Vertices that came to rest near an analytic boundary without sitting on
     /// it: further out than a clamped vertex's own offset, and no further than
     /// [`constants::BOUNDARY_ADRIFT_WINDOW_VOXELS`] from it. Measured after the
@@ -196,6 +240,51 @@ impl ClampReport {
                 constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS
             ));
         }
+        if self.refused > 0 || self.refused_crossings > 0 {
+            let mut note = String::new();
+            if self.refused > 0 {
+                let held = if self.refused == 1 {
+                    "1 correction was".to_string()
+                } else {
+                    format!("{} corrections were", self.refused)
+                };
+                note.push_str(&format!(
+                    "{held} refused to avoid collapsing a triangle to zero area: those vertices \
+                     kept the position the sampling gave them, up to {:.4} mm from the surface \
+                     they would have been moved onto",
+                    self.max_refused_mm
+                ));
+            }
+            // The ones whose kept position is still a crossing are in the count
+            // above, which is where the warning is; said here so the two lines
+            // add up rather than double-counting the same vertex.
+            if self.refused_crossings > 0 {
+                let (crossed, standing) = if self.refused_crossings == 1 {
+                    (
+                        "1 correction was".to_string(),
+                        "a vertex that still crosses a boundary",
+                    )
+                } else {
+                    (
+                        format!("{} corrections were", self.refused_crossings),
+                        "vertices that still cross a boundary",
+                    )
+                };
+                let reason = if self.refused > 0 {
+                    "for the same reason"
+                } else {
+                    "to avoid collapsing a triangle to zero area"
+                };
+                if self.refused > 0 {
+                    note.push_str("; ");
+                }
+                note.push_str(&format!(
+                    "{crossed} refused {reason} at {standing}, counted above with the vertices \
+                     the pass gave up on"
+                ));
+            }
+            notes.push(note);
+        }
         if self.adrift > 0 {
             let resting = if self.adrift == 1 {
                 "1 vertex rests".to_string()
@@ -236,6 +325,11 @@ enum Correction {
     Moved(Vec3),
     /// Illegal, and left where it is; see [`ClampReport::gave_up`].
     GaveUp,
+    /// Where the vertex belonged, withdrawn: applying it would have collapsed a
+    /// triangle the vertex is a corner of. Counted in [`ClampReport::refused`]
+    /// when the position it keeps is legal and in [`ClampReport::gave_up`] when
+    /// it is not.
+    Refused(Vec3),
 }
 
 /// Move every vertex of `mesh` onto the boundary it belongs on: the ones that
@@ -252,16 +346,22 @@ pub fn resolve(mesh: &mut Mesh, boundaries: &Boundaries, voxel_mm: f64) -> Clamp
     let capture = constants::BOUNDARY_CLAMP_CAPTURE_VOXELS * voxel_mm;
     // Decided in parallel and applied in order, so the report counts the same
     // vertices in the same order however many threads ran.
-    let corrections: Vec<Correction> = mesh
+    let mut corrections: Vec<Correction> = mesh
         .vertices
         .par_iter()
         .map(|vertex| corrected(*vertex, boundaries, cap, capture))
         .collect();
+    // Read back against the triangles before anything moves: a correction is
+    // decided for one vertex and a triangle is three of them.
+    refuse_collapses(mesh, &mut corrections);
 
     let mut report = ClampReport {
         vertices_moved: 0,
         max_displacement_mm: 0.0,
         gave_up: 0,
+        refused: 0,
+        max_refused_mm: 0.0,
+        refused_crossings: 0,
         adrift: 0,
         max_adrift_mm: 0.0,
     };
@@ -276,6 +376,20 @@ pub fn resolve(mesh: &mut Mesh, boundaries: &Boundaries, voxel_mm: f64) -> Clamp
                 *vertex = to;
             }
             Correction::GaveUp => report.gave_up += 1,
+            // Which count a withdrawal belongs in is decided by the position it
+            // hands back, not by the one it gave up on: legal where it stands is
+            // a surface resting short of a boundary, illegal is the crossing
+            // `gave_up` exists to warn about.
+            Correction::Refused(to) => {
+                if legal(*vertex, boundaries) {
+                    report.refused += 1;
+                    report.max_refused_mm =
+                        report.max_refused_mm.max(length(difference(to, *vertex)));
+                } else {
+                    report.gave_up += 1;
+                    report.refused_crossings += 1;
+                }
+            }
         }
     }
 
@@ -292,6 +406,87 @@ pub fn resolve(mesh: &mut Mesh, boundaries: &Boundaries, voxel_mm: f64) -> Clamp
     report.adrift = adrift;
     report.max_adrift_mm = worst;
     report
+}
+
+/// Withdraw the corrections that would leave a triangle with no area, before any
+/// of them is applied.
+///
+/// A projection is decided for one vertex against the analytic surfaces and
+/// nothing else, which is right for where that vertex belongs and blind to what
+/// it is a corner of. A face keeps the two coordinates that lie in it and moves
+/// only the third, so two corners of one triangle that share those two - which
+/// the rows of a marching cubes wall do exactly, having interpolated the same
+/// fraction along parallel lattice edges - are seated onto the same point. The
+/// triangle between them is then the zero-area triangle the export dies on.
+///
+/// So a triangle whose corrected corners span no area has the corrections of all
+/// three refused: they keep the positions they came in with, which is a surface
+/// under a voxel off the boundary rather than no surface at all. Refusing one
+/// vertex changes the positions the triangles around it would be measured with,
+/// so the scan repeats - [`constants::BOUNDARY_CLAMP_MAX_PASSES`] rounds, the
+/// budget every other loop here runs on.
+///
+/// What follows the budget is the difference between this bound and the others:
+/// a cap on a *correction* leaves the vertex where it was, which is a surface
+/// that ships, while a cap here would leave a collapse in the mesh and the export
+/// would die on it. So a chain longer than the budget is drained rather than
+/// abandoned, and this returns with nothing collapsing that it would have moved.
+/// That ends: a round that changes nothing stops the loop, every other round
+/// withdraws at least one correction, a withdrawal is never taken back, and
+/// there are finitely many corrections - the mesh that came in is the floor.
+///
+/// Only a triangle this pass would have moved is examined. One that arrives
+/// degenerate is not this pass's doing, and stays
+/// [`validate`](crate::mesh::validate::validate)'s to refuse.
+fn refuse_collapses(mesh: &Mesh, corrections: &mut [Correction]) {
+    for _ in 0..constants::BOUNDARY_CLAMP_MAX_PASSES {
+        if !withdraw_collapsing(mesh, corrections) {
+            return;
+        }
+    }
+    while withdraw_collapsing(mesh, corrections) {}
+}
+
+/// One round of [`refuse_collapses`]: withdraw the corrections of every triangle
+/// that collapses under the decisions as they stand. `true` when any were.
+fn withdraw_collapsing(mesh: &Mesh, corrections: &mut [Correction]) -> bool {
+    let at = |vertex: u32, decided: &[Correction]| match decided[vertex as usize] {
+        Correction::Moved(to) => to,
+        _ => mesh.vertices[vertex as usize],
+    };
+    let decided: &[Correction] = corrections;
+    let collapsing: Vec<[u32; 3]> = mesh
+        .triangles
+        .par_iter()
+        .filter(|t| {
+            t.iter()
+                .any(|&v| matches!(decided[v as usize], Correction::Moved(_)))
+                && collapses(at(t[0], decided), at(t[1], decided), at(t[2], decided))
+        })
+        .copied()
+        .collect();
+    if collapsing.is_empty() {
+        return false;
+    }
+    for t in collapsing {
+        for &v in t.iter() {
+            if let Correction::Moved(to) = corrections[v as usize] {
+                corrections[v as usize] = Correction::Refused(to);
+            }
+        }
+    }
+    true
+}
+
+/// True when three positions do not span a triangle the validator would accept.
+///
+/// The area and the threshold are [`validate`](crate::mesh::validate)'s own, read
+/// through its own function, so this pass and the gate it hands the mesh to
+/// cannot disagree about what a collapse is. An area that is not a number counts
+/// as one: a triangle nobody can measure is not one to ship.
+fn collapses(a: Vec3, b: Vec3, c: Vec3) -> bool {
+    let area = validate::triangle_area(a, b, c);
+    !area.is_finite() || area < constants::MIN_TRIANGLE_AREA_MM2
 }
 
 /// How far `vertex` rests from the boundary it is nearest to, when that is far
@@ -1584,6 +1779,214 @@ mod tests {
             "{moved:?} left the keepin it was pushed along"
         );
         assert!(legal(moved, &boundaries), "{moved:?}");
+    }
+
+    /// A keepout the size of a half space, whose one face every seat and every
+    /// push in the collapse tests below lands on.
+    fn ceiling(z: f64) -> Boundaries {
+        forbidden(vec![Shape::axis_aligned_box(
+            [-100.0, -100.0, z],
+            [100.0, 100.0, 100.0],
+        )])
+    }
+
+    /// The collapse this guard exists for, in the smallest mesh that has it: two
+    /// corners of one triangle that differ only in the coordinate the face
+    /// keeps - one proud of it, one resting short of it - are handed the same
+    /// point, and the triangle between them has no area left.
+    ///
+    /// All three corrections go, not just the pair's: two corners on one point
+    /// is a triangle whichever way the third moves.
+    ///
+    /// One of the three was inside the keepout, and a withdrawal hands it back
+    /// that position: the surface crosses a boundary there, so it is counted -
+    /// and warned about - with the vertices the pass gave up on, and not as a
+    /// refusal that merely rests short of a surface.
+    #[test]
+    fn a_correction_that_would_collapse_a_triangle_is_refused() {
+        let vertices = vec![[0.0, 0.0, 4.0], [0.0, 0.0, 6.0], [1.0, 0.0, 4.0]];
+        let mut mesh = Mesh {
+            vertices: vertices.clone(),
+            triangles: vec![[0, 1, 2]],
+        };
+        let report = resolve(&mut mesh, &ceiling(5.0), VOXEL_MM);
+
+        assert_eq!(mesh.vertices, vertices, "a refused correction still moved");
+        assert_eq!(report.vertices_moved, 0, "{report:?}");
+        assert_eq!(report.gave_up, 1, "{report:?}");
+        assert_eq!(report.refused_crossings, 1, "{report:?}");
+        assert_eq!(report.refused, 2, "{report:?}");
+        // The two counted as refusals are the ones that were legal at z = 4,
+        // a seat's offset short of the face they would have been put on.
+        assert!(
+            (report.max_refused_mm - (1.0 - constants::BOUNDARY_CLAMP_EPS_MM)).abs() < 1e-9,
+            "{report:?}"
+        );
+
+        let notes = report.notes(false, false);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(notes[1].starts_with("warning: 1 vertex was"), "{notes:?}");
+        assert!(
+            notes[2].contains(
+                "1 correction was refused for the same reason at a vertex that \
+                 still crosses a boundary"
+            ),
+            "{notes:?}"
+        );
+    }
+
+    /// And the refusals of vertices that are legal where they stand are the
+    /// plain count: nothing crossed, so nothing is warned about.
+    ///
+    /// Two corners a fraction apart along the one coordinate the face keeps are
+    /// seated onto the same point, which is the collapse without an illegal
+    /// vertex anywhere in it.
+    #[test]
+    fn refusals_that_leave_every_corner_legal_are_counted_and_not_warned_about() {
+        let vertices = vec![[0.0, 0.0, 4.0], [0.0, 0.0, 4.5], [1.0, 0.0, 4.0]];
+        let mut mesh = Mesh {
+            vertices: vertices.clone(),
+            triangles: vec![[0, 1, 2]],
+        };
+        let report = resolve(&mut mesh, &ceiling(5.0), VOXEL_MM);
+
+        assert_eq!(mesh.vertices, vertices, "a refused correction still moved");
+        assert_eq!(report.refused, 3, "{report:?}");
+        assert_eq!(report.gave_up, 0, "{report:?}");
+        assert_eq!(report.refused_crossings, 0, "{report:?}");
+        let notes = report.notes(false, false);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(!notes[1].contains("warning"), "{notes:?}");
+        assert!(!notes[1].contains("crosses a boundary"), "{notes:?}");
+    }
+
+    /// And a triangle the same corrections leave standing is clamped exactly as
+    /// it was before the guard existed: every corner onto the face, nothing
+    /// refused, nothing said.
+    #[test]
+    fn a_triangle_the_corrections_leave_standing_is_clamped_as_before() {
+        let seat = 5.0 - constants::BOUNDARY_CLAMP_EPS_MM;
+        let mut mesh = Mesh {
+            vertices: vec![[0.0, 0.0, 4.0], [2.0, 0.0, 6.0], [1.0, 3.0, 4.0]],
+            triangles: vec![[0, 1, 2]],
+        };
+        let report = resolve(&mut mesh, &ceiling(5.0), VOXEL_MM);
+
+        assert_eq!(report.vertices_moved, 3, "{report:?}");
+        assert_eq!(report.refused, 0, "{report:?}");
+        assert_eq!(report.max_refused_mm, 0.0, "{report:?}");
+        for vertex in &mesh.vertices {
+            assert!((vertex[2] - seat).abs() < 1e-9, "{vertex:?}");
+        }
+    }
+
+    /// Withdrawing a correction moves the vertex back to where it came in, which
+    /// is a different triangle for every other triangle it is a corner of - so
+    /// the scan repeats until nothing more collapses.
+    ///
+    /// Built on the decisions rather than through the boundaries: the second
+    /// triangle has to be the one a *refusal* flattens and no arrangement of
+    /// surfaces flattens, which is exactly what one round would miss.
+    #[test]
+    fn a_refusal_that_flattens_another_triangle_withdraws_that_one_too() {
+        let shared = [0.0, 1.0, 0.0];
+        let mesh = Mesh {
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                shared,
+                [0.0, 2.0, 0.0],
+                [0.0, 4.0, 0.0],
+            ],
+            triangles: vec![[0, 1, 2], [2, 3, 4]],
+        };
+        // The first triangle's first two corners are handed the same point. The
+        // second stands while its shared corner is moved off the line its two
+        // others lie on, and is a line again the moment that correction goes.
+        let mut corrections = vec![
+            Correction::Moved([5.0, 0.0, 0.0]),
+            Correction::Moved([5.0, 0.0, 0.0]),
+            Correction::Moved([1.0, 5.0, 5.0]),
+            Correction::Moved([0.0, 2.0, 0.0]),
+            Correction::Moved([0.0, 4.0, 0.0]),
+        ];
+        refuse_collapses(&mesh, &mut corrections);
+
+        for (index, correction) in corrections.iter().enumerate() {
+            assert!(
+                matches!(correction, Correction::Refused(_)),
+                "vertex {index} kept {correction:?}"
+            );
+        }
+    }
+
+    /// And a chain of them longer than the pass budget is drained to the end
+    /// rather than left half withdrawn: the guarantee the export rests on is
+    /// that nothing this pass would have moved collapses, and a budget that ran
+    /// out mid-cascade would break it silently.
+    ///
+    /// Each link's incoming position is the next link's corrected one, so a
+    /// triangle only flattens once its predecessor's correction is withdrawn -
+    /// one round per link by construction, four more than the budget allows.
+    #[test]
+    fn a_cascade_longer_than_the_pass_budget_is_still_drained() {
+        let links = constants::BOUNDARY_CLAMP_MAX_PASSES + 4;
+        let mut mesh = Mesh {
+            vertices: Vec::new(),
+            triangles: Vec::new(),
+        };
+        let mut corrections = Vec::new();
+        for k in 0..=links {
+            mesh.vertices.push([k as f64 + 1.0, 0.0, 0.0]);
+            // The first pair is handed one point, which is the collapse the
+            // cascade starts at; every other correction is the position its
+            // predecessor came in with.
+            corrections.push(Correction::Moved([k.max(1) as f64, 0.0, 0.0]));
+        }
+        for k in 0..links {
+            let apex = mesh.vertices.len() as u32;
+            mesh.vertices.push([k as f64 + 0.5, 3.0, 0.0]);
+            corrections.push(Correction::Legal);
+            mesh.triangles.push([k as u32, k as u32 + 1, apex]);
+        }
+        refuse_collapses(&mesh, &mut corrections);
+
+        for (index, correction) in corrections.iter().take(links + 1).enumerate() {
+            assert!(
+                matches!(correction, Correction::Refused(_)),
+                "link {index} kept {correction:?}"
+            );
+        }
+        let at = |v: u32| match corrections[v as usize] {
+            Correction::Moved(to) => to,
+            _ => mesh.vertices[v as usize],
+        };
+        for t in &mesh.triangles {
+            let moved = t
+                .iter()
+                .any(|&v| matches!(corrections[v as usize], Correction::Moved(_)));
+            assert!(
+                !(moved && collapses(at(t[0]), at(t[1]), at(t[2]))),
+                "{t:?} would still be collapsed by a correction this pass applies"
+            );
+        }
+    }
+
+    /// A mesh that arrives with a degenerate triangle in it is not this pass's
+    /// doing: nothing is refused for it, and the validator is still the one that
+    /// refuses the export.
+    #[test]
+    fn a_triangle_that_was_already_flat_is_left_to_the_validator() {
+        let vertices = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+        let mut mesh = Mesh {
+            vertices: vertices.clone(),
+            triangles: vec![[0, 1, 2]],
+        };
+        let report = resolve(&mut mesh, &Boundaries::default(), VOXEL_MM);
+
+        assert_eq!(report.refused, 0, "{report:?}");
+        assert_eq!(mesh.vertices, vertices);
+        assert!(crate::mesh::validate::validate(&mesh).is_err());
     }
 
     /// Empty boundaries constrain nothing, which is what lets a caller hold a

@@ -1730,6 +1730,10 @@ pub const TAUBIN_LAMBDA: f64 = 0.5;
 pub const TAUBIN_MU: f64 = -0.53;
 
 /// Triangles with an area below this (mm^2) are reported as degenerate.
+///
+/// Read in two places, deliberately the same number: the validator rejects a
+/// triangle under it, and the boundary clamp refuses a correction that would put
+/// one there, so the pass cannot make what the gate will not accept.
 pub const MIN_TRIANGLE_AREA_MM2: f64 = 1e-12;
 
 /// Cubic millimetres per cubic centimetre, for the mass estimate.
@@ -1774,6 +1778,12 @@ pub const BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS: f64 = 1.0;
 /// ceiling is what keeps a pair of shapes whose surfaces bounce a point between
 /// them from spinning. A vertex still illegal at the end is left where it was
 /// and counted.
+///
+/// The same ceiling is the budget for the pass's other repeat: withdrawing the
+/// corrections that would collapse a triangle changes the triangles beside it,
+/// so that scan runs again. It is not a ceiling there - a chain longer than this
+/// is drained to the end, because a collapse left in the mesh is an export that
+/// dies rather than a surface that ships.
 pub const BOUNDARY_CLAMP_MAX_PASSES: usize = 8;
 
 /// How far outside a keepout surface - and inside the domain surface - a clamped

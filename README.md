@@ -1228,7 +1228,7 @@ resolve anyway, and the correction is always onto the legal side.
 | a keepin                        | whichever of the rows above its own shape is, projected onto the *inside* of its skin - the side the material is on |
 | the domain                      | bounded descent onto the level set of the ordered CSG composite, which has seams and no nearest-point formula. A vertex outside the solid takes this or the nearest keepin's skin, whichever is nearer |
 
-Three things bound it, because a projection allowed to do anything can wreck a
+Four things bound it, because a projection allowed to do anything can wreck a
 surface:
 
 * **Overlapping keepouts** hand a vertex to one another, and leaving a keepout
@@ -1238,6 +1238,21 @@ surface:
   construction, so a vertex that would have to move further than
   `BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS` (one voxel) is not this defect and is
   left where it is.
+* **No triangle collapsed.** A correction is decided for one vertex against the
+  surfaces and nothing else, which is blind to what that vertex is a corner of:
+  a face keeps the two coordinates lying in it, so two corners of one triangle
+  that share those two are seated onto the same point and the triangle between
+  them has no area left. The corrections of a pass are therefore read back
+  against the triangles before any of them is applied, and a triangle whose
+  corrected corners would fall under `MIN_TRIANGLE_AREA_MM2` - the validator's
+  own floor - has the corrections of all three refused: those corners keep the
+  position the sampling gave them, under a voxel off the surface, and the count
+  and the furthest of them are reported. A corner that was *outside* a boundary
+  before its correction is outside it still, so it is counted - and warned
+  about - with the vertices the pass gave up on rather than as a refusal.
+  Withdrawing a correction changes the triangles beside it, so the scan repeats:
+  `BOUNDARY_CLAMP_MAX_PASSES` rounds as a budget, and past it for a chain longer
+  than that, because a collapse left in the mesh is an export that dies.
 * **An honest give-up.** A vertex still illegal when the budget runs out, or past
   the cap, keeps its position and is counted. The run says so:
 
@@ -1245,12 +1260,17 @@ surface:
 boundaries     clamped 412 vertices onto the analytic surfaces, moving them 0.0874 mm at most
 ```
 
-and, when there were any it could not correct, a `warning` line naming how many.
-Both reach the console and the editor's panel. The clamp runs **after** the
-island cull - no work on fragments that are about to be discarded, and the
+and, when there were any it could not correct, a `warning` line naming how many;
+when corrections were refused, a line of its own:
+
+```text
+               86 corrections were refused to avoid collapsing a triangle to zero area: those vertices kept the position the sampling gave them, up to 0.4809 mm from the surface they would have been moved onto
+```
+
+All of them reach the console and the editor's panel. The clamp runs **after**
+the island cull - no work on fragments that are about to be discarded, and the
 culling verdicts see the geometry they always did - and **before** validation, so
-the positions that are validated are the positions that are written; a clamp that
-collapsed a triangle fails the export rather than shipping one.
+the positions that are validated are the positions that are written.
 
 ### What it leaves alone, it counts
 
@@ -3524,9 +3544,11 @@ all, and a `hold_iterations` that outlasts `max_iterations`.
    closed form for the box, sphere, capped cylinder, tube, cone and triangular
    prism, a bounded iteration for the
    ellipsoid and for the domain composite - so the shapes the configuration described survive the voxel grid.
-   Only then is the mesh checked for watertightness, manifold edges, consistent
-   winding and degenerate triangles and written as a binary STL: what is
-   validated is what ships.
+   A correction that would leave a triangle with no area - two of its corners
+   handed the same point - is refused there and counted, so a degenerate
+   triangle can no longer come out of that pass. Only then is the mesh checked
+   for watertightness, manifold edges, consistent winding and degenerate
+   triangles and written as a binary STL: what is validated is what ships.
 
 6. **Show (optional).** With `--view`, the engine also hands each iteration's
    physical densities to the reporter through a default no-op hook. The viewer's

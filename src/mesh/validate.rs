@@ -40,7 +40,11 @@ pub fn enclosed_volume(mesh: &Mesh) -> f64 {
 }
 
 /// Area of a triangle in square millimetres.
-fn triangle_area(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
+///
+/// Shared with [`crate::mesh::clamp`], which refuses a correction that would put
+/// a triangle under [`constants::MIN_TRIANGLE_AREA_MM2`]: the pass that avoids a
+/// collapse and the gate that rejects one measure it the same way.
+pub(crate) fn triangle_area(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
     let n = cross(difference(b, a), difference(c, a));
     0.5 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt()
 }

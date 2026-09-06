@@ -1365,4 +1365,109 @@ mod tests {
             assert_eq!(normal, [0.0; 3]);
         }
     }
+
+    /// The shape class the exact-boundary clamp collapsed triangles on: a
+    /// keepin plate the design already fills, with the part's own wall standing
+    /// past the plate's edge.
+    ///
+    /// The wall is the density field's, not a shape's, so no analytic surface
+    /// stands beside it and the plate's top face is the boundary its vertices
+    /// are nearest to. Marching cubes puts the rows that straddle that face on
+    /// the same lattice column, so they share their x and y exactly, and a
+    /// projection onto a horizontal face keeps x and y and moves only z: both
+    /// rows land on the same point.
+    fn plate_and_wall() -> (Grid, Vec<f64>, Boundaries) {
+        use crate::geometry::{Csg, CsgOp, Shape, ShapeUnion};
+
+        let h = 1.0;
+        let bounds = Aabb {
+            min: [0.0, 0.0, 0.0],
+            max: [12.0, 12.0, 10.0],
+        };
+        let domain = Csg::new(vec![(
+            CsgOp::Add,
+            Shape::axis_aligned_box(bounds.min, bounds.max),
+        )]);
+        // A plate 1.6 mm thick, holding the cells whose centres lie in it - all
+        // of them inside the material below - and reaching 0.4 mm past the wall.
+        let keepin = ShapeUnion::new(vec![Shape::axis_aligned_box(
+            [0.0, 0.0, 3.6],
+            [6.4, 12.0, 5.2],
+        )]);
+        let keepout = ShapeUnion::default();
+        let mut grid = Grid::from_bounds(&bounds, h);
+        assert_eq!(grid.classify(&domain, &keepout, &keepin), 0);
+        let densities = (0..grid.n_cells())
+            .map(|e| {
+                let (i, _, _) = grid.cell_ijk(e);
+                let x = grid.origin[0] + (i as f64 + 0.5) * h;
+                if x < 6.0 { 1.0 } else { 0.0 }
+            })
+            .collect();
+        (
+            grid,
+            densities,
+            Boundaries {
+                domain,
+                keepout,
+                keepin,
+            },
+        )
+    }
+
+    /// The same field with no boundaries handed in - `[output] boundaries =
+    /// "voxel"` - comes out of the pipeline clean.
+    ///
+    /// Which is the half of the reproduction that says where the defect is not:
+    /// the sampling, the marching cubes tie rule, the smoothing and the cull
+    /// produce a mesh the validator accepts, and everything the test below
+    /// catches is the clamp's alone.
+    #[test]
+    fn the_plate_and_wall_field_exports_cleanly_without_boundaries() {
+        let (grid, densities, _) = plate_and_wall();
+        let export = surface_from_densities(
+            &grid,
+            &densities,
+            0.5,
+            6,
+            3,
+            IslandPolicy::Cull,
+            &islands::Anchors::none(),
+            None,
+        )
+        .expect("the unclamped surface is valid");
+        assert!(export.stats.triangles > 1000, "{:?}", export.stats);
+        assert_eq!(export.clamp, None);
+    }
+
+    /// And with the boundaries handed in, the same field still exports - the
+    /// clamp refuses the corrections that would have collapsed a triangle onto
+    /// the plate's face rather than shipping, or failing on, a zero-area one.
+    ///
+    /// Before the refusal existed this bailed out of `validate` with `triangle N
+    /// is degenerate: area 0e0 mm2`, which is what three converged runs of a
+    /// user's part died of.
+    #[test]
+    fn the_clamp_refuses_the_corrections_that_would_collapse_a_triangle() {
+        let (grid, densities, boundaries) = plate_and_wall();
+        let export = surface_from_densities(
+            &grid,
+            &densities,
+            0.5,
+            6,
+            3,
+            IslandPolicy::Cull,
+            &islands::Anchors::none(),
+            Some(&boundaries),
+        )
+        .expect("the clamped surface is valid");
+        let clamp = export.clamp.expect("a clamp report");
+        assert!(clamp.vertices_moved > 0, "{clamp:?}");
+        assert!(
+            clamp.refused > 0,
+            "nothing was refused, so this fixture no longer reproduces the collapse it \
+             was built for: {clamp:?}"
+        );
+        assert!(clamp.max_refused_mm > 0.0, "{clamp:?}");
+    }
 }

@@ -2,6 +2,18 @@
 
 ## 2026-09-05 - 0.43.0 - (title pending)
 
+- **The exact-boundary clamp never collapses a triangle.** Corrections are
+  decided one vertex at a time, so a face - which keeps the two coordinates
+  lying in it - could hand two corners of one triangle the same point, and the
+  export then died in validation on `area 0e0 mm2`. The corrections of a pass
+  are now read back against the triangles before any is applied: a triangle
+  whose corrected corners would fall under the validator's own area floor has
+  the corrections of all three refused, keeping the positions the sampling
+  gave them. The count and the furthest of them are reported on the console
+  and in the editor's panel; a refusal that hands a corner back a position
+  outside a boundary is counted, and warned about, with the vertices the pass
+  gave up on. Validation is still the gate.
+
 - **A keepin is a boundary surface.** The solid the exported mesh is held
   inside is now the domain *union* the keepins, so a keepin that sticks out of
   the domain keeps its own skin: its surface is seated onto like a keepout's

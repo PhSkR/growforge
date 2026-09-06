@@ -1779,6 +1779,9 @@ mod tests {
             vertices_moved: 0,
             max_displacement_mm: 0.0,
             gave_up: 0,
+            refused: 0,
+            max_refused_mm: 0.0,
+            refused_crossings: 0,
             adrift: 0,
             max_adrift_mm: 0.0,
         };
@@ -1797,24 +1800,24 @@ mod tests {
 
         // The one line that has to be loud, in the wording every report in
         // growforge marks a warning with.
-        let refused = ClampReport {
+        let unmoved = ClampReport {
             vertices_moved: 3,
             max_displacement_mm: 0.1,
             gave_up: 7,
             ..quiet
         };
-        let notes = refused.notes(false, false);
+        let notes = unmoved.notes(false, false);
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(
             notes[1].starts_with("warning: 7 vertices were"),
             "{notes:?}"
         );
-        print_clamp_report(Some(&refused), false, false);
+        print_clamp_report(Some(&unmoved), false, false);
 
         // One of them reads as one of them, rather than as "1 vertices".
         let single = ClampReport {
             gave_up: 1,
-            ..refused
+            ..unmoved
         };
         assert!(
             single.notes(false, false)[1].starts_with("warning: 1 vertex was"),
@@ -1822,6 +1825,79 @@ mod tests {
             single.notes(false, false)
         );
         print_clamp_report(Some(&single), false, false);
+
+        // The corrections the pass withdrew rather than collapse a triangle
+        // with: a line of its own, plainly, with the count and the furthest of
+        // them - and no `warning`, because what shipped there is the surface the
+        // sampling made and not a boundary crossed.
+        let withdrawn = ClampReport {
+            vertices_moved: 900,
+            max_displacement_mm: 0.31,
+            refused: 12,
+            max_refused_mm: 0.2500,
+            ..quiet
+        };
+        let notes = withdrawn.notes(false, false);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(!notes[1].starts_with("warning"), "{notes:?}");
+        assert!(
+            notes[1].starts_with("12 corrections were refused to avoid collapsing a triangle"),
+            "{notes:?}"
+        );
+        assert!(notes[1].contains("0.2500"), "{notes:?}");
+        print_clamp_report(Some(&withdrawn), false, false);
+
+        let one = ClampReport {
+            refused: 1,
+            ..withdrawn
+        };
+        assert!(
+            one.notes(false, false)[1].starts_with("1 correction was"),
+            "{:?}",
+            one.notes(false, false)
+        );
+
+        // A withdrawal that handed a vertex back an illegal position is a
+        // crossing, so it is in the give-up count and under its warning; this
+        // line says how many of that count came from here instead of counting
+        // the same vertex twice.
+        let crossing = ClampReport {
+            gave_up: 2,
+            refused_crossings: 2,
+            ..withdrawn
+        };
+        let notes = crossing.notes(false, false);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(
+            notes[1].starts_with("warning: 2 vertices were"),
+            "{notes:?}"
+        );
+        assert!(
+            notes[2].contains(
+                "; 2 corrections were refused for the same reason at vertices that still cross a \
+                 boundary, counted above with the vertices the pass gave up on"
+            ),
+            "{notes:?}"
+        );
+        print_clamp_report(Some(&crossing), false, false);
+
+        // And when every withdrawal was one, the line stands on its own and
+        // still names the reason.
+        let all_crossings = ClampReport {
+            refused: 0,
+            max_refused_mm: 0.0,
+            ..crossing
+        };
+        let notes = all_crossings.notes(false, false);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(
+            notes[2].starts_with(
+                "2 corrections were refused to avoid collapsing a triangle to zero area at \
+                 vertices that still cross a boundary"
+            ),
+            "{notes:?}"
+        );
+        print_clamp_report(Some(&all_crossings), false, false);
     }
 
     /// The vertices the pass left near a boundary without seating: always
@@ -1846,6 +1922,9 @@ mod tests {
             vertices_moved: 412,
             max_displacement_mm: 0.0874,
             gave_up: 0,
+            refused: 0,
+            max_refused_mm: 0.0,
+            refused_crossings: 0,
             adrift: 0,
             max_adrift_mm: 0.0,
         };

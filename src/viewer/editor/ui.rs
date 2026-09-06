@@ -5177,6 +5177,9 @@ mod tests {
             vertices_moved: 412,
             max_displacement_mm: 0.0874,
             gave_up: 0,
+            refused: 0,
+            max_refused_mm: 0.0,
+            refused_crossings: 0,
             adrift: 0,
             max_adrift_mm: 0.0,
         };
