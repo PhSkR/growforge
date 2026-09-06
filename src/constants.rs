@@ -920,6 +920,50 @@ pub const REDUCE_ADD_RATIO: f64 = 0.01;
 /// structural optimization it descends from.
 pub const REDUCE_ADD_RATIO_MAX: f64 = 0.05;
 
+// The three numbers below are the evolutionary update's own, and they are not
+// keys: they are what makes the 0/1 sequence of `method = "beso"` converge at
+// all rather than oscillate between two designs, and a run that set them
+// differently would be a different method. `evolution_rate` and `add_ratio`
+// above are the schedule the user drives it with.
+
+/// How many previous iterations' sensitivity fields the evolutionary update
+/// averages the current one with.
+///
+/// One, which is the averaging Huang and Xie introduced the method's
+/// convergence with: a 0/1 design's sensitivity field jumps when an element
+/// flips, and the same element can therefore be ranked last one iteration and
+/// first the next, which is what an evolutionary method oscillates on. Averaging
+/// with the previous iteration's own averaged field damps exactly that without
+/// putting a lag between the ranking and the design - a longer history is a
+/// low-pass filter over the ranking, and it ranks elements by a structure that
+/// is several removals out of date.
+///
+/// X. Huang, Y.M. Xie, "Convergent and mesh-independent solutions for the
+/// bi-directional evolutionary structural optimization method", Finite Elements
+/// in Analysis and Design 43 (2007) 1039-1049.
+pub const BESO_SENSITIVITY_HISTORY: usize = 1;
+
+/// Half the window the evolutionary update reads its settling off, in
+/// iterations.
+///
+/// Five, so the test compares the compliance summed over the last five
+/// iterations with the five before them - the form the method is written with.
+/// A single iteration's compliance is not a verdict on a 0/1 design: one flip
+/// moves it, and a design that has stopped improving still moves it by a
+/// fraction of a percent each way. Five is long enough for those to cancel and
+/// short enough that a stage does not pay twenty iterations to notice it has
+/// arrived.
+pub const BESO_CONVERGENCE_WINDOW: usize = 5;
+
+/// Fewest cells a positive `add_ratio` may let back in one iteration.
+///
+/// One. The cap is a share of the current volume, and a share of a small design
+/// rounds to zero cells - which would make the method one-way by arithmetic
+/// rather than by configuration, on exactly the small grids where a single cell
+/// is a large share of the volume. `add_ratio = 0` is the way to ask for the
+/// one-way method, and it is honoured before this floor is.
+pub const BESO_ADDITION_FLOOR_CELLS: usize = 1;
+
 // ---------------------------------------------------------------------------
 // Growth engine
 // ---------------------------------------------------------------------------

@@ -26,16 +26,33 @@
   `ratio` of the volume target before it, for up to the run's own
   `max_iterations` iterations, then answers for itself with the load path gate
   and the stress report. The first stage that no longer holds
-  `target_safety_factor` closes a bracket, `refine_stages` bisections narrow it,
-  and the lightest design that held is the one exported; a start that misses the
+  `target_safety_factor` closes a bracket, `refine_stages` bisections narrow it
+  - each of them restarting from the design that held rather than from the
+  lighter one that did not, so a refinement is a descent - and the lightest
+  design that held is the one exported; a start that misses the
   target is exported too, under a warning that says so, and a stage that failed
   on the iteration cap says the cap may be what it needs. The `[output]` trim,
   flush and reinforcement passes run after the schedule has chosen, so the part
   they leave is measured against the target once more: it carries
   `finished_safety_factor` and `finished_meets_target` into the JSON report, and
   a margin those passes cost it is a warning naming them and both numbers. A run
-  without the table takes the path it always took, iteration for iteration. `method = "beso"` is
-  refused by the engine until its update rule lands.
+  without the table takes the path it always took, iteration for iteration.
+- **`method = "beso"` cuts cells where the other method moves densities.** The
+  evolutionary update holds a solid-or-removed design: each iteration ranks the
+  design cells by their compliance sensitivity, smooths that ranking over the
+  density filter's own neighbourhood and averages it with the iteration before,
+  lowers the volume target by `evolution_rate` of itself down to the stage's,
+  and cuts the ranking where the cells above it fill that volume - letting at
+  most `add_ratio` of the volume back in, which is how a member the loads want
+  returns. The cells of supports and load regions are never cut away. A stage
+  settles when the volume is at its target and a cut flips no cell at all, or
+  the compliance has stopped moving across a window of iterations - rather than
+  on the density criteria, which mean nothing for a design that only ever flips; everything around it -
+  the load path gate, the stress report, the bracket and its refinements, the
+  lightest design that held - is the schedule the other method runs. The
+  overhang filter is allowed with it and needs nothing new: it is a stage of
+  the density chain, and it shapes what the analysis sees exactly as it does
+  under SIMP.
 - **Switching to the growth engine** in the editor now takes the four
   `[optimization]` tables that engine refuses with it (`overhang`, `wireframe`,
   `local_volume`, `reduce`), as the switch to `solid` already did.

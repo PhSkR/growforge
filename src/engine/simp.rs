@@ -27,6 +27,14 @@
 //! its warm start - and what comes out is the lightest stage that held the
 //! target. See [`SimpEngine::optimize`]'s stage section.
 //!
+//! The schedule's `method` decides step 6 and nothing else. Under
+//! `"continuation"` it is the configured scheme above, taking the stage's target
+//! as its volume constraint; under `"beso"` it is the evolutionary update of
+//! [`crate::engine::beso`], which holds a 0/1 design, walks its own volume
+//! target down to the stage's at `evolution_rate` a step, and answers the
+//! settling question below itself instead of leaving it to the convergence
+//! tolerance and [`crate::engine::stall`].
+//!
 //! The loop stops for one of three reasons, reported apart because they mean
 //! different things about the design that comes out: the convergence tolerance
 //! (an answer), the stall criterion of [`crate::engine::stall`] (an iterate the
@@ -37,10 +45,11 @@
 
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
-use crate::config::{ReduceMethod, ReduceMethodParams};
+use crate::config::ReduceMethodParams;
 use crate::constants;
+use crate::engine::beso;
 use crate::engine::chain::DensityChain;
 use crate::engine::local_volume::LocalVolume;
 use crate::engine::objective::{Objective, Workspace};
@@ -68,8 +77,12 @@ pub struct SimpEngine;
 /// Both ends of the density chain travel together: the printed field is the
 /// design, and the filtered one is what the overhang residual is measured
 /// against, so a design exported out of an earlier stage is described by that
-/// stage's numbers throughout.
+/// stage's numbers throughout. The design variables travel with them because a
+/// refinement stage is run from this design rather than from the lighter one
+/// that failed.
 struct Kept {
+    /// Design variables of the stage's design: what a refinement restarts from.
+    x: Vec<f64>,
     /// Printed physical densities of the stage's design.
     printed: Vec<f64>,
     /// The chain's intermediate stage for the same design.
@@ -94,20 +107,6 @@ impl Engine for SimpEngine {
         let n_cells = grid.n_cells();
         let params = problem.optimization;
         let reduce = params.reduce;
-        // The evolutionary method shares the stage schedule below but not the
-        // update rule, and that rule is not in this build. Refused here rather
-        // than quietly run under the other one: a run that reported a method it
-        // did not use would be worse than no run.
-        if let Some(reduce) = reduce
-            && matches!(reduce.method, ReduceMethodParams::Beso { .. })
-        {
-            bail!(
-                "[optimization.reduce] method = \"{}\" is not implemented in this build; \
-                 method = \"{}\" is the one it has",
-                reduce.method.kind().label(),
-                ReduceMethod::Continuation.label()
-            );
-        }
 
         let design_cells: Vec<usize> = (0..n_cells)
             .filter(|&e| grid.cells[e] == CellKind::Design)
@@ -150,7 +149,32 @@ impl Engine for SimpEngine {
         let mut x_new = vec![0.0; n_cells];
         let mut dc = vec![0.0; n_cells];
         let mut dv = vec![0.0; n_cells];
-        let mut updater = Updater::new(params.update, n_cells);
+        // The evolutionary method brings its own update; every other run takes
+        // the scheme `[optimization] update` selected, which is the only one a
+        // configuration can name.
+        let mut updater = match reduce.map(|reduce| reduce.method) {
+            Some(ReduceMethodParams::Beso {
+                evolution_rate,
+                add_ratio,
+            }) => {
+                let state = beso::State::new(problem, &chain, evolution_rate, add_ratio);
+                reporter.note(&format!(
+                    "reduce: the evolutionary update holds a solid-or-removed design: each \
+                     iteration ranks the design cells by their compliance sensitivity, takes \
+                     {:.3} of the volume away and lets at most {:.3} of it back, and the change \
+                     column is the share of the design cells that flipped. {} of the {} design \
+                     cells are a support or a load region and are never removed, so no stage of \
+                     this run can go below a fraction of {:.4}",
+                    evolution_rate,
+                    add_ratio,
+                    state.protected_cells(),
+                    design_cells.len(),
+                    state.protected_cells() as f64 / design_cells.len().max(1) as f64
+                ));
+                Updater::Evolutionary(state)
+            }
+            _ => Updater::new(params.update, n_cells),
+        };
         // The local volume cap, when one was asked for: a second constraint, its
         // own kernel and its own gradient. Nothing is allocated for it when the
         // table is absent, which is what keeps a plain run's working set the one
@@ -358,7 +382,38 @@ impl Engine for SimpEngine {
                 // when the hold is longer than one. Nothing but the iteration cap and
                 // a cancellation can therefore end a run while the wire is forced,
                 // and both of those say so below.
-                if wireframe.as_ref().is_none_or(|wire| !wire.holds(iteration)) {
+                // The evolutionary update settles on its own terms and is asked
+                // for them here: the change a 0/1 design reports is a count of
+                // flips rather than a distance that decays towards a tolerance,
+                // and neither of the two verdicts below would mean anything of
+                // it. Every other scheme answers `None` and is asked exactly
+                // what it always was.
+                if let Some(settling) =
+                    updater.evolutionary_settling(compliance, params.convergence_tol)
+                {
+                    match settling {
+                        beso::Settling::Running => {}
+                        beso::Settling::Settled(change) => {
+                            stop = StopReason::Converged;
+                            reporter.note(&format!(
+                                "{stage_prefix}converged after {iteration} iterations (the volume \
+                                 is at its target and the compliance moved {change:.5} < {:.5} \
+                                 over the last {} iterations)",
+                                params.convergence_tol,
+                                2 * constants::BESO_CONVERGENCE_WINDOW
+                            ));
+                            break;
+                        }
+                        beso::Settling::Unmoved => {
+                            stop = StopReason::Converged;
+                            reporter.note(&format!(
+                                "{stage_prefix}converged after {iteration} iterations (the volume \
+                                 is at its target and the cut flipped no cell)"
+                            ));
+                            break;
+                        }
+                    }
+                } else if wireframe.as_ref().is_none_or(|wire| !wire.holds(iteration)) {
                     if max_change < params.convergence_tol {
                         stop = StopReason::Converged;
                         reporter.note(&format!(
@@ -509,6 +564,7 @@ impl Engine for SimpEngine {
                     .is_none_or(|held| volume_fraction < held.volume_fraction)
                 {
                     kept = Some(Kept {
+                        x: x.clone(),
                         printed: work.printed.clone(),
                         filtered: work.filtered.clone(),
                         volume_fraction,
@@ -542,6 +598,21 @@ impl Engine for SimpEngine {
                     refinements_left -= 1;
                     stage_refine = true;
                     stage_target = (pass + fail) / 2.0;
+                    // A refinement asks for more material than the stage that
+                    // just failed has, so it starts from the design that held
+                    // instead of from that one: a bisection is then a descent
+                    // for either method, rather than a climb the evolutionary
+                    // update can only make `add_ratio` of the volume at a time
+                    // and cannot make at all when the file asked for the one-way
+                    // method. The updater goes back with the design - what it
+                    // carries between iterations describes the trajectory this
+                    // leaves - and the workspace's densities are the first thing
+                    // the next stage's evaluation overwrites.
+                    let held = kept
+                        .as_ref()
+                        .expect("a closed bracket has a design that held in it");
+                    x.copy_from_slice(&held.x);
+                    updater.restart(&x, &design_cells);
                 }
                 // Still descending. The floor is a stage of its own - it is
                 // asked for like any other - and a schedule that reaches it and
@@ -650,7 +721,7 @@ impl Engine for SimpEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, UpdateScheme};
+    use crate::config::{Config, ReduceMethod, UpdateScheme};
     use crate::report::SilentReporter;
     use std::path::PathBuf;
 
@@ -1991,7 +2062,25 @@ vector = [0.0, 0.0, -200.0]
     /// Run a reduction schedule and take back the field it exported, the stage
     /// every progress line belonged to, and the notes it said.
     fn reduce_run(keys: &str) -> (DensityField, Vec<Option<ReduceProgress>>, Vec<String>) {
-        let config = Config::parse(&reducing(keys)).expect("parse");
+        schedule_run(&reducing(keys))
+    }
+
+    /// The same under `method = "beso"`. Its stages need more than the
+    /// fixture's five iterations: the volume walks down to the stage's target
+    /// at `evolution_rate` a step and the settling test then reads a window of
+    /// ten iterations at it.
+    fn beso_run(keys: &str) -> (DensityField, Vec<Option<ReduceProgress>>, Vec<String>) {
+        schedule_run(
+            &reducing(&format!(
+                "method = \"beso\"
+{keys}"
+            ))
+            .replace("max_iterations = 5", "max_iterations = 14"),
+        )
+    }
+
+    fn schedule_run(text: &str) -> (DensityField, Vec<Option<ReduceProgress>>, Vec<String>) {
+        let config = Config::parse(text).expect("parse");
         let problem = Problem::build(&config, &PathBuf::from(".")).expect("build");
         let reporter = Staged::default();
         let field = SimpEngine.optimize(&problem, &reporter).expect("optimize");
@@ -2193,21 +2282,171 @@ vector = [0.0, 0.0, -200.0]
         assert!(json.contains("\"method\": \"continuation\""), "{json}");
     }
 
-    /// The evolutionary method shares the schedule but not the update rule, and
-    /// that rule is not in this build: the run refuses rather than reporting a
-    /// method it did not use.
+    /// The evolutionary method runs the same schedule to the same verdicts: the
+    /// stages descend, a stage that holds the target is kept, and what ships is
+    /// the lightest design that held - reached by cutting cells rather than by
+    /// re-converging densities.
     #[test]
-    fn the_evolutionary_method_is_refused_by_the_engine() {
-        let config = Config::parse(&reducing("target_safety_factor = 2.0\nmethod = \"beso\"\n"))
-            .expect("parse");
-        let problem = Problem::build(&config, &PathBuf::from(".")).expect("build");
-        let error = SimpEngine
-            .optimize(&problem, &SilentReporter)
-            .expect_err("the evolutionary method is not built");
-        let text = format!("{error:#}");
+    fn an_evolutionary_schedule_exports_the_lightest_design_that_held() {
+        let (field, lines, notes) = beso_run(
+            "target_safety_factor = 3.0
+ratio = 0.5
+min_mass_fraction = 0.1
+             refine_stages = 1
+evolution_rate = 0.1
+add_ratio = 0.05
+",
+        );
+        assert_eq!(field.stop, StopReason::ReduceComplete);
+        let summary = field.reduce.expect("a schedule");
+        assert_eq!(summary.method, ReduceMethod::Beso);
+        let exported = summary.exported;
+        assert!(exported.passed && !summary.missed_the_target());
         assert!(
-            text.contains("beso") && text.contains("not implemented in this build"),
-            "{text}"
+            exported.achieved_fraction < 1.0,
+            "the schedule exported the start: {exported:?}"
+        );
+        assert!(exported.safety_factor.expect("a factor") >= summary.target_safety_factor);
+        assert!((field.volume_fraction - exported.achieved_fraction).abs() < 1e-12);
+        // The first stage is the fraction the run started from and every later
+        // one asks for less, which is the schedule these stages ran.
+        assert!((summary.stages[0].target_fraction - 1.0).abs() < 1e-12);
+        for pair in summary.stages.windows(2) {
+            assert!(
+                pair[1].target_fraction < pair[0].target_fraction || pair[1].refine,
+                "{:?} does not follow {:?}",
+                pair[1],
+                pair[0]
+            );
+        }
+        // A stage the evolution walked all the way down lands on its target
+        // rather than near it: the cut is a count of cells, not a bisection.
+        let arrived = summary
+            .stages
+            .iter()
+            .find(|stage| (stage.target_fraction - 0.5).abs() < 1e-12)
+            .expect("the second stage");
+        assert!(
+            (arrived.achieved_fraction - 0.5).abs() < 0.05,
+            "{arrived:?} did not reach its target"
+        );
+        assert!(lines.iter().all(|line| line.is_some()));
+        assert!(
+            notes.iter().any(
+                |note| note.starts_with("reduce: the evolutionary update holds a")
+                    && note.contains("never removed")
+            ),
+            "{notes:?}"
+        );
+    }
+
+    /// A refinement stage restarts from the design that held the target rather
+    /// than from the lighter one that did not, so a bisection is a descent for
+    /// this method too: even the one-way form of it - `add_ratio = 0`, which can
+    /// never grow a design back - reaches the fraction the refinement asks for,
+    /// and its verdict is measured on a design of that fraction rather than on
+    /// whatever the stage before it was left at.
+    #[test]
+    fn an_evolutionary_refinement_restarts_from_the_design_that_held() {
+        let (field, _, notes) = beso_run(
+            "target_safety_factor = 3.0
+ratio = 0.5
+min_mass_fraction = 0.1
+             refine_stages = 1
+evolution_rate = 0.1
+add_ratio = 0.0
+",
+        );
+        let summary = field.reduce.expect("a schedule");
+        let refinement = summary
+            .stages
+            .iter()
+            .find(|stage| stage.refine)
+            .expect("a refinement stage");
+        assert!(
+            (refinement.achieved_fraction - refinement.target_fraction).abs() < 0.05,
+            "{refinement:?} did not reach its target"
+        );
+        assert!(
+            refinement.safety_factor.is_some(),
+            "the refinement's verdict is unmeasured: {refinement:?}"
+        );
+        // A refinement that reached its target did not run out of budget, so
+        // nothing offers more iterations as the remedy.
+        assert!(
+            !notes.iter().any(
+                |note| note.contains("(refinement)") && note.contains("raising max_iterations")
+            ),
+            "{notes:?}"
+        );
+        // The first stage is the solid start at a target of one: the first cut
+        // has nothing to take away and nothing to flip, and a stage nothing
+        // moves is settled where it stands.
+        assert_eq!(summary.stages[0].iterations, 1, "{:?}", summary.stages[0]);
+    }
+
+    /// The self-supporting filter needs nothing of its own from the evolutionary
+    /// method and is not refused with it: it is a stage of the density chain, so
+    /// it shapes what the analysis sees and what ships exactly as it does under
+    /// the density schemes, and what the ranking reads is the sensitivity that
+    /// comes back through it.
+    #[test]
+    fn an_evolutionary_schedule_runs_under_the_overhang_filter() {
+        let text = tiny(
+            "[optimization.overhang]
+build_direction = \"z+\"
+
+[optimization.reduce]
+             method = \"beso\"
+target_safety_factor = 3.0
+ratio = 0.5
+             evolution_rate = 0.1
+refine_stages = 0
+",
+        )
+        .replace(
+            "mass_fraction = 0.4
+",
+            "",
+        )
+        .replace("max_iterations = 5", "max_iterations = 12");
+        let (field, _, _) = schedule_run(&text);
+        assert_eq!(field.stop, StopReason::ReduceComplete);
+        let summary = field.reduce.expect("a schedule");
+        assert_eq!(summary.method, ReduceMethod::Beso);
+        assert!(summary.stages.len() > 1, "{:?}", summary.stages);
+        let residual = field.overhang_residual.expect("an overhang residual");
+        assert!(residual.max.is_finite() && residual.mean <= residual.max);
+        assert!(field.densities.iter().all(|d| *d >= -1e-12));
+        // The design that ships is the filter's own output, which is why the
+        // fraction is read for material rather than against a target: the smooth
+        // minimum of the sweep sits a little above one on a solid blueprint, and
+        // that is the exported field's number under either method.
+        assert!(field.volume_fraction > 0.0);
+    }
+
+    /// And it fails one the same way: a target no design of this domain can hold
+    /// leaves the schedule with nothing to export but the solid start, which the
+    /// evolutionary method's own first stage never cuts into.
+    #[test]
+    fn an_evolutionary_schedule_that_holds_nothing_exports_the_solid_start() {
+        let (field, _, notes) = beso_run(
+            "target_safety_factor = 1e6
+evolution_rate = 0.1
+",
+        );
+        assert_eq!(field.stop, StopReason::ReduceComplete);
+        assert_eq!(field.volume_fraction, 1.0);
+        assert!(field.densities.iter().all(|d| *d == 1.0), "not solid");
+        let summary = field.reduce.expect("a schedule");
+        assert_eq!(summary.method, ReduceMethod::Beso);
+        assert_eq!(summary.stages.len(), 1, "{:?}", summary.stages);
+        assert!(!summary.exported.passed && summary.missed_the_target());
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("warning: [optimization.reduce]")),
+            "{notes:?}"
         );
     }
 }

@@ -531,9 +531,18 @@ pub fn print_problem_summary(problem: &Problem) {
                 );
                 println!(
                     "update         {}",
-                    match problem.optimization.update {
-                        UpdateScheme::Oc => "oc, optimality criteria (the reproducible default)",
-                        UpdateScheme::Mma => "mma, method of moving asymptotes",
+                    // The evolutionary method is its own update, so the scheme
+                    // this line otherwise names is not the one that will run -
+                    // and a configuration cannot name one beside it either.
+                    match (
+                        problem.optimization.reduce.map(|reduce| reduce.method),
+                        problem.optimization.update,
+                    ) {
+                        (Some(ReduceMethodParams::Beso { .. }), _) =>
+                            "beso, the evolutionary update of [optimization.reduce]",
+                        (_, UpdateScheme::Oc) =>
+                            "oc, optimality criteria (the reproducible default)",
+                        (_, UpdateScheme::Mma) => "mma, method of moving asymptotes",
                     }
                 );
                 println!(

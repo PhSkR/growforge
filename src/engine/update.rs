@@ -6,26 +6,43 @@
 //! chain, so the same [`Buffers`] and the same [`Step`] describe either one.
 //! They differ only in the approximation they minimize: see [`super::oc`] and
 //! [`super::mma`].
+//!
+//! [`super::beso`] plugs in here too, and it is not one of those two: it is not
+//! a scheme a configuration can select but the update `[optimization.reduce]
+//! method = "beso"` brings with it, it moves cells rather than densities, and it
+//! answers the loop's settling question itself. The seam is the same one all the
+//! same - a step in, a [`Step`] out - which is what lets the stage schedule run
+//! either method without knowing which one it has.
 
 use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::config::UpdateScheme;
 use crate::engine::chain::DensityChain;
-use crate::engine::{mma, oc};
+use crate::engine::{beso, mma, oc};
 
 /// Result of one design variable update.
 #[derive(Debug, Clone, Copy)]
 pub struct Step {
     /// Largest absolute change of any design variable.
+    ///
+    /// Under [`super::beso`] every change is the whole box - a cell is kept or
+    /// it is cut - so what one step reports there is the share of the design
+    /// cells that flipped.
     pub max_change: f64,
     /// Mean printed density over the design cells after the step.
     pub volume_fraction: f64,
     /// Lagrange multiplier of the volume constraint the bisection settled on.
+    ///
+    /// Under [`super::beso`] the volume constraint is met by a cut through the
+    /// ranking rather than by a multiplier, and this is where that cut fell: the
+    /// sensitivity of the last cell the iteration kept.
     pub lambda: f64,
     /// Sensitivity shift the self-weight guard applied, zero when it did not
     /// engage. Always zero under MMA, which represents a positive objective
-    /// sensitivity natively; see [`super::mma`].
+    /// sensitivity natively; see [`super::mma`], and under [`super::beso`],
+    /// which ranks sensitivities rather than dividing by them and needs no
+    /// positive ones.
     pub shift: f64,
 }
 
@@ -97,13 +114,16 @@ pub(crate) fn design_mean(x_phys: &[f64], design_cells: &[usize]) -> f64 {
 ///
 /// The optimality criteria step is stateless; MMA carries its asymptotes and
 /// the two previous design points, which is what lets it see whether a variable
-/// is oscillating.
+/// is oscillating; the evolutionary update carries its volume target, its
+/// sensitivity history and the cells it may not cut.
 #[derive(Debug)]
 pub enum Updater {
     /// Optimality criteria, [`super::oc`].
     Oc,
     /// Method of moving asymptotes, [`super::mma`].
     Mma(mma::State),
+    /// The bi-directional evolutionary update, [`super::beso`].
+    Evolutionary(beso::State),
 }
 
 impl Updater {
@@ -115,11 +135,42 @@ impl Updater {
         }
     }
 
-    /// Which scheme this is.
-    pub fn scheme(&self) -> UpdateScheme {
+    /// Which scheme this is, and `None` for the evolutionary update, which is
+    /// not one of the schemes `[optimization] update` selects between.
+    pub fn scheme(&self) -> Option<UpdateScheme> {
         match self {
-            Updater::Oc => UpdateScheme::Oc,
-            Updater::Mma(_) => UpdateScheme::Mma,
+            Updater::Oc => Some(UpdateScheme::Oc),
+            Updater::Mma(_) => Some(UpdateScheme::Mma),
+            Updater::Evolutionary(_) => None,
+        }
+    }
+
+    /// Put the updater back onto a design it did not itself produce, which the
+    /// stage schedule does when a refinement restarts from the design that held
+    /// its target.
+    ///
+    /// Only the evolutionary update carries state that such a jump invalidates:
+    /// its volume target is where the last cut left the design, and a design it
+    /// did not cut is somewhere else. The optimality criteria step is stateless
+    /// and MMA's asymptotes are a scaling it re-derives from the points it is
+    /// given, so both take the new design as they would any other.
+    pub fn restart(&mut self, x: &[f64], design_cells: &[usize]) {
+        if let Updater::Evolutionary(state) = self {
+            state.restart(x, design_cells);
+        }
+    }
+
+    /// The evolutionary update's own settling verdict for this iteration, and
+    /// `None` from a scheme that does not have one - whose caller then asks its
+    /// own questions of the step instead.
+    pub fn evolutionary_settling(
+        &mut self,
+        compliance: f64,
+        tolerance: f64,
+    ) -> Option<beso::Settling> {
+        match self {
+            Updater::Evolutionary(state) => Some(state.observe(compliance, tolerance)),
+            _ => None,
         }
     }
 
@@ -144,6 +195,7 @@ impl Updater {
                 buffers,
             ),
             Updater::Mma(state) => state.update(x, dc, dv, constraint, buffers),
+            Updater::Evolutionary(state) => state.update(x, dc, constraint, buffers),
         }
     }
 }
@@ -174,10 +226,13 @@ mod tests {
 
     #[test]
     fn the_updater_reports_the_scheme_it_was_built_for() {
-        assert_eq!(Updater::new(UpdateScheme::Oc, 8).scheme(), UpdateScheme::Oc);
+        assert_eq!(
+            Updater::new(UpdateScheme::Oc, 8).scheme(),
+            Some(UpdateScheme::Oc)
+        );
         assert_eq!(
             Updater::new(UpdateScheme::Mma, 8).scheme(),
-            UpdateScheme::Mma
+            Some(UpdateScheme::Mma)
         );
         assert_eq!(UpdateScheme::default(), UpdateScheme::Oc);
     }

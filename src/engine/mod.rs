@@ -13,6 +13,7 @@
 //! than an engine either.
 
 pub mod am_filter;
+pub mod beso;
 pub mod chain;
 pub mod filter;
 pub mod growth;
