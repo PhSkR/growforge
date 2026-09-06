@@ -1432,7 +1432,7 @@ enum Section {
     Resolution,
     /// `[material]`.
     Material,
-    /// `[optimization]` and its three sub-tables.
+    /// `[optimization]` and its four sub-tables.
     Optimization,
     /// `[growth]`, shown under that engine alone.
     Growth,

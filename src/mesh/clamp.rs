@@ -234,8 +234,9 @@ impl ClampReport {
             };
             notes.push(format!(
                 "warning: {left} left unmoved and the surface still crosses a boundary there: no \
-                 legal position was reached in {} passes, or the correction needed was further \
-                 than the {} voxel a sampling artefact can be",
+                 legal position was reached in {} passes, the correction needed was further than \
+                 the {} voxel a sampling artefact can be, or it was withdrawn to keep a triangle \
+                 from collapsing",
                 constants::BOUNDARY_CLAMP_MAX_PASSES,
                 constants::BOUNDARY_CLAMP_MAX_DISPLACEMENT_VOXELS
             ));

@@ -1,19 +1,81 @@
 # Changelog
 
-## 2026-09-05 - 0.43.0 - (title pending)
+## 2026-09-06 - 0.43.0 - Say how strong, not how heavy
 
-- **The exact-boundary clamp never collapses a triangle.** Corrections are
-  decided one vertex at a time, so a face - which keeps the two coordinates
-  lying in it - could hand two corners of one triangle the same point, and the
-  export then died in validation on `area 0e0 mm2`. The corrections of a pass
-  are now read back against the triangles before any is applied: a triangle
-  whose corrected corners would fall under the validator's own area floor has
-  the corrections of all three refused, keeping the positions the sampling
-  gave them. The count and the furthest of them are reported on the console
-  and in the editor's panel; a refusal that hands a corner back a position
-  outside a boundary is counted, and warned about, with the vertices the pass
-  gave up on. Validation is still the gate.
+`mass_fraction` was always the question and the safety factor was always the
+answer: you said how heavy the part could be, and the report told you
+afterwards what margin that bought. **`[optimization.reduce]` turns it
+around** - name the margin, and the run starts from the solid design space and
+takes material away stage by stage until it finds the lightest design that
+still holds it. Two methods do the taking, the part that ships is measured
+once more after the `[output]` passes have been over it, and the editor drives
+the whole schedule from one tick box.
 
+- **Material is removed until the safety factor says stop.** The new
+  `[optimization.reduce]` table carries a required `target_safety_factor` and
+  the schedule around it - `ratio`, `refine_stages`, `min_mass_fraction` - and
+  turns a SIMP run into a sequence of stages inside one solve. The design
+  starts at `mass_fraction`, which the table makes *optional* and redefines as
+  where the run starts rather than where it has to end up: solid, unless the
+  file says otherwise. Each stage re-converges the design at `ratio` of the
+  volume target before it, for up to the run's own `max_iterations`
+  iterations, and then answers for itself with the load path gate and the
+  stress report. The first stage that no longer holds the target closes a
+  bracket, `refine_stages` bisections narrow it - each of them restarting from
+  the design that held rather than from the lighter one that did not, so a
+  refinement is a descent under either method - and the lightest design that
+  held is the one exported. A start that misses the target is exported too,
+  under a warning that says so and names what is left to try, and a stage that
+  failed on the iteration cap says the cap may be what it needs. The table is
+  refused by the solid and growth engines, beside `[optimization.wireframe]`
+  or `[optimization.local_volume]`, beside an `update` scheme under the
+  `"beso"` method, and over a `[material]` that declares no
+  `yield_strength_mpa` - the safety factor is measured against it.
+- **The `[output]` passes are measured too.** Trim, flush and reinforcement
+  run after the schedule has chosen, so the part they leave is not the design
+  any stage judged. It is measured against the target once more, carrying
+  `finished_safety_factor` and `finished_meets_target` into the JSON report,
+  and a margin those passes cost it is a warning naming them and both numbers.
+- **What a reduction says.** A `reduce complete` stop reason; the stage on
+  every iteration line, since the step count starts again at each one; a note
+  per finished stage with its target, its fraction, its iterations and its
+  verdict; a summary line naming the stage that shipped; the whole schedule
+  echoed by `check` before anything is solved; and a `reduce` object in the
+  stress report JSON holding the same records, beside what the finished part
+  measured. A run without the table prints and writes exactly what it did
+  before, to the byte.
+- **`method = "beso"` cuts cells where the other method moves densities.** The
+  evolutionary update holds a solid-or-removed design: each iteration ranks
+  the design cells by their compliance sensitivity, smooths that ranking over
+  the density filter's own neighbourhood and averages it with the iteration
+  before, lowers the volume target by `evolution_rate` of itself down to the
+  stage's, and cuts the ranking where the cells above it fill that volume -
+  letting at most `add_ratio` of the volume back in, which is how a member the
+  loads want returns. The cells of supports and load regions are never cut
+  away. A stage settles when the volume is at its target and either a cut
+  flips no cell at all or the compliance has stopped moving across a window of
+  iterations, rather than on the design variable change, which means nothing
+  for a design that only ever flips. Everything around it - the load path
+  gate, the stress report, the bracket and its refinements, the lightest
+  design that held - is the schedule the other method runs; and a refinement
+  restarting from the design that held is what lets an update able to give
+  back only `add_ratio` of the volume an iteration run a bisection at all. The
+  overhang filter is allowed with it and needs nothing new: it is a stage of
+  the density chain, and it shapes what the analysis sees exactly as it does
+  under SIMP.
+- **The editor drives a reduction.** A tick box in the optimization section
+  writes the whole `[optimization.reduce]` table with its defaults and takes
+  it away again, with a row per key - target safety factor, method, ratio,
+  refine stages, min mass fraction, and the two evolutionary rates under
+  `beso` alone, which the method combo takes with it when it leaves. Under the
+  table the mass fraction row is the optional `start fraction`, which is what
+  the key now is: unticked, the schedule starts from the solid design space,
+  and taking the table away gives a file that started solid its mass target
+  back. The run line carries the stage the schedule is on, and the stress
+  block draws the schedule when it ends: every stage, the one that was
+  exported, and what the part in the file measures against the target - the
+  console's own lines, and its own warnings. A design generated from a run
+  whose schedule finished carries that schedule into its own report.
 - **A keepin is a boundary surface.** The solid the exported mesh is held
   inside is now the domain *union* the keepins, so a keepin that sticks out of
   the domain keeps its own skin: its surface is seated onto like a keepout's
@@ -27,74 +89,22 @@
   domain is still the precedence, and a `[[keepin]]` tube that overlaps itself
   is now warned about by `check` exactly as a `[[keepout]]` one is, since its
   skin is projected onto too.
-
-- **`[optimization.reduce]`** is read, validated and echoed by `check`: a
-  required `target_safety_factor`, a `method` of `"continuation"` or `"beso"`,
-  and the schedule around them (`ratio`, `refine_stages`, `min_mass_fraction`,
-  and `evolution_rate` / `add_ratio` for the evolutionary method alone). With
-  the table present `mass_fraction` is optional and means the fraction the run
-  *starts* from - solid when it is left out. Refused by the solid and growth
-  engines, beside `[optimization.wireframe]` or `[optimization.local_volume]`,
-  beside an `update` scheme under `method = "beso"`, and with a `[material]`
-  that declares no `yield_strength_mpa` - the safety factor is measured against
-  it. Nothing removes material yet; the stage loop is the next change.
-- **What a reduction run will report** is in place ahead of the stage loop that
-  fills it: a `reduce complete` stop reason, a per-stage record (target,
-  fraction, iterations, safety factor, pass, refinement) with the summary of
-  which stage was exported, the stage prefix on the progress line, the stage and
-  summary lines the console says, and a `reduce` object in the stress report
-  JSON. Nothing removes material yet, and a run without the table prints and
-  writes exactly what it did before, to the byte.
-- **Material is now removed until the safety factor says stop.** Under
-  `[optimization.reduce]` with `method = "continuation"` the SIMP run becomes a
-  schedule of stages inside one solve: the design starts at `mass_fraction` -
-  solid unless the file says otherwise - and each stage re-converges it at
-  `ratio` of the volume target before it, for up to the run's own
-  `max_iterations` iterations, then answers for itself with the load path gate
-  and the stress report. The first stage that no longer holds
-  `target_safety_factor` closes a bracket, `refine_stages` bisections narrow it
-  - each of them restarting from the design that held rather than from the
-  lighter one that did not, so a refinement is a descent - and the lightest
-  design that held is the one exported; a start that misses the
-  target is exported too, under a warning that says so, and a stage that failed
-  on the iteration cap says the cap may be what it needs. The `[output]` trim,
-  flush and reinforcement passes run after the schedule has chosen, so the part
-  they leave is measured against the target once more: it carries
-  `finished_safety_factor` and `finished_meets_target` into the JSON report, and
-  a margin those passes cost it is a warning naming them and both numbers. A run
-  without the table takes the path it always took, iteration for iteration.
-- **`method = "beso"` cuts cells where the other method moves densities.** The
-  evolutionary update holds a solid-or-removed design: each iteration ranks the
-  design cells by their compliance sensitivity, smooths that ranking over the
-  density filter's own neighbourhood and averages it with the iteration before,
-  lowers the volume target by `evolution_rate` of itself down to the stage's,
-  and cuts the ranking where the cells above it fill that volume - letting at
-  most `add_ratio` of the volume back in, which is how a member the loads want
-  returns. The cells of supports and load regions are never cut away. A stage
-  settles when the volume is at its target and a cut flips no cell at all, or
-  the compliance has stopped moving across a window of iterations - rather than
-  on the density criteria, which mean nothing for a design that only ever flips; everything around it -
-  the load path gate, the stress report, the bracket and its refinements, the
-  lightest design that held - is the schedule the other method runs. The
-  overhang filter is allowed with it and needs nothing new: it is a stage of
-  the density chain, and it shapes what the analysis sees exactly as it does
-  under SIMP.
+- **The exact-boundary clamp never collapses a triangle.** Corrections are
+  decided one vertex at a time, so a face - which keeps the two coordinates
+  lying in it - could hand two corners of one triangle the same point, and the
+  export then died in validation on `area 0e0 mm2`. The corrections of a pass
+  are now read back against the triangles before any is applied: a triangle
+  whose corrected corners would fall under the validator's own area floor has
+  the corrections of all three refused, keeping the positions the sampling
+  gave them. The count and the furthest of them are reported on the console
+  and in the editor's panel; a refusal that hands a corner back a position
+  outside a boundary is counted, and warned about, with the vertices the pass
+  gave up on. Validation is still the gate.
 - **Switching to the growth engine** in the editor now takes the four
-  `[optimization]` tables that engine refuses with it (`overhang`, `wireframe`,
-  `local_volume`, `reduce`), as the switch to `solid` already did.
-- **The editor drives a reduction.** A tick box in the optimization section
-  writes the whole `[optimization.reduce]` table with its defaults and takes
-  it away again, with a row per key - target safety factor, method, ratio,
-  refine stages, min mass fraction, and the two evolutionary rates under
-  `beso` alone, which the method combo takes with it when it leaves. Under
-  the table the mass fraction row is the optional `start fraction`, which is
-  what the key now is: unticked, the schedule starts from the solid design
-  space, and taking the table away gives a file that started solid its mass
-  target back. The run line carries the stage the schedule is on, and the
-  stress block draws the schedule when it ends: every stage, the one that was
-  exported, and what the part in the file measures against the target - the
-  console's own lines, and its own warnings. A design generated from a run
-  whose schedule finished carries that schedule into its own report.
+  `[optimization]` tables that engine refuses with it (`overhang`,
+  `wireframe`, `local_volume`, `reduce`), as the switch to `solid` already
+  did.
+- Version 0.43.0.
 
 ## 2026-08-17 - 0.42.0 - Copy and paste an object
 

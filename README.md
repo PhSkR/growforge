@@ -15,9 +15,10 @@ under a volume constraint, a 45 degree self-supporting (overhang) constraint, an
 optional guide wireframe that seeds a SIMP run with a load path joining every
 region it has to reach and then lets go of it,
 self-weight loads, enclosed cavity detection, a post-run von Mises stress report
-that runs on whichever engine's result, marching cubes export with optional
-lattice supersampling for a finer surface and floating fragments culled from the
-surface that ships, an optional GPU compute backend for
+that runs on whichever engine's result, an optional material reduction that makes
+that safety factor the target and the mass the result, marching cubes export
+with optional lattice supersampling for a finer surface and floating fragments
+culled from the surface that ships, an optional GPU compute backend for
 the finite element solve, a native 3D viewer, smooth shaded, for checking a
 setup and watching a run, and a visual editor that edits the problem definition
 itself - drag the geometry, change any value numerically, regrow on the spot,
@@ -740,6 +741,256 @@ What this does and does not promise:
   iteration after the release, and neither verdict about a settling design is
   asked before then.
 
+## Material reduction
+
+```toml
+[optimization.reduce]
+target_safety_factor = 2.5  # required; above 1.0
+method = "continuation"     # optional, default "continuation"; or "beso"
+ratio = 0.8                 # optional, default 0.8, 0.5 .. 0.95
+refine_stages = 2           # optional, default 2, 0 .. 8
+min_mass_fraction = 0.02    # optional, default 0.02
+# evolution_rate = 0.02     # beso only, optional, default 0.02, 0.005 .. 0.1
+# add_ratio = 0.01          # beso only, optional, default 0.01, 0 .. 0.05
+```
+
+Ordinarily `mass_fraction` is what a run is given and the
+[safety factor](#stress-report) is what it hands back: you say how heavy the part
+may be, and the report says afterwards what margin that bought. Adding this table
+**swaps them - the strength becomes the target and the mass becomes the result**.
+The run starts from a solid design space, lowers its volume target a stage at a
+time, and exports the lightest design that still held `target_safety_factor`.
+
+A stage is a whole optimization at one volume target, and it answers for itself:
+
+* **Stage 1 is the fraction the run starts from** - solid, unless
+  `[optimization] mass_fraction` names somewhere further down to start, which is
+  a head start past the stages that would only have removed the obvious. Under
+  this table that key is optional and it is the *start* rather than a target, so
+  the closed end of its range is legal too: `1.0` is the solid design space
+  spelled out.
+* **Each stage converges before it is judged.** The inner loop is the ordinary
+  one - the density filter, `penalty`, the update scheme, the overhang filter
+  when it is on - held to that stage's volume target, with the run's own
+  `max_iterations` as a per-stage cap and the usual
+  [convergence and stall tests](#when-a-run-stops) deciding when it has arrived.
+* **Then it is measured.** The connectivity gate the
+  [stress report](#stress-report) runs first is asked before anything is solved,
+  so a stage whose design has no load path left fails for nothing; then the von
+  Mises analysis runs on that stage's printed field, through the optimization's
+  own solver. A safety factor at or above `target_safety_factor` is a pass.
+* **The first stage that fails closes a bracket**, and `refine_stages`
+  bisections narrow it: each asks for the midpoint of the last target that held
+  and the first that did not. Every refinement **restarts from the design that
+  held** rather than carrying on from the lighter one that did not, so a
+  bisection is a descent for either method rather than a climb.
+* **The lightest design that held is the design in the file**, whichever stage
+  it came from and whether or not it was the last one the schedule ran.
+* **A start that misses the target is exported too**, under a warning saying so.
+  Nothing lighter can hold a target the starting design missed, so there is no
+  bracket and nothing left to look for; the warning names what is left to try,
+  and names different things for a design that still has voids in it than for one
+  that is already solid.
+* **The floor is a stop, not a failure.** A schedule that reaches
+  `min_mass_fraction` still holding the target stops there and exports it. A
+  design that light is one a stress report over a handful of voxels is in no
+  position to vouch for, and it usually says the loads, the supports or the
+  domain are not what the run was meant to be given.
+
+**The part in the file is then measured once more.** The `[output]` `trim`,
+`flush` and `reinforce` passes run after the schedule has chosen, so the stress
+table beside the STL describes a design no stage ever saw. What it measures goes
+into the report as `finished_safety_factor` and `finished_meets_target`, and a
+margin those passes cost the part is a warning naming them and both numbers:
+
+```text
+warning: [optimization.reduce]: the part in the file measures a safety factor of 2.41, below the target of 3.00; the schedule chose stage 4, which measured 3.12, and the [output] trim and reinforce passes ran on that design afterwards - turn them off, or raise target_safety_factor to leave them the margin they spend
+```
+
+### The two methods
+
+| `method`                   | how the material goes away                   |
+| -------------------------- | -------------------------------------------- |
+| `"continuation"` (default) | the ordinary SIMP loop on a shrinking volume target, warm started from the stage before. Densities move both ways, and the filter, `penalty` and the `update` scheme all go on meaning what they mean in a plain run |
+| `"beso"`                   | a bi-directional evolutionary update of its own: a soft-killed solid-or-removed design, ranked by compliance sensitivity, with a share of the volume hard-cut every iteration and a smaller share allowed back |
+
+`"beso"` is the method of Huang and Xie, cited in `constants.rs` beside the
+numbers taken from it. The kill is **soft**: a cut cell goes to the bottom of the
+density range rather than out of the model, so it keeps the stiffness
+`stiffness_floor` gives it and can be ranked - and taken back - like any other.
+One iteration of it ranks the design cells by their
+compliance sensitivity, smooths that ranking over the density filter's own
+neighbourhood, averages it with the previous iteration's smoothed ranking, lowers
+the iteration's volume target by `evolution_rate` of itself - never below the
+stage's own - and cuts the ranking where the cells above it fill that volume,
+letting at most `add_ratio` of the volume flip back in. **That share coming back
+is the whole of what makes it bi-directional**: a member the loads want is a
+member that can return, and `add_ratio = 0` asks for the one-way erosion the
+method descends from.
+
+It behaves differently from the continuation method in ways worth knowing before
+its numbers are read:
+
+* **The cells of supports and load regions are never cut away**, which pins a
+  floor under every stage of the run. The run states it before its first
+  iteration:
+
+  ```text
+  reduce: the evolutionary update holds a solid-or-removed design: each iteration ranks the design cells by their compliance sensitivity, takes 0.100 of the volume away and lets at most 0.050 of it back, and the change column is the share of the design cells that flipped. 32 of the 192 design cells are a support or a load region and are never removed, so no stage of this run can go below a fraction of 0.1667
+  ```
+
+* **The printed fraction lands a little off the target.** What a run reports is
+  the mean printed density of the *filtered* field, and filtering a 0/1 design
+  moves it: a stage aiming at 0.5 comes back at 0.4835. A continuation stage
+  lands on its target to four decimals, because that target is what its update
+  bisects a multiplier onto.
+* **It settles on different criteria.** The largest design variable change means
+  nothing for a design that only ever flips, so a stage settles when its volume
+  is at target and either the cut flipped no cell at all or the compliance has
+  stopped moving across a window of iterations against the window before it
+  (`BESO_CONVERGENCE_WINDOW`). Proving the second needs two of those windows -
+  ten iterations of compliance history, only the last of which has to be at the
+  target, and the history starts afresh at every refinement - so a
+  `max_iterations` under ten can only ever settle a stage that has already
+  stopped flipping.
+* **A refinement is why the bisection restarts from the design that held.** A
+  midpoint asks for more material than the stage that just failed holds, and this
+  update can only let `add_ratio` of the volume back an iteration - and none at
+  all under `add_ratio = 0`. Starting each refinement from the heavier design
+  that passed makes it a descent, which is a schedule either method can run.
+* **It costs solver iterations.** A 0/1 field at the default `stiffness_floor` of
+  `1e-9` carries the full nine decades of stiffness contrast with no intermediate
+  density anywhere to bridge them, and the conjugate gradient counts run three to
+  five times a continuation run's on the same problem. A real part under `"beso"`
+  is a candidate for a higher [`stiffness_floor`](#configuration-reference).
+* The [overhang constraint](#overhang-constraint-printability) combines with it
+  and needs nothing new: it is a stage of the density chain, and it shapes what
+  the analysis sees exactly as it does under SIMP.
+
+### What a reduction says
+
+Every iteration line carries the stage it belongs to, and the step count starts
+again at each one. A finished stage says what it was asked for, what it came back
+with and the verdict on it; the schedule says which stage is in the file:
+
+```text
+stage  2  iter    3  compliance   1.082895e1  vol 0.5000  change  0.20000  cg [78]     0.50 s
+reduce stage 2: stopped at the iteration cap of 5 (max change 0.16472)
+reduce stage 2: target 0.5000, fraction 0.5000, 5 iterations, safety factor 3.46, pass
+reduce stage 3: no safety factor for this stage: 0 of its elements reach the stress report's density threshold of 0.50, so it has no peak stress to measure
+reduce stage 3: target 0.2500, fraction 0.2500, 5 iterations, safety factor n/a, fail; the stage stopped at the iteration cap, so raising max_iterations may be what it needs
+reduce stage 4 (refinement): target 0.3750, fraction 0.3750, 5 iterations, safety factor 2.70, fail; the stage stopped at the iteration cap, so raising max_iterations may be what it needs
+reduce: exported stage 2 at fraction 0.5000, safety factor 3.46 >= 3.00
+```
+
+A stage too light to hold any element above the stress report's own density
+threshold has no peak stress to measure: it reads `n/a` and **fails**, because a
+design nothing can be measured on is not one that held. A stage that ended on the
+iteration cap says so beside its verdict - a verdict read off a design that had
+not converged is a verdict about the wrong design, and the cap is the first thing
+to raise. The run itself ends on `reduce complete`.
+
+`growforge check` echoes the whole schedule before anything is solved, so what a
+reduction will cost is readable without running it:
+
+```text
+reduce         continuation, material removed until the safety factor reaches 3.000; the volume target starts at 1 and takes 0.500 of itself a stage down to a floor of 0.100, then 1 bisection between the last target that holds and the first that does not; every stage of it runs up to the run's own max_iterations of 5 iterations
+```
+
+With `[output] stress_json` set, the JSON gains a `reduce` object beside the load
+cases: `method`, `target_safety_factor`, `exported_stage`,
+`finished_safety_factor` (`null` when the finished part could not be measured),
+`finished_meets_target`, and `stages` - one record per stage in the order they
+ran, holding `index`, `target_fraction`, `achieved_fraction`, `iterations`,
+`safety_factor` (`null` for a stage nothing could be measured on), `passed` and
+`refine`. A run without the table writes the file it always wrote, to the byte.
+
+### What it costs, and what it needs
+
+**Every stage is a whole converged run and a whole stress analysis.** Nothing
+about a reduction is free: `max_iterations` is the budget of each *stage* rather
+than of the run, so a schedule of eight stages can cost eight times what the same
+problem costs at a fixed `mass_fraction`, and each of them adds a stress report -
+several linear solves, across every load case. The default `ratio` reaches a
+tenth of the design space in ten stages and the default `refine_stages` adds two
+more on top. The levers are the schedule's own keys: a coarser `ratio` arrives in
+fewer converged stages and leans on the refinement to close the wider bracket, a
+`min_mass_fraction` above the default stops a schedule walking down to designs
+worth nothing, and `refine_stages = 0` exports the last target that held without
+narrowing it at all.
+
+**It needs a yield strength.** `target_safety_factor` is `yield_strength_mpa`
+over the peak von Mises stress the design reaches, so a `[material]` declaring
+none is rejected rather than run: the stress report would read `n/a`, and no
+stage could be passed or failed. Every material preset carries one.
+
+**What it combines with** is the
+[overhang constraint](#overhang-constraint-printability), under either method,
+and the `[output]` passes - which are then measured again, as above. **What it
+refuses**, each by name: the [guide wireframe](#guide-wireframe), whose floor
+holds material into a field the reduction is not then allowed to take it out of;
+the [local volume cap](#local-volume-constraint-bone-like-structures), which is
+priced against a global volume target this schedule moves every stage;
+`[optimization] update` under `method = "beso"`, which is its own update and
+leaves no design variable step for a scheme to take; and both other engines -
+`engine = "solid"` optimizes nothing and has nothing it may take away, and
+`engine = "growth"` has no density field to re-converge.
+
+### Example
+
+`examples/cantilever.toml` with its volume target taken out and a strength target
+put in its place. The run starts from the solid block, and what it exports is
+however much material PLA needs to keep a factor of 2.5 under the tip load:
+
+```toml
+[project]
+name = "cantilever_reduced"
+
+[resolution]
+voxel_size_mm = 2.0
+
+[material]
+preset = "pla"             # a reduction needs the yield strength a preset carries
+
+[optimization]
+# No mass_fraction: the schedule starts from the solid design space.
+min_feature_mm = 8.0
+max_iterations = 150
+
+[optimization.reduce]
+target_safety_factor = 2.5
+ratio = 0.8
+refine_stages = 2
+min_mass_fraction = 0.05
+
+[output]
+stl_path = "cantilever_reduced.stl"
+stress_json = "cantilever_reduced.json"
+
+[[domain]]
+op = "add"
+shape = "box"
+min = [0.0, 0.0, 0.0]
+max = [120.0, 40.0, 40.0]
+
+[[keepin]]
+shape = "box"
+min = [110.0, 15.0, 15.0]
+max = [120.0, 25.0, 25.0]
+
+[[supports]]
+region = { shape = "box", min = [-0.5, -0.5, -0.5], max = [0.5, 40.5, 40.5] }
+directions = ["x", "y", "z"]
+
+[[loadcases]]
+name = "tip-down"
+
+  [[loadcases.loads]]
+  type = "force"
+  region = { shape = "sphere", center = [115.0, 20.0, 20.0], radius = 4.0 }
+  vector = [0.0, 0.0, -50.0]
+```
+
 ## Self-weight (gravity)
 
 ```toml
@@ -886,12 +1137,13 @@ max_iterations = 1000   # optional, default 1000
 convergence_tol = 0.01  # optional, default 0.01
 ```
 
-A SIMP run ends for one of three reasons, and the summary line names which:
+A SIMP run ends for one of four reasons, and the summary line names which:
 
 ```
 iterations     682 (converged)
 iterations     361 (stalled)
 iterations    1000 (iteration cap)
+iterations      70 (reduce complete)
 ```
 
 **`converged`** - the largest design variable change of an iteration fell below
@@ -919,6 +1171,11 @@ and under `mma`, which has no third scheme to point at, it says to raise
 **`iteration cap`** - `max_iterations` ran out with the design still moving and
 still improving. The design is whatever the budget ended on, and more budget
 would have bought a better one.
+
+**`reduce complete`** - a [material reduction](#material-reduction) ran out of
+stages and refinements. Every stage ended on one of the three reasons above,
+and the design exported is the lightest stage that held the target safety
+factor, whatever the last stage did.
 
 The default budget is **1000**, not a target: it exists so that a run converges
 instead of stopping at a wall clock compromise. In the skeletal regime this tool
@@ -1253,8 +1510,9 @@ surface:
   Withdrawing a correction changes the triangles beside it, so the scan repeats:
   `BOUNDARY_CLAMP_MAX_PASSES` rounds as a budget, and past it for a chain longer
   than that, because a collapse left in the mesh is an export that dies.
-* **An honest give-up.** A vertex still illegal when the budget runs out, or past
-  the cap, keeps its position and is counted. The run says so:
+* **An honest give-up.** A vertex still illegal when the budget runs out, past
+  the cap, or handed back a crossing by a refusal above, keeps its position and
+  is counted. The run says so:
 
 ```text
 boundaries     clamped 412 vertices onto the analytic surfaces, moving them 0.0874 mm at most
@@ -1294,7 +1552,8 @@ says about it depends on what the run was. **A part that was drawn** - `engine =
 resting off one is a face about to ship in the wrong place:
 
 ```text
-boundaries     warning: 37 vertices rest up to 0.4400 mm off the surface they belong to: this part is the shapes it was drawn from, so every exported surface is a domain, keepin or keepout surface and one standing off it ships as a face in the wrong place
+boundaries     clamped 128 vertices onto the analytic surfaces, moving them 0.0512 mm at most
+               warning: 37 vertices rest up to 0.4400 mm off the surface they belong to: this part is the shapes it was drawn from, so every exported surface is a domain, keepin or keepout surface and one standing off it ships as a face in the wrong place
 ```
 
 on the console, and in the warning colour in the editor's panel.
@@ -1309,7 +1568,8 @@ their shapes, with `flush = "walls"`, where a vertex still short of one is that
 pass falling short:
 
 ```text
-boundaries     [output] flush ran and 37 vertices rest up to 0.4400 mm off the surface they belong to: where that is a wall meant to meet the shape it rests against, the pass did not reach it and a larger flush_depth_mm does; where it is a free surface running past a boundary, it rests on nothing and nothing is wrong
+boundaries     clamped 412 vertices onto the analytic surfaces, moving them 0.0874 mm at most
+               [output] flush ran and 37 vertices rest up to 0.4400 mm off the surface they belong to: where that is a wall meant to meet the shape it rests against, the pass did not reach it and a larger flush_depth_mm does; where it is a free surface running past a boundary, it rests on nothing and nothing is wrong
 ```
 
 Plainly, with no warning: it is a number to act on or to accept. With
@@ -2326,7 +2586,7 @@ switch the session to whatever comes back, without closing the window: see
 | engine / resolution / material / optimization / growth / output | every scalar the configuration holds, each with its default shown when the key is absent; each section carries a `reset` button that puts its own keys back to those defaults |
 | problem             | grid size, cell, node and degree of freedom counts, per-region node counts and the memory estimate, refreshed on every edit |
 | show                | the same layer switches the viewer has, plus the editor's own selection, hover, gizmo, dimension and placement preview overlays - the floor grid's own switch is up in the snapping controls, beside the increment it is ruled at; under them, what the [trim](#trimming-unloaded-material) pass removed from the design on screen, or the warning that it was refused, what the [flush fill](#flush-fill) pass put back out to the surfaces the walls rest on, what the [reinforcement](#reinforcement-minimum-printable-thickness) pass spent on its thin arms, or the warning that a member could not be thickened, and what the [boundary clamp](#exact-boundaries) moved onto the shapes |
-| stress              | the [safety factor](#stress-report) of the part that was just written, first, with the peak von Mises stress of every load case under it; present after a full run and after `generate stl`, absent while one is running and absent when the stress solve produced no report |
+| stress              | the [safety factor](#stress-report) of the part that was just written, first, with the peak von Mises stress of every load case under it; present after a full run and after `generate stl`, absent while one is running and absent when the stress solve produced no report; a run whose [reduction](#material-reduction) schedule finished draws that schedule under it - every stage, the one that was exported, and what the part in the file measures against the target |
 
 **Every labelled block above folds away**, and stays however you left it for the
 session. The window opens on the ones a session works in - `objects`,
@@ -2345,11 +2605,26 @@ what units, and what its default is - so the reference below is for reading and
 the panel is for working; the `show` switches carry the same text in the viewer's
 window.
 
-The optimization section carries the three optional `[optimization]` sub-tables
-that way too: `overhang constraint`, `guide wireframe` and `local volume` are
-checkboxes, and ticking one adds the table with every key inside it still on its
-own default, so the rows appear with their defaults showing and nothing is
-written into the file that was not asked for.
+The optimization section carries the four optional `[optimization]` sub-tables
+that way too: `overhang constraint`, `guide wireframe`, `local volume` and
+`reduce until a safety factor` are checkboxes, and ticking one adds the table
+with every key inside it still on its own default, so the rows appear with their
+defaults showing and nothing is written into the file that was not asked for.
+
+**`reduce until a safety factor`** is the one with a required key, so ticking it
+has a number to write: `constants::VIEW_EDIT_DEFAULT_TARGET_SAFETY_FACTOR`, and
+the rest of [the table](#material-reduction) on its own defaults. Under it the
+mass fraction row above becomes the optional `start fraction` it now is - tick it
+to pin where the schedule starts, leave it off to start from the solid design
+space - and taking the table away gives a file that started solid its mass target
+back, because a configuration without either is one that does not build. The
+`method` combo draws `evolution rate` and `add ratio` only under `beso`, and
+takes both keys out of the file when the method leaves it. What the panel does
+**not** do is repair a combination the schema refuses: tick the box beside a
+guide wireframe, or over a `[material]` with no yield strength, and the
+validation block says so in the words `check` would use, with `run full` disabled
+until you resolve it yourself. Which of the two tables to drop is not the panel's
+decision to make.
 
 The growth section carries `[growth.symmetry]` the same way: a checkbox adds the
 table with a single mirror plane, a dropdown switches the kind, and each kind
@@ -2369,8 +2644,8 @@ Resetting a section switches its optional sub-tables off with it - the overhang
 constraint, the guide wireframe, the local volume cap, `[growth.symmetry]` -
 because a table that is not there is a feature that is not running, and
 **resetting the engine takes a `[growth]` table with it**, exactly as switching
-the engine by hand does: what a reset lands on still builds. Four keys are
-deliberately not put back to a default, and the tooltips say which:
+the engine by hand does: what a reset lands on still builds. Four keys and one
+table are deliberately not put back to a default, and the tooltips say which:
 
 | key                             | what a reset does with it                    |
 | ------------------------------- | -------------------------------------------- |
@@ -2378,6 +2653,7 @@ deliberately not put back to a default, and the tooltips say which:
 | `[optimization] min_feature_mm` | returns to three voxels at the voxel size this configuration is solved on - the smallest feature the density filter can resolve, rather than a fixed length, so a reset never lands on a value the run then warns about |
 | `[output] stl_path`             | keeps its value - where a run writes is a decision about the project, not about the part, and it is the one required key of the schema besides |
 | `[output] stress_json`          | keeps its value, for that same reason: a reset puts properties back, it does not move deliverables |
+| `[optimization.reduce]`         | kept, table and all - a reduction is what a run is *aimed* at, where the three tables beside it are constraints on how it gets there, and its own tick box is how it goes |
 
 A key a reset removes takes its comment with it, the way [saving](#saving)
 always removes a key you switched off; the keys it does not touch keep theirs,
@@ -2704,6 +2980,11 @@ showing, and the numbers a full run prints - stresses, cavities, mass - are not
 computed for one at all. The solver backend is left exactly as the configuration
 asks, so a preview of a `backend = "gpu"` problem solves on the GPU too.
 
+A preview of a [material reduction](#material-reduction) runs the **whole
+schedule** under that cap rather than a slice of it - every stage, the stress
+analysis that judges it, and every refinement - so it is a slow preview of a slow
+run, and one more reason auto-regrow starts off for `simp`.
+
 Edits are debounced: the re-voxelization and the re-run wait until you have
 stopped moving, rather than firing on every value a drag passes through. An edit
 that lands while a preview is running cancels that preview and starts one of the
@@ -2766,7 +3047,10 @@ however its runs went.
 iteration budget, the cavity pass, the stress report, and the STL written to
 `[output] stl_path`. Progress appears in the window exactly as with
 `run --view`, the console prints the same per-iteration lines, and the run ends
-on the exported mesh with the stress colouring available. The status line ends
+on the exported mesh with the stress colouring available. Under a reduction the
+progress line names the stage the schedule is on - `full run running  stage 3
+step 42 vol 0.5120` - because the step count starts again at every stage, and a line
+without it would appear to count backwards. The status line ends
 with the file: *"the full pipeline finished; it wrote ..."*, as a stopped run
 ends with what it did not write and a failed one with why - and a generation
 with *"generated ..."*.
@@ -2799,6 +3083,14 @@ problem that run was built from**. Both matter:
   rather than a field reinterpreted against a grid it never belonged to. `generate
   stl` is therefore *not* disabled by an invalid configuration, where `run full`
   is.
+* **A finished reduction's schedule travels with its design.** Generating from a
+  run whose schedule ran to the end writes that schedule into this generation's
+  own report, `finished_safety_factor` and all - measured on what this
+  generation's `[output]` passes left, which is the file it just wrote. A run
+  stopped part way through a schedule kept a design but never chose one, so what
+  it generates carries no schedule at all and its report has no `reduce` object:
+  the stage lines it printed before it was stopped are the whole of what it
+  decided.
 
 It is offered whenever there is a design on screen and nothing is already writing,
 and disabled otherwise: a full run and a generation both own `[output] stl_path`,
@@ -2945,9 +3237,13 @@ preset = "pla"             # "pla" | "petg" | "abs"
 
 [optimization]
 mass_fraction = 0.3        # required except under engine = "solid", which
-                           # REJECTS it; open interval (0, 1); fraction of the
-                           # DESIGN cells kept, measured on the PRINTED densities.
-                           # The growth engine normalizes its strut radii to it
+                           # REJECTS it, and under [optimization.reduce], where
+                           # it is OPTIONAL and means the fraction the reduction
+                           # STARTS from - solid when it is left out, and 1.0 is
+                           # a legal value there. Open interval (0, 1) otherwise;
+                           # fraction of the DESIGN cells kept, measured on the
+                           # PRINTED densities. The growth engine normalizes its
+                           # strut radii to it
 min_feature_mm = 4.0       # required; the density filter radius is half of this.
                            # For the growth engine it is the smallest strut
                            # DIAMETER, and the scale of every [growth] default
@@ -3004,6 +3300,32 @@ update = "oc"              # optional, default "oc"; "oc" | "mma". simp only:
                            # above one. NEEDS update = "mma"; engine = "growth"
                            # and engine = "solid" reject this table. See the
                            # local volume section
+
+# [optimization.reduce]    # optional; absent means mass_fraction is the target
+# target_safety_factor = 2.5 # the run meets. Present makes the strength the
+# method = "continuation"  # target and the mass the result: the run starts at
+# ratio = 0.8              # mass_fraction - solid when that key is absent - and
+# refine_stages = 2        # lowers its volume target a stage at a time,
+# min_mass_fraction = 0.02 # converging and then analysing each one, until the
+# evolution_rate = 0.02    # safety factor no longer holds; the lightest design
+# add_ratio = 0.01         # that held is the one exported. target_safety_factor
+                           # is required and must be above 1.0. The rest are
+                           # optional: method is "continuation" (default) or
+                           # "beso"; ratio, 0.5 .. 0.95 and default 0.8, is the
+                           # share of the previous stage's target the next one
+                           # asks for; refine_stages, 0 .. 8 and default 2, is
+                           # the bisections between the last target that held and
+                           # the first that did not; min_mass_fraction, default
+                           # 0.02, is the floor the schedule stops at.
+                           # evolution_rate (0.005 .. 0.1, default 0.02) and
+                           # add_ratio (0 .. 0.05, default 0.01) belong to
+                           # method = "beso" alone and are rejected under the
+                           # other one. NEEDS [material] yield_strength_mpa,
+                           # which is what a safety factor is measured against;
+                           # simp only, and refused beside
+                           # [optimization.wireframe], [optimization.local_volume]
+                           # and, under "beso", an update scheme. See the
+                           # material reduction section
 
 # [solver]                 # optional; absent means the compute backend, falling
 # backend = "gpu"          # back to the cpu when this build or this machine has
@@ -3419,20 +3741,34 @@ whose gravity loads cancel out, an unknown build direction, an unknown void
 policy, an unknown material preset, an unknown engine, an unknown key anywhere.
 
 Rejected for a growth run specifically: a `[growth]` table without
-`engine = "growth"`, `engine = "growth"` with `[optimization.overhang]` or with
-`[optimization.wireframe]`, a degenerate growth control (see the growth engine
+`engine = "growth"`, `engine = "growth"` with `[optimization.overhang]`, with
+`[optimization.wireframe]`, with `[optimization.local_volume]` or with
+`[optimization.reduce]`, a degenerate growth control (see the growth engine
 section), a problem whose only loads are gravity, and a load region with no path
 to any support. Nothing about pruning is ever a rejection: a surface no branch
 could reach is reported, and the branches that were heading for it are removed.
 
 Rejected for a solid run specifically: `engine = "solid"` with
 `[optimization] mass_fraction` set (it fills the domain, so there is no share of
-it to target), with `[optimization.overhang]`, `[optimization.wireframe]` or
-`[optimization.local_volume]`, or with `[output] trim`, `reinforce` or `flush`
+it to target), with `[optimization.overhang]`, `[optimization.wireframe]`,
+`[optimization.local_volume]` or `[optimization.reduce]`, or with
+`[output] trim`, `reinforce` or `flush`
 set to anything but `"off"` - every one of those passes alters the very domain
 that engine exports.
 `mass_fraction` is required for every other engine and refused for this one, so
 a file switching between them gains and loses the key.
+
+Rejected for a reduction specifically: an `[optimization.reduce]` table over a
+`[material]` that declares no `yield_strength_mpa` - `target_safety_factor` is
+measured against it, so no stage could be passed or failed - beside
+`[optimization.wireframe]` or `[optimization.local_volume]`, and, under
+`method = "beso"`, beside an `[optimization] update` scheme, which that method
+replaces. Also a `target_safety_factor` at or below 1.0, where the part is at its
+yield with nothing left over; a `ratio`, `refine_stages`, `evolution_rate` or
+`add_ratio` outside its own range; a `min_mass_fraction` at or below zero or not
+below the fraction the run starts from; and a `mass_fraction` outside `(0, 1]` -
+the closed end, because under this table the key is where the reduction starts
+and starting solid is the default.
 
 Rejected for a symmetric growth run: a `[growth.symmetry]` table without
 `engine = "growth"`, a kind carrying the other kind's keys, no `planes` or more
@@ -3451,9 +3787,13 @@ under `voids = "warn"`, an exported field holding more than one connected body o
 material - always a defect for a tool that designs one part, never a reason to
 throw the part away - a surface that came out in more than one piece, whose
 fragments are culled under the default `islands` policy and reported either way,
-a load or support region that the declared symmetry maps onto nothing, and - for
-a guide wireframe - a region it cannot reach, a region that holds no material at
-all, and a `hold_iterations` that outlasts `max_iterations`.
+a load or support region that the declared symmetry maps onto nothing, a
+`[[keepout]]` or `[[keepin]]` tube that overlaps itself - it has swallowed part
+of its own inside and its surface has no exact projection, so a keepout's
+violations ship unclamped while a keepin's skin simply stays voxel-faceted and
+the vertices outside it fall back onto the domain - and, for a guide wireframe,
+a region it cannot reach, a region that holds no material at all, and a
+`hold_iterations` that outlasts `max_iterations`.
 
 ## How it works
 

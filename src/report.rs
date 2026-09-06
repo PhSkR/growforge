@@ -1848,6 +1848,16 @@ mod tests {
             notes[1].starts_with("warning: 7 vertices were"),
             "{notes:?}"
         );
+        // All three ways a vertex reaches that count, since the third of them -
+        // a correction withdrawn to save a triangle - is folded in from the note
+        // below and would otherwise read as one of the other two.
+        for cause in [
+            "passes",
+            "voxel a sampling artefact",
+            "withdrawn to keep a triangle",
+        ] {
+            assert!(notes[1].contains(cause), "{cause}: {notes:?}");
+        }
         print_clamp_report(Some(&unmoved), false, false);
 
         // One of them reads as one of them, rather than as "1 vertices".
