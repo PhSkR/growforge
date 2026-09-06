@@ -169,14 +169,16 @@ pub fn run_with_view(
 /// on the command line ends the process and in the editor ends only the run.
 ///
 /// `keep` is handed the field the engine produced, once, at the moment it
-/// produces it - which is what leaves a design behind for a run that reported no
-/// iteration of one. See [`keeps_nothing`] for the callers that have nowhere to
+/// produces it, with the reduction schedule that chose it when there was one -
+/// which is what leaves a design behind for a run that reported no iteration of
+/// one, and what lets an export of that design carry the schedule's record into
+/// its own report. See [`keeps_nothing`] for the callers that have nowhere to
 /// keep it.
 pub(crate) fn run_worker(
     problem: &Problem,
     reporter: &dyn Reporter,
     link: &ViewLink,
-    keep: &dyn Fn(&[f64]),
+    keep: &dyn Fn(&[f64], Option<&crate::engine::ReduceSummary>),
 ) -> Result<Option<RunOutcome>> {
     // Declared first so it drops last: whatever unwinds below, the window is
     // told before this function's frame is gone.
@@ -210,7 +212,7 @@ pub(crate) fn run_worker(
     // exactly as one that reports five hundred does; for the others this is the
     // last reported iteration's field again, which is the same field or the one
     // it settled on.
-    keep(&field.densities);
+    keep(&field.densities, field.reduce.as_ref());
     // The stress solve is the longest single call of the analysis stage, so the
     // stop reaches inside it rather than waiting at the far end of it.
     let stop = || reporter.cancelled();
@@ -260,7 +262,7 @@ pub(crate) fn run_worker(
 /// The `keep` of a caller with nowhere to keep a design: `growforge run --view`
 /// writes its file and leaves, so nothing outlives the run to export the field
 /// again from.
-pub(crate) fn keeps_nothing(_densities: &[f64]) {}
+pub(crate) fn keeps_nothing(_densities: &[f64], _reduce: Option<&crate::engine::ReduceSummary>) {}
 
 /// Everything [`finish`] produced from a density field.
 ///
@@ -322,10 +324,10 @@ pub(crate) struct Finished {
 ///
 /// `reduce` is the run's own record of its material reduction schedule, when it
 /// had one, and travels to the JSON report exactly as it does on the command
-/// line; a design that is exported without the run behind it has none. It is
-/// taken by mutable reference for [`crate::complete`]'s reason: what the part
-/// measures once the finishing passes have had it is written back onto the
-/// record here, because this is where those passes run.
+/// line, and to the window's own copy of it. It is taken by mutable reference
+/// for [`crate::complete`]'s reason: what the part measures once the finishing
+/// passes have had it is written back onto the record here, because this is
+/// where those passes run.
 ///
 /// The sequence itself is [`crate::complete`]'s, shared with the command line.
 /// What is this function's own is the window: the status line at each stage, the
@@ -335,7 +337,7 @@ pub(crate) struct Finished {
 pub(crate) fn finish(
     problem: &Problem,
     densities: &mut [f64],
-    reduce: Option<&mut crate::engine::ReduceSummary>,
+    mut reduce: Option<&mut crate::engine::ReduceSummary>,
     link: &ViewLink,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<Finished>> {
@@ -344,7 +346,7 @@ pub(crate) fn finish(
         problem,
         densities,
         crate::stress::StressLimits::default(),
-        reduce,
+        reduce.as_deref_mut(),
         &stages,
     )
     .inspect_err(|error| link.set_status(RunStatus::Failed(format!("{error:#}"))))?;
@@ -409,6 +411,10 @@ pub(crate) fn finish(
             .report()
             .map(|report| report.summary(islands.bodies.len())),
     );
+    // The schedule's record, complete: `complete` has just written what the part
+    // in the file measures onto it, so the panel is shown the same stages and the
+    // same finished factor the JSON report carries.
+    link.set_reduce_summary(reduce.as_deref().cloned());
     link.set_status(RunStatus::Finished {
         triangles: stats.triangles,
         volume_mm3: stats.volume_mm3,

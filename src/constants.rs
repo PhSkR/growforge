@@ -2520,6 +2520,18 @@ pub const VIEW_EDIT_DEFAULT_TARGET_CELLS: usize = 500_000;
 pub const VIEW_EDIT_DEFAULT_BUILD_DIRECTION: crate::config::BuildDirection =
     crate::config::BuildDirection::ZPlus;
 
+/// Target a newly enabled `[optimization.reduce]` starts with: the safety factor
+/// the schedule has to hold.
+///
+/// The one required key of that table, so the tick box has to write a number
+/// rather than leave the file unbuildable. Two, which is a margin of a factor of
+/// two over yield and the smallest figure anyone would call a safety factor -
+/// well clear of [`REDUCE_TARGET_SAFETY_FACTOR_MIN`], which only refuses the
+/// targets that are not margins at all, and low enough that the first schedule a
+/// user runs removes material rather than refusing to start. What margin a part
+/// really needs is theirs to decide, and it is the first row under the box.
+pub const VIEW_EDIT_DEFAULT_TARGET_SAFETY_FACTOR: f64 = 2.0;
+
 /// Mirror plane a newly enabled `[growth.symmetry]` starts with: one plane
 /// normal to x, the smallest symmetry there is, so the editor adds a halved
 /// problem rather than deciding a four-fold one on the user's behalf.

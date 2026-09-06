@@ -82,6 +82,19 @@
 - **Switching to the growth engine** in the editor now takes the four
   `[optimization]` tables that engine refuses with it (`overhang`, `wireframe`,
   `local_volume`, `reduce`), as the switch to `solid` already did.
+- **The editor drives a reduction.** A tick box in the optimization section
+  writes the whole `[optimization.reduce]` table with its defaults and takes
+  it away again, with a row per key - target safety factor, method, ratio,
+  refine stages, min mass fraction, and the two evolutionary rates under
+  `beso` alone, which the method combo takes with it when it leaves. Under
+  the table the mass fraction row is the optional `start fraction`, which is
+  what the key now is: unticked, the schedule starts from the solid design
+  space, and taking the table away gives a file that started solid its mass
+  target back. The run line carries the stage the schedule is on, and the
+  stress block draws the schedule when it ends: every stage, the one that was
+  exported, and what the part in the file measures against the target - the
+  console's own lines, and its own warnings. A design generated from a run
+  whose schedule finished carries that schedule into its own report.
 
 ## 2026-08-17 - 0.42.0 - Copy and paste an object
 

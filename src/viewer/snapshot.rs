@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
+use crate::engine::ReduceSummary;
 use crate::report::{IterationStats, Reporter};
 use crate::stress::StressSummary;
 use crate::viewer::scene::LayerMesh;
@@ -208,6 +209,12 @@ pub struct Progress {
     /// a run is going, and for a run whose stress solve produced no report -
     /// which leaves the block absent rather than showing the last run's numbers.
     pub stress: Option<StressSummary>,
+    /// What the run's `[optimization.reduce]` schedule took away, stage by
+    /// stage, once it has exported a design. `None` on every run without the
+    /// table, and `None` while a schedule is still running - the stages a run
+    /// has finished so far are on its notes, and this is the record of the whole
+    /// of it.
+    pub reduce: Option<ReduceSummary>,
     /// Stage the run is in.
     pub status: RunStatus,
 }
@@ -310,6 +317,21 @@ impl ViewLink {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .stress = summary;
+    }
+
+    /// Record what a finished reduction schedule chose, for the panel.
+    ///
+    /// Written where [`ViewLink::set_stress_summary`] is and for the same
+    /// reason: the record is only complete once the analysis that describes the
+    /// exported part has measured it, and the schedule's own last figure -
+    /// [`ReduceSummary::finished_safety_factor`] - is written there. `None` is a
+    /// run with no schedule behind it, and it is written all the same, so a
+    /// record is replaced rather than left over.
+    pub fn set_reduce_summary(&self, summary: Option<ReduceSummary>) {
+        self.progress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reduce = summary;
     }
 
     /// True once the window has detached.

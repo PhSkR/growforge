@@ -276,13 +276,44 @@ pub fn reduce_finished_note(summary: &ReduceSummary, passes: &[&str]) -> Option<
             .to_string(),
     };
     Some(format!(
-        "warning: [optimization.reduce]: the part in the file measures a safety factor of {}, \
-         below the target of {:.2}; the schedule chose stage {}, which measured {}, and {tail}",
-        safety_factor(summary.finished_safety_factor),
-        summary.target_safety_factor,
+        "warning: [optimization.reduce]: {}; the schedule chose stage {}, which measured {}, and \
+         {tail}",
+        reduce_finished_line(summary),
         summary.exported.index,
         safety_factor(summary.exported.safety_factor)
     ))
+}
+
+/// What the part in the file measures against the target its schedule was held
+/// to, whichever way it came out.
+///
+/// The clause [`reduce_finished_note`] warns with, said on its own so that a
+/// reader who is shown the schedule is told the finished figure whether or not
+/// it is bad news - which is what the editor's panel draws, where there is no
+/// console scrolling past to have carried the good case. One wording behind
+/// both, so the window and the terminal cannot quote the same measurement two
+/// ways.
+///
+/// A part no safety factor could be measured on is said to be unmeasured rather
+/// than compared: it holds nothing, which is what
+/// [`ReduceSummary::finished_meets_target`] says of it, but it is not below the
+/// target either - nothing was measured to be below anything.
+pub fn reduce_finished_line(summary: &ReduceSummary) -> String {
+    let Some(factor) = summary.finished_safety_factor else {
+        return format!(
+            "the safety factor of the part in the file is unmeasured, so it does not hold the \
+             target of {:.2}",
+            summary.target_safety_factor
+        );
+    };
+    format!(
+        "the part in the file measures a safety factor of {factor:.2}, {} the target of {:.2}",
+        match summary.finished_meets_target() {
+            true => "at or above",
+            false => "below",
+        },
+        summary.target_safety_factor
+    )
 }
 
 /// A stage's safety factor as the console says it, with the same `n/a` the
@@ -1479,13 +1510,18 @@ mod tests {
             bare.contains("nothing but the export's cavity pass ran"),
             "{bare}"
         );
-        // An unmeasured part holds nothing, and says so the way the table does.
+        // An unmeasured part holds nothing, and says that rather than claiming
+        // a measurement below the target: there was no measurement.
         let unmeasured = ReduceSummary {
             finished_safety_factor: None,
             ..held
         };
         let note = reduce_finished_note(&unmeasured, &["trim"]).expect("a warning");
-        assert!(note.contains("safety factor of n/a"), "{note}");
+        assert!(
+            note.contains("is unmeasured, so it does not hold the target of 5.00"),
+            "{note}"
+        );
+        assert!(!note.contains("below the target"), "{note}");
     }
 
     #[test]

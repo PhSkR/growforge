@@ -562,8 +562,16 @@ impl Editor {
             .latest
             .as_ref()
             .map(|stats| {
+                // The stage a reduction schedule is on, where there is one: the
+                // step count restarts at every stage, so a line without it reads
+                // as a run going backwards. The same prefix the console's own
+                // per-iteration line carries.
+                let stage = match stats.reduce {
+                    Some(reduce) => format!("  stage {}", reduce.stage),
+                    None => String::new(),
+                };
                 format!(
-                    "  step {} vol {:.4}",
+                    "{stage}  step {} vol {:.4}",
                     stats.iteration, stats.volume_fraction
                 )
             })
@@ -2135,6 +2143,19 @@ impl Editor {
     /// The session's console is told the same thing by the run itself.
     pub fn stress_summary(&self) -> Option<StressSummary> {
         self.worker.progress().and_then(|progress| progress.stress)
+    }
+
+    /// What the run behind the window took away, stage by stage, when it was
+    /// given an `[optimization.reduce]` schedule.
+    ///
+    /// `None` until that schedule has exported a design, and `None` for good on
+    /// a run without the table - the same rule the stress summary is drawn under,
+    /// and for the same reason: the record describes the part on screen or it
+    /// says nothing. A generation from a kept design carries the schedule of the
+    /// run that produced it, so what the panel shows is the schedule behind the
+    /// file that was just written.
+    pub fn reduce_summary(&self) -> Option<crate::engine::ReduceSummary> {
+        self.worker.progress().and_then(|progress| progress.reduce)
     }
 
     /// What the density layer is showing, for the panel.

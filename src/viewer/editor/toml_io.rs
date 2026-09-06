@@ -1293,7 +1293,7 @@ mod tests {
         // Pinned keys, the two evolutionary ones included, arrive and read back
         // as themselves.
         config.optimization.reduce = Some(ReduceConfig {
-            target_safety_factor: 2.5,
+            target_safety_factor: 4.25,
             method: Some(ReduceMethod::Beso),
             ratio: Some(0.9),
             refine_stages: Some(3),
@@ -1303,12 +1303,27 @@ mod tests {
         });
         document.sync(&config).expect("sync");
         let saved = document.render();
+        // Every key spelled out in the file, which is what the panel's rows
+        // pin one at a time: a key that reads back through a default rather
+        // than off the line it wrote would round-trip and still be missing.
+        for line in [
+            "target_safety_factor = 4.25",
+            "method = \"beso\"",
+            "ratio = 0.9",
+            "refine_stages = 3",
+            "min_mass_fraction = 0.05",
+            "evolution_rate = 0.03",
+            "add_ratio = 0.0",
+        ] {
+            assert!(saved.contains(line), "{line} is not in the file: {saved}");
+        }
         let reduce = Config::parse(&saved)
             .expect("reparse")
             .optimization_params()
             .expect("params")
             .reduce
             .expect("a reduction");
+        assert_eq!(reduce.target_safety_factor, 4.25);
         assert_eq!(reduce.ratio, 0.9);
         assert_eq!(reduce.refine_stages, 3);
         assert_eq!(reduce.min_mass_fraction, 0.05);
@@ -1318,6 +1333,35 @@ mod tests {
                 evolution_rate: 0.03,
                 add_ratio: 0.0,
             }
+        );
+
+        // The other method, written out rather than left to the default, and
+        // the two evolutionary keys gone with it - which is the state the
+        // panel's method combo leaves behind.
+        config.optimization.reduce = Some(ReduceConfig {
+            method: Some(ReduceMethod::Continuation),
+            evolution_rate: None,
+            add_ratio: None,
+            ..config.optimization.reduce.clone().expect("the table")
+        });
+        document.sync(&config).expect("sync");
+        let saved = document.render();
+        assert!(saved.contains("method = \"continuation\""), "{saved}");
+        for key in ["evolution_rate", "add_ratio"] {
+            assert!(
+                !saved.contains(key),
+                "{key} outlived the method that owns it: {saved}"
+            );
+        }
+        assert_eq!(
+            Config::parse(&saved)
+                .expect("reparse")
+                .optimization_params()
+                .expect("params")
+                .reduce
+                .expect("a reduction")
+                .method,
+            ReduceMethodParams::Continuation
         );
 
         // And unset, the whole table goes: the file is what it was.

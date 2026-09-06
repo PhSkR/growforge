@@ -46,6 +46,7 @@ use anyhow::{Result, anyhow};
 
 use crate::config::Config;
 use crate::constants;
+use crate::engine::ReduceSummary;
 use crate::problem::Problem;
 use crate::report::{ConsoleReporter, IterationStats, Reporter, SilentReporter};
 use crate::stress::StressOutcome;
@@ -181,6 +182,7 @@ pub struct OutputWrite {
 pub struct Retained {
     problem: Arc<Problem>,
     densities: Vec<f64>,
+    reduce: Option<ReduceSummary>,
 }
 
 impl Retained {
@@ -193,6 +195,17 @@ impl Retained {
     /// Physical density of every cell, in grid element order.
     pub fn densities(&self) -> &[f64] {
         &self.densities
+    }
+
+    /// The `[optimization.reduce]` schedule that chose this design, when a
+    /// schedule did.
+    ///
+    /// Set only where the engine hands its finished field over: a design kept
+    /// mid-run is one stage of a schedule that has not finished, and there is no
+    /// record to be had of it yet. `None` on every run without the table, and on
+    /// a run that was stopped - which is what the engine records for one.
+    pub fn reduce(&self) -> Option<&ReduceSummary> {
+        self.reduce.as_ref()
     }
 }
 
@@ -222,6 +235,11 @@ impl Retention {
     /// one it converged to - and a run whose engine reports none, the solid one
     /// above all, keeps its only one there.
     ///
+    /// `reduce` is the schedule that chose the field, which only the second of
+    /// those two callers has: a design kept between iterations belongs to a
+    /// stage the schedule has not finished, and the record of a schedule is
+    /// written when it ends.
+    ///
     /// The cancellation is checked *under the slot's own lock*, which is what
     /// makes it mean anything. A run is superseded by cancelling it and then
     /// clearing the slot for its replacement, both from the window's thread; the
@@ -235,10 +253,11 @@ impl Retention {
     /// The copy is made outside the lock. The panel reads the slot every frame
     /// and a field is megabytes; what has to be atomic is the decision and the
     /// write, not the memcpy. Same shape as [`crate::viewer::snapshot::LatestSlot::push`].
-    fn keep(&self, densities: &[f64], cancel: &AtomicBool) {
+    fn keep(&self, densities: &[f64], reduce: Option<&ReduceSummary>, cancel: &AtomicBool) {
         let kept = Arc::new(Retained {
             problem: Arc::clone(&self.problem),
             densities: densities.to_vec(),
+            reduce: reduce.cloned(),
         });
         let mut slot = lock(&self.slot);
         if cancel.load(Ordering::Relaxed) {
@@ -324,7 +343,7 @@ impl Reporter for EditReporter<'_> {
         if self.cancelled() {
             return;
         }
-        self.retain.keep(densities, self.cancel);
+        self.retain.keep(densities, None, self.cancel);
     }
 
     fn cancelled(&self) -> bool {
@@ -754,7 +773,9 @@ fn full(
     // [`crate::viewer::run_worker`], which is where the ordering that makes it
     // exportable lives. Not the reporter's business: this run may report no
     // iteration at all, and a run that ends is a design either way.
-    let completed = |densities: &[f64]| retention.keep(densities, cancel);
+    let completed = |densities: &[f64], reduce: Option<&ReduceSummary>| {
+        retention.keep(densities, reduce, cancel)
+    };
     match crate::viewer::run_worker(problem, &reporter, link, &completed) {
         Ok(Some(outcome)) => {
             // Recorded here and nowhere else: this is the one moment at which
@@ -813,10 +834,12 @@ fn export_retained(
     // same thing twice rather than compounding.
     let mut densities = retained.densities().to_vec();
     let stop = || cancel.load(Ordering::Relaxed);
-    // A kept design is a field and the problem it belongs to; the run's
-    // stage records are not part of what is retained, so an export of it
-    // carries the stress report alone.
-    match crate::viewer::finish(problem, &mut densities, None, link, &stop) {
+    // A copy of the schedule's record for the same reason the field is copied:
+    // the finishing passes measure what the part in the file came out at and
+    // write it onto the record, and the design that was kept has to stay the one
+    // the run produced however many times it is generated from.
+    let mut reduce = retained.reduce().cloned();
+    match crate::viewer::finish(problem, &mut densities, reduce.as_mut(), link, &stop) {
         Ok(Some(finished)) => {
             // Recorded exactly where a full run records it, so the editor's own
             // output stays its own however it was written.
@@ -901,7 +924,7 @@ fn preview(retention: &Retention, link: &ViewLink, cancel: &AtomicBool) {
             // A preview never goes through [`crate::viewer::finish`], so this is
             // the same field a generation would be handed either way; what it
             // adds is the run whose engine reported no iteration to keep one of.
-            retention.keep(&field.densities, cancel);
+            retention.keep(&field.densities, field.reduce.as_ref(), cancel);
             let surface = crate::viewer::scene::preview_surface(
                 &problem.grid,
                 &field.densities,
@@ -1219,28 +1242,59 @@ vector = [0.0, 0.0, -20.0]
         };
         let cancel = AtomicBool::new(false);
 
-        // A live run keeps every field it reports, beside its own problem.
-        retention.keep(&vec![0.25; cells], &cancel);
+        // A live run keeps every field it reports, beside its own problem. An
+        // iteration is a stage of a schedule that has not finished, so it
+        // carries no record of one.
+        retention.keep(&vec![0.25; cells], None, &cancel);
         let kept = lock(&slot).clone().expect("a live run kept nothing");
         assert_eq!(kept.densities().len(), cells);
         assert_eq!(kept.densities()[0], 0.25);
+        assert!(kept.reduce().is_none(), "an iteration carried a schedule");
+
+        // The field the engine hands over carries the schedule that chose it,
+        // which is what an export of that design reports.
+        let summary = ReduceSummary {
+            method: crate::config::ReduceMethod::Continuation,
+            target_safety_factor: 3.0,
+            exported: crate::engine::ReduceStage {
+                index: 2,
+                target_fraction: 0.8,
+                achieved_fraction: 0.8,
+                iterations: 21,
+                safety_factor: Some(4.2),
+                passed: true,
+                refine: false,
+            },
+            stages: Vec::new(),
+            finished_safety_factor: None,
+        };
+        retention.keep(&vec![0.5; cells], Some(&summary), &cancel);
+        assert_eq!(
+            lock(&slot)
+                .clone()
+                .expect("the slot was emptied")
+                .reduce()
+                .cloned(),
+            Some(summary),
+            "the schedule did not travel with the design it chose"
+        );
 
         // Cancelled, it keeps nothing: what is already there stays.
         cancel.store(true, Ordering::Relaxed);
-        retention.keep(&vec![0.75; cells], &cancel);
+        retention.keep(&vec![0.75; cells], None, &cancel);
         assert_eq!(
             lock(&slot)
                 .clone()
                 .expect("the slot was emptied")
                 .densities()[0],
-            0.25,
+            0.5,
             "a cancelled run wrote its field over a newer one"
         );
 
         // And a slot its replacement has cleared stays cleared, which is the case
         // the guard exists for.
         *lock(&slot) = None;
-        retention.keep(&vec![0.75; cells], &cancel);
+        retention.keep(&vec![0.75; cells], None, &cancel);
         assert!(
             lock(&slot).is_none(),
             "a cancelled run repopulated a cleared slot"
@@ -1636,6 +1690,7 @@ vector = [0.0, 0.0, -20.0]
         let retained = Retained {
             densities: vec![1.0; problem.grid.n_cells()],
             problem,
+            reduce: None,
         };
         let link = ViewLink::new();
         let cancel = AtomicBool::new(false);
@@ -1681,6 +1736,86 @@ vector = [0.0, 0.0, -20.0]
         );
     }
 
+    /// A generation from a design a reduction chose carries that schedule into
+    /// its own report and into the panel.
+    ///
+    /// The gap this closes: the kept design travelled without its schedule, so
+    /// asking a stopped run for its stl wrote a stress report with no `reduce`
+    /// object in it - the same design, described as if nothing had chosen it.
+    /// The record travels with the field now, and `finish` measures what the
+    /// part in the file came out at onto the copy of it this export writes, so
+    /// the JSON's `finished_safety_factor` describes this generation and the
+    /// panel is shown the same record.
+    #[test]
+    fn a_generation_carries_the_schedule_that_chose_the_design() {
+        let text = CANTILEVER.replace(
+            "stl_path = \"kept.stl\"",
+            "stl_path = \"kept_reduced.stl\"\nstress_json = \"kept_reduced.stress.json\"",
+        );
+        let (_dir, path) = write_temp("worker_reduce_stl", &text);
+        let directory = path.parent().expect("a directory").to_path_buf();
+        let config = Config::parse(&text).expect("parse");
+        let problem = Arc::new(Problem::build(&config, &directory).expect("build"));
+        let stl = problem.output.stl_path.clone();
+        let report = problem
+            .output
+            .stress_json
+            .clone()
+            .expect("the fixture asks for a report");
+        let stage = crate::engine::ReduceStage {
+            index: 2,
+            target_fraction: 0.8,
+            achieved_fraction: 0.7931,
+            iterations: 33,
+            safety_factor: Some(4.2),
+            passed: true,
+            refine: false,
+        };
+        let retained = Retained {
+            densities: vec![1.0; problem.grid.n_cells()],
+            problem,
+            reduce: Some(ReduceSummary {
+                method: crate::config::ReduceMethod::Continuation,
+                target_safety_factor: 3.0,
+                exported: stage,
+                stages: vec![stage],
+                // Unmeasured until an export measures it, which is what this
+                // test is about.
+                finished_safety_factor: None,
+            }),
+        };
+        let link = ViewLink::new();
+        let cancel = AtomicBool::new(false);
+        let writes = Mutex::new(None);
+        let mut console: Vec<u8> = Vec::new();
+
+        export_retained(&retained, &link, &cancel, &writes, &mut console);
+        let written = std::fs::read_to_string(&report).expect("the stress report");
+        assert!(written.contains("\"reduce\": {"), "{written}");
+        assert!(written.contains("\"exported_stage\": 2,"), "{written}");
+        assert!(written.contains("\"iterations\": 33,"), "{written}");
+        assert!(
+            !written.contains("\"finished_safety_factor\": null"),
+            "the export never measured the part it wrote: {written}"
+        );
+
+        // The panel is shown that same record, finished factor and all, and the
+        // kept design still holds the one the run gave it: generating twice
+        // generates the same thing twice.
+        let shown = link.progress().reduce.expect("the panel was told nothing");
+        assert_eq!(shown.exported, stage);
+        assert!(shown.finished_safety_factor.is_some());
+        assert_eq!(
+            retained
+                .reduce()
+                .and_then(|reduce| reduce.finished_safety_factor),
+            None,
+            "the export wrote its own measurement back onto the kept design"
+        );
+        std::fs::remove_file(&stl).ok();
+        std::fs::remove_file(&report).ok();
+    }
+
     /// An export that came out in two pieces says so on the session's console,
     /// above the safety factor it qualifies, and the panel is told the same.
     ///
@@ -1706,6 +1841,7 @@ vector = [0.0, 0.0, -20.0]
         let retained = Retained {
             densities: vec![1.0; problem.grid.n_cells()],
             problem,
+            reduce: None,
         };
         let link = ViewLink::new();
         let cancel = AtomicBool::new(false);

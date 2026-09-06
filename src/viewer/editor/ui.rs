@@ -16,11 +16,13 @@
 use crate::config::{
     Axis, BoundaryFidelity, BuildDirection, CsgOpSpec, FlushPolicy, GrowthConfig, IslandPolicy,
     LoadSpec, LocalVolumeConfig, MaterialConfig, OptimizationConfig, OutputConfig, OverhangConfig,
-    ReinforcePolicy, ShapeSpec, SolverBackend, SolverConfig, SymmetryConfig, SymmetryKind,
-    TrimPolicy, UpdateScheme, VoidPolicy, WireframeConfig,
+    ReduceConfig, ReduceMethod, ReinforcePolicy, ShapeSpec, SolverBackend, SolverConfig,
+    SymmetryConfig, SymmetryKind, TrimPolicy, UpdateScheme, VoidPolicy, WireframeConfig,
 };
 use crate::constants;
+use crate::engine::ReduceSummary;
 use crate::geometry::Vec3;
+use crate::report;
 use crate::stress::StressSummary;
 use crate::viewer::editor::grid;
 use crate::viewer::editor::measure::Phase;
@@ -1502,9 +1504,11 @@ impl Section {
                 // invent for it: how heavy the part may be is what the user
                 // came to decide. It keeps its value, and the button says so.
                 let mass_fraction = config.optimization.mass_fraction;
-                // Design intent for the same reason, and the panel has no row
-                // for it yet: a reset that dropped the table would leave it
-                // written in the file the editor is holding open.
+                // Design intent for the same reason, and kept for it: a
+                // reduction is what the run is *aimed* at, where the three
+                // tables below it are constraints on how it gets there. Its own
+                // tick box is how it goes, exactly as the mass fraction's value
+                // is the user's to change.
                 let reduce = config.optimization.reduce.clone();
                 let min_feature_mm = voxel_mm.map_or(config.optimization.min_feature_mm, |h| {
                     constants::VIEW_EDIT_RESET_MIN_FEATURE_VOXELS * h
@@ -1600,10 +1604,13 @@ impl Section {
             Section::Optimization => "put the optimization controls back to their defaults, and \
                                       switch the overhang constraint, the guide wireframe and the \
                                       local volume cap off with them - a sub-table that is not \
-                                      there is a feature that is not running. Two keys are not \
-                                      touched that way: mass fraction is yours and keeps its \
-                                      value, and min feature returns to the smallest the filter \
-                                      can resolve at this voxel size. One click is one undo step"
+                                      there is a feature that is not running. Three things are \
+                                      not touched that way: mass fraction is yours and keeps its \
+                                      value, min feature returns to the smallest the filter can \
+                                      resolve at this voxel size, and a reduction is what the run \
+                                      is aimed at rather than a control over it, so its table \
+                                      stays until its own box is unticked. One click is one undo \
+                                      step"
                 .to_string(),
             Section::Growth => "put every [growth] key back to its default, symmetry included, so \
                                 the table resolves to exactly what the engine would pick on its \
@@ -2027,11 +2034,36 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
             reset_row(ui, field, Section::Optimization);
             let mut optimization = field.state.config().optimization.clone();
             let mut changed = false;
-            // The row exists exactly while the key does, as the material's
-            // custom property rows do: the solid engine refuses a mass target
-            // and the engine combo takes the key out when it is chosen, so there
-            // is nothing here to drag under it.
-            if let Some(mass_fraction) = &mut optimization.mass_fraction {
+            // Read before the rows below borrow the table: what the mass
+            // target *means* is the reduction's to change, and the row says
+            // which of the two it is. Not under the solid engine, which refuses
+            // the key and the table both.
+            let solid = field.state.config().is_solid();
+            let reducing = optimization.reduce.is_some() && !solid;
+            if reducing {
+                // Optional, because the schema makes it optional under the
+                // table: no key at all is the solid design space every
+                // reduction is defined to start from, so the box is what puts a
+                // head start in and takes it out again.
+                changed |= optional_row(
+                    ui,
+                    field,
+                    "start fraction",
+                    &mut optimization.mass_fraction,
+                    constants::REDUCE_START_FRACTION,
+                    constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
+                    "where the reduction below starts, between 0 and 1: under \
+                     [optimization.reduce] this key is no longer the weight the run is held to \
+                     but the design the schedule begins taking material away from, and the mass \
+                     that comes out is whatever still held the safety factor. Unticked it starts \
+                     solid, which is every cell the domain describes; a lower figure is a head \
+                     start past the stages that would only have removed the obvious",
+                );
+            } else if let Some(mass_fraction) = &mut optimization.mass_fraction {
+                // The row exists exactly while the key does, as the material's
+                // custom property rows do: the solid engine refuses a mass
+                // target and the engine combo takes the key out when it is
+                // chosen, so there is nothing here to drag under it.
                 changed |= number_row(
                     ui,
                     field,
@@ -2266,10 +2298,209 @@ fn optimization_section(ui: &mut egui::Ui, field: &mut Field<'_>) {
                      second filter, and every iteration pays for its stencil twice",
                 );
             }
+
+            // The reduction schedule, on the same pattern, with the one
+            // difference its schema forces: the table has a required key, so
+            // the box has a number to write rather than an empty table.
+            let mut reduce = optimization.reduce.is_some();
+            let toggle = ui
+                .checkbox(&mut reduce, "reduce until a safety factor")
+                .on_hover_text(
+                    "make the strength the target and the mass the result: the run starts from \
+                     the start fraction above - the solid design space unless that box pins one \
+                     - and lowers its volume target a stage at a time, \
+                     converging and then analysing each stage, and exports the lightest design \
+                     that still held the safety factor below. It costs a converged run and a \
+                     stress solve per stage. REQUIRES yield_strength_mpa in [material] - that is \
+                     what a safety factor is measured against - and is refused beside the guide \
+                     wireframe and the local volume cap. simp only: the growth and solid engines \
+                     reject the table",
+                );
+            if field.apply(&toggle) {
+                write_reduce(&mut optimization, reduce, solid);
+                changed = true;
+            }
+            if let Some(config) = &mut optimization.reduce {
+                changed |= number_row(
+                    ui,
+                    field,
+                    "target safety factor",
+                    &mut config.target_safety_factor,
+                    constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
+                    &format!(
+                        "the safety factor the exported design has to hold: the yield strength \
+                         over the peak von Mises stress, the very number the stress block \
+                         reports. Above {}, where the part is at its yield with nothing left \
+                         over. It is the whole stopping rule of the run - a higher target leaves \
+                         a heavier part, and nothing else ends the schedule",
+                        constants::REDUCE_TARGET_SAFETY_FACTOR_MIN
+                    ),
+                );
+                let mut method = config.method.unwrap_or_default();
+                if combo(
+                    ui,
+                    field,
+                    "method",
+                    &mut method,
+                    &[
+                        (
+                            ReduceMethod::Continuation,
+                            ReduceMethod::Continuation.label(),
+                        ),
+                        (ReduceMethod::Beso, ReduceMethod::Beso.label()),
+                    ],
+                    "how material is taken away. continuation lowers the volume target a stage \
+                     at a time and re-converges the ordinary loop at each one, warm started from \
+                     the stage before, so the filter, the penalty and the update scheme go on \
+                     meaning what they mean. beso ranks the elements and hard-removes a share of \
+                     the volume every iteration with a smaller share allowed back, which is an \
+                     update of its own and refuses the update row above beside it",
+                ) {
+                    write_reduce_method(config, method);
+                    changed = true;
+                }
+                changed |= optional_row(
+                    ui,
+                    field,
+                    "ratio",
+                    &mut config.ratio,
+                    constants::REDUCE_RATIO,
+                    constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
+                    &format!(
+                        "the share of the previous stage's volume target the next stage asks \
+                         for, between {} and {}. A coarser step arrives in fewer converged \
+                         stages and hands the refinement a wider bracket to close; a finer one \
+                         pays a whole stage for what the refinement would have closed anyway",
+                        constants::REDUCE_RATIO_MIN,
+                        constants::REDUCE_RATIO_MAX
+                    ),
+                );
+                changed |= optional_integer_row(
+                    ui,
+                    field,
+                    "refine stages",
+                    &mut config.refine_stages,
+                    constants::REDUCE_REFINE_STAGES,
+                    &format!(
+                        "bisections between the last volume target that held the safety factor \
+                         and the first that did not, at most {}. Each one is a whole stage and \
+                         each halves the bracket, so they are what makes the exported part as \
+                         light as the target really allows; zero exports the last target that \
+                         held",
+                        constants::REDUCE_REFINE_STAGES_MAX
+                    ),
+                );
+                changed |= optional_row(
+                    ui,
+                    field,
+                    "min mass fraction",
+                    &mut config.min_mass_fraction,
+                    constants::REDUCE_MIN_MASS_FRACTION,
+                    constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
+                    "the volume target the schedule will not go below, above 0 and below the \
+                     fraction it starts from. Reaching it with the safety factor still held \
+                     stops the run and exports that design: the floor is a stop and not a \
+                     failure, and a design still holding the target down there is a sign the \
+                     loads, the supports or the domain are not what the run was meant to be \
+                     given",
+                );
+                // The two keys the evolutionary method owns, drawn only under
+                // it because the table refuses them under the other one - see
+                // [`write_reduce_method`], which is what takes them away.
+                if method == ReduceMethod::Beso {
+                    changed |= optional_row(
+                        ui,
+                        field,
+                        "evolution rate",
+                        &mut config.evolution_rate,
+                        constants::REDUCE_EVOLUTION_RATE,
+                        constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
+                        &format!(
+                            "beso only: the share of the current volume removed in one \
+                             iteration, between {} and {}. Faster crosses the schedule in fewer \
+                             iterations; slower keeps every cut to the elements the ranking \
+                             really put last",
+                            constants::REDUCE_EVOLUTION_RATE_MIN,
+                            constants::REDUCE_EVOLUTION_RATE_MAX
+                        ),
+                    );
+                    changed |= optional_row(
+                        ui,
+                        field,
+                        "add ratio",
+                        &mut config.add_ratio,
+                        constants::REDUCE_ADD_RATIO,
+                        constants::VIEW_EDIT_DRAG_SPEED_FRACTION,
+                        &format!(
+                            "beso only: the largest share of the current volume that may come \
+                             back in one iteration, up to {}. It is what makes the method \
+                             bi-directional - a member the loads want back can return - and 0 \
+                             makes it a one-way erosion that can never undo a cut",
+                            constants::REDUCE_ADD_RATIO_MAX
+                        ),
+                    );
+                }
+            }
             if changed {
                 field.state.config_mut().optimization = optimization;
             }
         });
+}
+
+/// Everything ticking the reduction box does to the configuration.
+///
+/// Factored out for the reason [`write_flush_policy`] is: what a tick writes is
+/// a whole table with a required key inside it, and driving that through a
+/// checkbox buried in a scroll area is a test of egui rather than of the table.
+///
+/// On is the table with its target at
+/// [`constants::VIEW_EDIT_DEFAULT_TARGET_SAFETY_FACTOR`] and every optional key
+/// absent, so each row shows the default a run would really use; off is no table
+/// at all, which is how "not running" is written here.
+///
+/// On leaves the mass fraction exactly as it is: under the table it becomes the
+/// fraction the schedule starts from, and where a run starts is design intent
+/// the panel has no default for - the row above only says which of the two it
+/// now is. Off is the direction that owes a value, for the reason
+/// [`select_engine`] owes one: the key is optional only under the table, so a
+/// file that started from the solid design space carries none, and every engine
+/// but `solid` requires it - and a start pinned at the solid design space's own
+/// 1.0 is legal only under the table, since a plain target must stay below it.
+/// Either way it gets [`constants::STARTER_MASS_FRACTION`] back, the figure a
+/// brand new file is written with, so what a tick lands on builds.
+fn write_reduce(optimization: &mut OptimizationConfig, on: bool, solid: bool) {
+    optimization.reduce = on.then_some(ReduceConfig {
+        target_safety_factor: constants::VIEW_EDIT_DEFAULT_TARGET_SAFETY_FACTOR,
+        method: None,
+        ratio: None,
+        refine_stages: None,
+        min_mass_fraction: None,
+        evolution_rate: None,
+        add_ratio: None,
+    });
+    if !on
+        && !solid
+        && optimization
+            .mass_fraction
+            .is_none_or(|fraction| fraction >= constants::DENSITY_MAX)
+    {
+        optimization.mass_fraction = Some(constants::STARTER_MASS_FRACTION);
+    }
+}
+
+/// Everything choosing a reduction method in the combo does to the table.
+///
+/// The two evolutionary keys go with the method that owns them, exactly as the
+/// flush depth goes with its policy and for the same reason: the continuation
+/// method *refuses* them, the rows that hold them are not drawn under it, and a
+/// value a switch left behind would refuse a build with nothing on screen to
+/// explain it.
+fn write_reduce_method(reduce: &mut ReduceConfig, method: ReduceMethod) {
+    reduce.method = Some(method);
+    if method != ReduceMethod::Beso {
+        reduce.evolution_rate = None;
+        reduce.add_ratio = None;
+    }
 }
 
 /// The growth controls, shown whenever that engine is selected.
@@ -2906,12 +3137,21 @@ fn pass_note_lines(ui: &mut egui::Ui, pass: &str, notes: &[String]) {
 /// absent again while the next one runs: what it says describes the design on
 /// screen, or it says nothing. The console of the session is sent the same lines
 /// by the run, from the same formatter.
+///
+/// A finished `[optimization.reduce]` schedule is drawn in the same block and
+/// under the same rule, because it is the same question answered at length: how
+/// the design on screen came to be as light as it is, and what the part in the
+/// file measures against the factor it was aimed at. Either of the two brings
+/// the block up - a schedule whose stress solve produced no report has still
+/// chosen a design, and the record of it is not a thing to swallow.
 fn stress_summary(ui: &mut egui::Ui, editor: &Editor) {
-    let Some(summary) = editor.stress_summary() else {
+    let summary = editor.stress_summary();
+    let reduce = editor.reduce_summary();
+    if summary.is_none() && reduce.is_none() {
         return;
-    };
+    }
     ui.separator();
-    stress_block(ui, &summary);
+    stress_block(ui, summary.as_ref(), reduce.as_ref());
 }
 
 /// The summary itself, header and all, drawn from a summary rather than from
@@ -2933,22 +3173,63 @@ fn stress_summary(ui: &mut egui::Ui, editor: &Editor) {
 /// block that needs a run behind it, so every row here is one wrapping label,
 /// which cannot widen the panel. A multi-widget `ui.horizontal` added here can,
 /// and would have to be `horizontal_wrapped` and brought inside that test.
-fn stress_block(ui: &mut egui::Ui, summary: &StressSummary) {
+fn stress_block(
+    ui: &mut egui::Ui,
+    summary: Option<&StressSummary>,
+    reduce: Option<&ReduceSummary>,
+) {
     egui::CollapsingHeader::new(constants::VIEW_EDIT_BLOCK_STRESS)
         .default_open(true)
         .show(ui, |ui| {
-            if let Some(warning) = &summary.warning {
-                ui.label(
-                    egui::RichText::new(warning.as_str())
-                        .strong()
-                        .color(ui.visuals().warn_fg_color),
-                );
+            if let Some(summary) = summary {
+                if let Some(warning) = &summary.warning {
+                    ui.label(
+                        egui::RichText::new(warning.as_str())
+                            .strong()
+                            .color(ui.visuals().warn_fg_color),
+                    );
+                }
+                ui.label(egui::RichText::new(summary.headline.as_str()).strong());
+                for case in &summary.cases {
+                    ui.monospace(case.as_str());
+                }
             }
-            ui.label(egui::RichText::new(summary.headline.as_str()).strong());
-            for case in &summary.cases {
-                ui.monospace(case.as_str());
+            if let Some(reduce) = reduce {
+                reduce_lines(ui, reduce);
             }
         });
+}
+
+/// What a finished reduction schedule did, under the safety factor above it:
+/// every stage it ran, the stage it exported, and what the part in the file
+/// measures now the finishing passes have had it.
+///
+/// Every line is one the run's own console was sent, from the formatters in
+/// [`crate::report`], so the window and the terminal quote one set of numbers
+/// and one wording. Two of them are warnings and are coloured as such: a
+/// schedule that never found a design holding the target exported the one it
+/// started from, and a target the `[output]` passes then spent is a target the
+/// part in the file does not hold - which is exactly what a reader of a safety
+/// factor has to know before they read it.
+///
+/// Wrapping labels, under the rule [`stress_block`] is written by: a run has to
+/// have finished for any of this to exist, so the panel's width guard cannot
+/// reach it and nothing here may be a `ui.horizontal` of several widgets.
+fn reduce_lines(ui: &mut egui::Ui, summary: &ReduceSummary) {
+    for stage in &summary.stages {
+        ui.label(egui::RichText::new(report::reduce_stage_note(stage)).small());
+    }
+    let mut exported = egui::RichText::new(report::reduce_summary_note(summary)).small();
+    if summary.missed_the_target() {
+        exported = exported.color(ui.visuals().warn_fg_color);
+    }
+    ui.label(exported);
+    let mut finished =
+        egui::RichText::new(format!("reduce: {}", report::reduce_finished_line(summary))).small();
+    if !summary.finished_meets_target() {
+        finished = finished.color(ui.visuals().warn_fg_color);
+    }
+    ui.label(finished);
 }
 
 /// The layer switches, under a header of their own.
@@ -3233,7 +3514,7 @@ mod tests {
             }
             summary(root, &editor.state);
             show_block(root, scene);
-            stress_block(root, &stress);
+            stress_block(root, Some(&stress), None);
             controls(root);
         });
         (context, scope)
@@ -3370,6 +3651,20 @@ mod tests {
                 config.optimization.local_volume = Some(LocalVolumeConfig {
                     max_fraction: Some(0.55),
                     radius_mm: Some(9.0),
+                });
+                // The evolutionary method, because it is the one that draws
+                // every row of the table: the two keys below it exist under no
+                // other. The configuration this leaves does not build - a
+                // reduction refuses the two caps above it - which is a state of
+                // the panel like any other and one the validation block draws.
+                config.optimization.reduce = Some(ReduceConfig {
+                    target_safety_factor: 2.5,
+                    method: Some(ReduceMethod::Beso),
+                    ratio: Some(0.9),
+                    refine_stages: Some(3),
+                    min_mass_fraction: Some(0.05),
+                    evolution_rate: Some(0.03),
+                    add_ratio: Some(0.01),
                 });
                 config.output.trim = Some(TrimPolicy::Stress);
                 config.output.trim_stress_fraction = Some(0.02);
@@ -3824,8 +4119,59 @@ mod tests {
                 .edit(|config| config.optimization.local_volume = Some(local_volume.clone()));
             draw(&mut editor, &mut scene);
         }
+        editor
+            .state
+            .edit(|config| config.optimization.local_volume = None);
+
+        // The reduction rows, the same way: the bare table with every optional
+        // key on its default, the continuation method with them pinned, and the
+        // evolutionary one, whose two extra rows exist under no other method.
+        for reduce in [
+            ReduceConfig {
+                target_safety_factor: 2.5,
+                method: None,
+                ratio: None,
+                refine_stages: None,
+                min_mass_fraction: None,
+                evolution_rate: None,
+                add_ratio: None,
+            },
+            ReduceConfig {
+                target_safety_factor: 3.0,
+                method: Some(ReduceMethod::Continuation),
+                ratio: Some(0.9),
+                refine_stages: Some(3),
+                min_mass_fraction: Some(0.05),
+                evolution_rate: None,
+                add_ratio: None,
+            },
+            ReduceConfig {
+                target_safety_factor: 3.0,
+                method: Some(ReduceMethod::Beso),
+                ratio: Some(0.9),
+                refine_stages: Some(3),
+                min_mass_fraction: Some(0.05),
+                evolution_rate: Some(0.03),
+                add_ratio: Some(0.01),
+            },
+        ] {
+            editor
+                .state
+                .edit(|config| config.optimization.reduce = Some(reduce.clone()));
+            draw(&mut editor, &mut scene);
+        }
+        // The start fraction unpinned, which is the state a schedule starting
+        // from the solid design space leaves that row in.
+        let mass_fraction = editor.state.config().optimization.mass_fraction;
+        editor
+            .state
+            .edit(|config| config.optimization.mass_fraction = None);
+        draw(&mut editor, &mut scene);
+        editor
+            .state
+            .edit(|config| config.optimization.mass_fraction = mass_fraction);
         editor.state.edit(|config| {
-            config.optimization.local_volume = None;
+            config.optimization.reduce = None;
             config.optimization.penalty = Some(4.0);
             // The scientific row in its pinned state; unpinned it draws the
             // default label instead, which every other draw above covers.
@@ -4042,6 +4388,392 @@ mod tests {
             .edit(|config| write_flush_policy(&mut config.output, FlushPolicy::Walls));
         assert_eq!(editor.state.config().output.flush, Some(FlushPolicy::Walls));
         assert_eq!(editor.state.config().output.flush_depth_mm, None);
+    }
+
+    /// The reduction's tick box: on writes the whole table with its defaults,
+    /// off takes the whole table away, and what is left builds either way.
+    ///
+    /// The commit path a click reaches rather than the click itself, as the
+    /// flush policy's test drives its writer: the box sits inside a scroll area
+    /// several sections down, and what is under test is what a tick writes.
+    /// The rows it brings with it are laid out by
+    /// `the_panel_draws_every_selection_and_every_section`.
+    #[test]
+    fn the_reduction_tick_box_writes_the_table_and_takes_it_away_again() {
+        let (_dir, path) = write_temp("panel_reduce", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let before = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(editor.state.config().optimization.reduce, None);
+
+        editor
+            .state
+            .edit(|config| write_reduce(&mut config.optimization, true, false));
+        let table = editor
+            .state
+            .config()
+            .optimization
+            .reduce
+            .clone()
+            .expect("the tick wrote no table");
+        assert_eq!(
+            table,
+            ReduceConfig {
+                target_safety_factor: constants::VIEW_EDIT_DEFAULT_TARGET_SAFETY_FACTOR,
+                method: None,
+                ratio: None,
+                refine_stages: None,
+                min_mass_fraction: None,
+                evolution_rate: None,
+                add_ratio: None,
+            },
+            "a tick pinned a key nobody set"
+        );
+        // The mass fraction is left alone: under the table it is where the
+        // schedule starts, and that is the user's number either way.
+        assert_eq!(editor.state.config().optimization.mass_fraction, Some(0.3));
+        editor.state.revalidate();
+        assert!(
+            editor.state.is_valid(),
+            "the tick landed a configuration that does not build: {:?}",
+            editor.state.error()
+        );
+
+        // The file gets the required key and nothing else, so every row still
+        // shows the default a run would use.
+        editor.save();
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(saved.contains("[optimization.reduce]"), "{saved}");
+        assert!(
+            saved.contains(&format!(
+                "target_safety_factor = {}",
+                constants::VIEW_EDIT_DEFAULT_TARGET_SAFETY_FACTOR
+            )),
+            "{saved}"
+        );
+        for key in ["method", "\nratio", "refine_stages", "min_mass_fraction"] {
+            assert!(!saved.contains(key), "{key} was written unpinned: {saved}");
+        }
+
+        // And off again: the table goes, the file is what it was, and one undo
+        // is what puts the whole tick back.
+        editor
+            .state
+            .edit(|config| write_reduce(&mut config.optimization, false, false));
+        assert_eq!(editor.state.config().optimization.reduce, None);
+        editor.save();
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            before,
+            "the table outlived the tick that wrote it"
+        );
+        assert!(editor.state.undo());
+        assert_eq!(editor.state.config().optimization.reduce, Some(table));
+    }
+
+    /// Unticking the box on a file that started its reduction solid gives it a
+    /// mass target back.
+    ///
+    /// [`select_engine`]'s obligation, in the one other place a switch changes
+    /// which keys a configuration needs: `mass_fraction` is optional only under
+    /// `[optimization.reduce]`, so a schedule starting from the solid design
+    /// space carries none - and taking the table away without putting one back
+    /// would land the session on "mass_fraction is required" halfway through an
+    /// edit, with the row that repairs it gone in the same frame.
+    #[test]
+    fn unticking_the_reduction_gives_a_solid_start_its_mass_fraction_back() {
+        let (_dir, path) = write_temp("panel_reduce_solid_start", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.edit(|config| {
+            config.optimization.mass_fraction = None;
+            write_reduce(&mut config.optimization, true, false);
+        });
+        editor.state.revalidate();
+        assert!(
+            editor.state.is_valid(),
+            "a reduction from the solid design space does not build: {:?}",
+            editor.state.error()
+        );
+
+        editor
+            .state
+            .edit(|config| write_reduce(&mut config.optimization, false, false));
+        assert_eq!(
+            editor.state.config().optimization.mass_fraction,
+            Some(constants::STARTER_MASS_FRACTION),
+            "the box left a configuration with no mass target and no table"
+        );
+        editor.state.revalidate();
+        assert!(
+            editor.state.is_valid(),
+            "unticking the box landed a configuration that does not build: {:?}",
+            editor.state.error()
+        );
+
+        // A start the file did name is the user's own number: only the missing
+        // key is filled.
+        editor.state.edit(|config| {
+            config.optimization.mass_fraction = Some(0.42);
+            write_reduce(&mut config.optimization, true, false);
+        });
+        editor
+            .state
+            .edit(|config| write_reduce(&mut config.optimization, false, false));
+        assert_eq!(editor.state.config().optimization.mass_fraction, Some(0.42));
+
+        // A start pinned at the solid design space's 1.0 is legal only under
+        // the table: a plain target must stay below it, so it is given back too.
+        editor.state.edit(|config| {
+            config.optimization.mass_fraction = Some(constants::DENSITY_MAX);
+            write_reduce(&mut config.optimization, true, false);
+        });
+        editor.state.revalidate();
+        assert!(
+            editor.state.is_valid(),
+            "a start of 1.0 under the table builds"
+        );
+        editor
+            .state
+            .edit(|config| write_reduce(&mut config.optimization, false, false));
+        assert_eq!(
+            editor.state.config().optimization.mass_fraction,
+            Some(constants::STARTER_MASS_FRACTION),
+            "a start pinned at 1.0 was left behind as a plain mass target"
+        );
+        editor.state.revalidate();
+        assert!(
+            editor.state.is_valid(),
+            "unticking the box on a 1.0 start landed a configuration that does not build: {:?}",
+            editor.state.error()
+        );
+
+        // And nothing is put back under the engine that refuses the key: the
+        // solid engine fills the domain rather than targeting a share of it.
+        let mut optimization = editor.state.config().optimization.clone();
+        optimization.mass_fraction = None;
+        write_reduce(&mut optimization, false, true);
+        assert_eq!(
+            optimization.mass_fraction, None,
+            "the box wrote a key the solid engine refuses"
+        );
+    }
+
+    /// One click at `pos`, through the optimization section, in the frames egui
+    /// needs to report it.
+    ///
+    /// [`click_panel_at`]'s sequence over the one section instead of the whole
+    /// panel, for the same reason it exists at all: the row a tick box like this
+    /// one owns has no writer of its own to drive - what a click on it does is
+    /// [`optional_row`]'s own two lines - and the section is where its rows are
+    /// laid out somewhere a pointer can reach them.
+    fn click_optimization_at(editor: &mut Editor, pos: egui::Pos2) {
+        let context = egui::Context::default();
+        let button = |pressed| {
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            button(true),
+            button(false),
+            Vec::new(),
+        ] {
+            let input = egui::RawInput {
+                events,
+                ..crate::viewer::ui::tests::window_input()
+            };
+            let _ = context.run_ui(input, |root| {
+                let mut field = Field::new(&mut editor.state, true);
+                optimization_section(root, &mut field);
+            });
+        }
+    }
+
+    /// The start fraction is a row with a box of its own: it writes the key and
+    /// it takes it away again, which is the only way back to a solid start.
+    #[test]
+    fn the_start_fraction_row_writes_the_key_and_takes_it_away_again() {
+        let (_dir, path) = write_temp("panel_start_fraction", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.edit(|config| {
+            config.optimization.mass_fraction = None;
+            write_reduce(&mut config.optimization, true, false);
+        });
+
+        let context = egui::Context::default();
+        let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+            let mut field = Field::new(&mut editor.state, true);
+            optimization_section(root, &mut field);
+        });
+        let text = crate::viewer::ui::tests::painted_text(&output);
+        // The row is drawn with the key absent, which is what the finding was
+        // about, and it is drawn as the reduction's start rather than as the
+        // weight target the same key is without the table.
+        assert!(
+            text.lines().any(|line| line == "start fraction"),
+            "the section drew no start fraction row: {text}"
+        );
+        assert!(
+            !text.lines().any(|line| line == "mass fraction"),
+            "the section drew both rows: {text}"
+        );
+        let pos = crate::viewer::ui::tests::painted_text_center(&output, "start fraction")
+            .expect("the section painted no start fraction row");
+
+        click_optimization_at(&mut editor, pos);
+        assert_eq!(
+            editor.state.config().optimization.mass_fraction,
+            Some(constants::REDUCE_START_FRACTION),
+            "the box wrote no start fraction"
+        );
+        editor.state.revalidate();
+        assert!(
+            editor.state.is_valid(),
+            "the start the box wrote does not build: {:?}",
+            editor.state.error()
+        );
+
+        click_optimization_at(&mut editor, pos);
+        assert_eq!(
+            editor.state.config().optimization.mass_fraction,
+            None,
+            "the box could not take its own key away again"
+        );
+        editor.state.revalidate();
+        assert!(
+            editor.state.is_valid(),
+            "a solid start does not build: {:?}",
+            editor.state.error()
+        );
+    }
+
+    /// Switching the method back off the evolutionary one takes its two keys
+    /// with it.
+    ///
+    /// The flush depth's incident in another table: `evolution_rate` and
+    /// `add_ratio` are drawn only under `beso`, the schema refuses them under
+    /// `continuation`, and a switch that left them behind would refuse a build
+    /// with no row on screen to explain it.
+    #[test]
+    fn switching_the_reduction_off_beso_takes_the_evolutionary_keys_with_it() {
+        let (_dir, path) = write_temp("panel_reduce_method", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        editor.state.edit(|config| {
+            config.optimization.reduce = Some(ReduceConfig {
+                target_safety_factor: 2.5,
+                method: Some(ReduceMethod::Beso),
+                ratio: None,
+                refine_stages: None,
+                min_mass_fraction: None,
+                evolution_rate: Some(0.03),
+                add_ratio: Some(0.01),
+            });
+        });
+        editor.state.revalidate();
+        assert!(editor.state.is_valid(), "{:?}", editor.state.error());
+
+        editor.state.edit(|config| {
+            let reduce = config.optimization.reduce.as_mut().expect("the table");
+            write_reduce_method(reduce, ReduceMethod::Continuation);
+        });
+        let table = editor
+            .state
+            .config()
+            .optimization
+            .reduce
+            .clone()
+            .expect("the table");
+        assert_eq!(table.method, Some(ReduceMethod::Continuation));
+        assert_eq!(table.evolution_rate, None);
+        assert_eq!(table.add_ratio, None);
+        editor.state.revalidate();
+        assert!(
+            editor.state.is_valid(),
+            "the switch landed a configuration that does not build: {:?}",
+            editor.state.error()
+        );
+
+        // The file the save leaves behind is the one that builds: the keys are
+        // gone from it too.
+        editor.save();
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(saved.contains("method = \"continuation\""), "{saved}");
+        for key in ["evolution_rate", "add_ratio"] {
+            assert!(
+                !saved.contains(key),
+                "{key} outlived the method that owns it: {saved}"
+            );
+        }
+
+        // And back to beso, which writes neither: each row shows its default
+        // until it is pinned.
+        editor.state.edit(|config| {
+            let reduce = config.optimization.reduce.as_mut().expect("the table");
+            write_reduce_method(reduce, ReduceMethod::Beso);
+        });
+        let table = editor
+            .state
+            .config()
+            .optimization
+            .reduce
+            .clone()
+            .expect("t");
+        assert_eq!(table.evolution_rate, None);
+        assert_eq!(table.add_ratio, None);
+    }
+
+    /// What the panel says about a reduction the schema refuses: the validation
+    /// block's own line, in the configuration's own words.
+    ///
+    /// The rejections are the table's, not the panel's - a reduction beside the
+    /// local volume cap, or under an evolutionary method with an update scheme
+    /// named - and the panel's job is to say so where every other refusal is
+    /// said, above the sections. Nothing here is auto-corrected: both keys have
+    /// rows of their own, and a panel that silently dropped one would be editing
+    /// a decision the user made.
+    #[test]
+    fn the_panel_says_why_a_refused_reduction_will_not_build() {
+        let (_dir, path) = write_temp("panel_reduce_refused", fixture());
+        let mut editor = Editor::open(&path).expect("open");
+        let mut scene = editor.initial_scene();
+        for refusal in [0, 1] {
+            editor.state.edit(|config| {
+                config.optimization.local_volume = None;
+                config.optimization.update = None;
+                write_reduce(&mut config.optimization, true, false);
+                match refusal {
+                    0 => {
+                        config.optimization.local_volume = Some(LocalVolumeConfig {
+                            max_fraction: None,
+                            radius_mm: None,
+                        });
+                    }
+                    _ => {
+                        config.optimization.update = Some(UpdateScheme::Mma);
+                        let reduce = config.optimization.reduce.as_mut().expect("the table");
+                        write_reduce_method(reduce, ReduceMethod::Beso);
+                    }
+                }
+            });
+            editor.state.revalidate();
+            let error = editor
+                .state
+                .error()
+                .unwrap_or_else(|| panic!("refusal {refusal} was accepted"))
+                .to_string();
+            assert!(
+                error.contains("[optimization.reduce]"),
+                "the refusal never named the table: {error}"
+            );
+            let text = panel_text(&mut editor, &mut scene);
+            assert!(
+                text.contains("configuration is not runnable"),
+                "the panel drew no refusal: {text}"
+            );
+        }
     }
 
     /// The boundary fidelity combo, in each of its states, and the value it
@@ -5314,8 +6046,90 @@ mod tests {
         for summary in [whole, pieces] {
             let context = egui::Context::default();
             let _ = context.run_ui(egui::RawInput::default(), |root| {
-                stress_block(root, &summary);
+                stress_block(root, Some(&summary), None);
             });
+        }
+    }
+
+    /// A reduction schedule, as the block draws it: every stage, the stage that
+    /// was exported, and what the part in the file measures against the target.
+    ///
+    /// Read back off the frame rather than off the summary, so what is asserted
+    /// is what a user sees. The lines are the console's own - the schedule is
+    /// reported in both places from one formatter - so they are asked for here
+    /// through those formatters and not spelled out a second time.
+    ///
+    /// Three states, because the colouring rules are three: a schedule that held
+    /// its target, one that never did, and one the finishing passes took the
+    /// target away from after it had.
+    #[test]
+    fn the_stress_block_draws_the_stages_a_reduction_ran() {
+        use crate::engine::ReduceStage;
+
+        let stage = |index: usize, fraction: f64, factor: f64, passed: bool| ReduceStage {
+            index,
+            target_fraction: fraction,
+            achieved_fraction: fraction,
+            iterations: 20 + index,
+            safety_factor: Some(factor),
+            passed,
+            refine: index == 3,
+        };
+        let stages = vec![
+            stage(1, 1.0, 9.10, true),
+            stage(2, 0.8, 4.20, true),
+            stage(3, 0.64, 1.90, false),
+        ];
+        let held = ReduceSummary {
+            method: ReduceMethod::Continuation,
+            target_safety_factor: 3.0,
+            exported: stages[1],
+            stages,
+            finished_safety_factor: Some(4.05),
+        };
+        let missed = ReduceSummary {
+            exported: ReduceStage {
+                passed: false,
+                ..held.stages[0]
+            },
+            finished_safety_factor: Some(9.10),
+            target_safety_factor: 12.0,
+            ..held.clone()
+        };
+        let spent = ReduceSummary {
+            finished_safety_factor: Some(2.10),
+            ..held.clone()
+        };
+        assert!(!held.missed_the_target() && held.finished_meets_target());
+        assert!(missed.missed_the_target());
+        assert!(
+            !spent.finished_meets_target(),
+            "the passes cost it the target"
+        );
+
+        for summary in [&held, &missed, &spent] {
+            let context = egui::Context::default();
+            let output = context.run_ui(crate::viewer::ui::tests::window_input(), |root| {
+                stress_block(root, None, Some(summary));
+            });
+            let text = crate::viewer::ui::tests::painted_text(&output);
+            for stage in &summary.stages {
+                let line = report::reduce_stage_note(stage);
+                assert!(
+                    text.contains(&line),
+                    "the block never drew {line:?}: {text}"
+                );
+            }
+            let exported = report::reduce_summary_note(summary);
+            assert!(
+                text.contains(&exported),
+                "the block never drew {exported:?}: {text}"
+            );
+            let finished = report::reduce_finished_line(summary);
+            assert!(
+                text.contains(&finished),
+                "the block never drew {finished:?}: {text}"
+            );
         }
     }
 
