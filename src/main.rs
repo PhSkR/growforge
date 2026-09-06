@@ -11,9 +11,9 @@ use growforge::constants;
 use growforge::problem::Problem;
 use growforge::report::{
     ConsoleReporter, print_bench_report, print_clamp_report, print_flush_report,
-    print_island_report, print_mesh_stats, print_problem_summary, print_reinforce_report,
-    print_self_weight, print_solid_report, print_stress_report, print_trim_report,
-    print_void_report, print_warnings,
+    print_island_report, print_mesh_stats, print_problem_summary, print_reduce_finish,
+    print_reinforce_report, print_self_weight, print_solid_report, print_stress_report,
+    print_trim_report, print_void_report, print_warnings,
 };
 use growforge::{RunOutcome, load_config_and_problem};
 
@@ -223,10 +223,12 @@ fn dispatch() -> Result<()> {
                         }
                     }
                     None => {
-                        // Three outcomes, named apart: an answer, an iterate the
-                        // problem will not improve on, and whatever the budget ended
-                        // on. The engine has already printed the sentence that says
-                        // what to do about the middle one.
+                        // Four outcomes, named apart: an answer, an iterate the
+                        // problem will not improve on, whatever the budget ended
+                        // on, and the stage an [optimization.reduce] schedule
+                        // kept. The engine has already printed the sentence that
+                        // says what to do about the second, and the schedule's
+                        // own stage lines and summary about the fourth.
                         println!(
                             "iterations     {} ({})",
                             outcome.field.iterations,
@@ -269,6 +271,16 @@ fn dispatch() -> Result<()> {
             // The count is the island report's, printed just above: the table
             // and the warning on it describe the same exported surface.
             print_stress_report(&outcome.stress, outcome.islands.bodies.len());
+            // Beside that table because the factor it quotes is the table's: a
+            // reduction schedule chose its design before the passes above ran,
+            // and this is what the part they left measures against the target it
+            // was held to.
+            print_reduce_finish(
+                outcome.field.reduce.as_ref(),
+                outcome.trim.as_ref(),
+                outcome.flush.as_ref(),
+                outcome.reinforce.as_ref(),
+            );
             if let Some(path) = &problem.output.stress_json
                 && outcome.stress.is_available()
             {

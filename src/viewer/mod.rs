@@ -230,7 +230,7 @@ pub(crate) fn run_worker(
     }) = finish(
         problem,
         &mut field.densities,
-        field.reduce.as_ref(),
+        field.reduce.as_mut(),
         link,
         &stop,
     )?
@@ -322,7 +322,10 @@ pub(crate) struct Finished {
 ///
 /// `reduce` is the run's own record of its material reduction schedule, when it
 /// had one, and travels to the JSON report exactly as it does on the command
-/// line; a design that is exported without the run behind it has none.
+/// line; a design that is exported without the run behind it has none. It is
+/// taken by mutable reference for [`crate::complete`]'s reason: what the part
+/// measures once the finishing passes have had it is written back onto the
+/// record here, because this is where those passes run.
 ///
 /// The sequence itself is [`crate::complete`]'s, shared with the command line.
 /// What is this function's own is the window: the status line at each stage, the
@@ -332,7 +335,7 @@ pub(crate) struct Finished {
 pub(crate) fn finish(
     problem: &Problem,
     densities: &mut [f64],
-    reduce: Option<&crate::engine::ReduceSummary>,
+    reduce: Option<&mut crate::engine::ReduceSummary>,
     link: &ViewLink,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<Finished>> {

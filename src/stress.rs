@@ -632,6 +632,17 @@ fn reduce_json(reduce: &ReduceSummary) -> String {
         "    \"exported_stage\": {},\n",
         reduce.exported.index
     ));
+    // Not the exported stage's own number: the `[output]` passes run after the
+    // schedule has chosen a design, and these two describe the part that
+    // shipped. `null` where the finished analysis had no factor to give.
+    out.push_str(&format!(
+        "    \"finished_safety_factor\": {},\n",
+        json::optional_number(reduce.finished_safety_factor)
+    ));
+    out.push_str(&format!(
+        "    \"finished_meets_target\": {},\n",
+        reduce.finished_meets_target()
+    ));
     out.push_str("    \"stages\": [\n");
     for (position, stage) in reduce.stages.iter().enumerate() {
         out.push_str("      {\n");
@@ -1068,6 +1079,9 @@ vector = [1000.0, 0.0, 0.0]
             target_safety_factor: 5.0,
             exported: start,
             stages: vec![start, broken],
+            // The finishing passes cost the part the target its schedule held
+            // to, which is what the two finished fields are there to say.
+            finished_safety_factor: Some(4.2),
         };
         let text = to_json(&problem, &report, Some(&summary));
         // Take the schedule's object back out and the file is the one a run
@@ -1083,6 +1097,8 @@ vector = [1000.0, 0.0, 0.0]
             "\"safety_factor\": null",
             "\"passed\": false",
             "\"refine\": true",
+            "\"finished_safety_factor\": 4.2",
+            "\"finished_meets_target\": false",
         ] {
             assert!(text.contains(expected), "{expected} missing from {text}");
         }

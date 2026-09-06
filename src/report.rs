@@ -214,11 +214,20 @@ pub fn reduce_stage_note(stage: &ReduceStage) -> String {
 pub fn reduce_summary_note(summary: &ReduceSummary) -> String {
     let stage = summary.exported;
     if summary.missed_the_target() {
+        // What is left to try depends on what shipped. A design with voids in it
+        // can be given more material; one at full density is already every cell
+        // the domain has, and telling its user to add material is telling them
+        // to do the one thing they cannot.
+        let remedy = if stage.achieved_fraction < constants::DENSITY_MAX {
+            "lower target_safety_factor, or give the design more material or a stiffer material \
+             to hold it with"
+        } else {
+            "the design is already solid, so lower target_safety_factor, enlarge the domain, \
+             relieve the load, or choose a stiffer or stronger material"
+        };
         return format!(
             "warning: [optimization.reduce]: no stage held the target safety factor of {:.2}; \
-             exporting stage {} at fraction {:.4}, safety factor {} - lower \
-             target_safety_factor, or give the design more material or a stiffer material to \
-             hold it with",
+             exporting stage {} at fraction {:.4}, safety factor {} - {remedy}",
             summary.target_safety_factor,
             stage.index,
             stage.achieved_fraction,
@@ -232,6 +241,48 @@ pub fn reduce_summary_note(summary: &ReduceSummary) -> String {
         safety_factor(stage.safety_factor),
         summary.target_safety_factor
     )
+}
+
+/// What the part in the file measures against the target its schedule was held
+/// to, when it no longer holds it.
+///
+/// The schedule chooses a design and stops; the `[output]` passes then trim,
+/// flush and reinforce the field it chose, and the stress table beside the STL
+/// describes what they left. That part is the deliverable, so a target those
+/// passes cost it is a warning carrying both numbers and every pass that ran
+/// between them - `passes`, in the order the pipeline runs them.
+///
+/// `None` when the exported part still holds the target, which is the ordinary
+/// outcome and one [`reduce_summary_note`] has already reported.
+pub fn reduce_finished_note(summary: &ReduceSummary, passes: &[&str]) -> Option<String> {
+    if summary.finished_meets_target() {
+        return None;
+    }
+    // What stands between the stage's verdict and the part is what there is to
+    // do about it: those passes when any of them ran, and the cavity pass every
+    // export resolves the field with when none did.
+    let tail = match passes.split_last() {
+        Some((last, [])) => format!(
+            "the [output] {last} pass ran on that design afterwards - turn it off, or raise \
+             target_safety_factor to leave it the margin it spends"
+        ),
+        Some((last, rest)) => format!(
+            "the [output] {} and {last} passes ran on that design afterwards - turn them off, or \
+             raise target_safety_factor to leave them the margin they spend",
+            rest.join(", ")
+        ),
+        None => "nothing but the export's cavity pass ran on that design afterwards - raise \
+                 target_safety_factor, or check the [output] voids policy"
+            .to_string(),
+    };
+    Some(format!(
+        "warning: [optimization.reduce]: the part in the file measures a safety factor of {}, \
+         below the target of {:.2}; the schedule chose stage {}, which measured {}, and {tail}",
+        safety_factor(summary.finished_safety_factor),
+        summary.target_safety_factor,
+        summary.exported.index,
+        safety_factor(summary.exported.safety_factor)
+    ))
 }
 
 /// A stage's safety factor as the console says it, with the same `n/a` the
@@ -429,7 +480,8 @@ pub fn print_problem_summary(problem: &Problem) {
                         Some(reduce) => format!(
                             "{}, material removed until the safety factor reaches {:.3}; the \
                              volume target starts at {} and takes {:.3} of itself a stage down to \
-                             a floor of {:.3}, {}{}",
+                             a floor of {:.3}, {}; every stage of it runs up to the run's own \
+                             max_iterations of {} iterations{}",
                             reduce.method.kind().label(),
                             reduce.target_safety_factor,
                             problem.optimization.mass_fraction,
@@ -438,11 +490,15 @@ pub fn print_problem_summary(problem: &Problem) {
                             match reduce.refine_stages {
                                 0 => "and the lightest target that holds is exported unrefined"
                                     .to_string(),
+                                1 => "then 1 bisection between the last target that holds and the \
+                                      first that does not"
+                                    .to_string(),
                                 n => format!(
                                     "then {n} bisections between the last target that holds and \
                                      the first that does not"
                                 ),
                             },
+                            problem.optimization.max_iterations,
                             match reduce.method {
                                 ReduceMethodParams::Beso {
                                     evolution_rate,
@@ -688,6 +744,39 @@ pub fn print_reinforce_report(report: Option<&ReinforceReport>) {
     };
     for (index, note) in report.notes().iter().enumerate() {
         let label = if index == 0 { "reinforce" } else { "" };
+        println!("{label:<14} {note}");
+    }
+}
+
+/// Print what the part in the file measures against the target an
+/// `[optimization.reduce]` schedule was held to, when the finishing passes cost
+/// it that target.
+///
+/// Nothing at all on a run without the table, and nothing on one whose exported
+/// part still holds it - that is what the schedule's own summary line said while
+/// the run was going. Printed beside the stress table because the factor it
+/// quotes is that table's, and it names the passes that ran between the
+/// schedule's verdict and the file.
+pub fn print_reduce_finish(
+    summary: Option<&ReduceSummary>,
+    trim: Option<&TrimReport>,
+    flush: Option<&FlushReport>,
+    reinforce: Option<&ReinforceReport>,
+) {
+    let Some(summary) = summary else {
+        return;
+    };
+    // A pass that ran is a pass with a report: `None` is the `off` of all three.
+    let passes: Vec<&str> = [
+        trim.map(|_| "trim"),
+        flush.map(|_| "flush"),
+        reinforce.map(|_| "reinforce"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(note) = reduce_finished_note(summary, &passes) {
+        let label = "reduce";
         println!("{label:<14} {note}");
     }
 }
@@ -1278,6 +1367,7 @@ mod tests {
             target_safety_factor: 5.0,
             exported: sample_stage(),
             stages: vec![sample_stage()],
+            finished_safety_factor: Some(6.41),
         };
         assert_eq!(
             reduce_summary_note(&held),
@@ -1308,6 +1398,85 @@ mod tests {
             ),
             "{note}"
         );
+        // The exported design is the solid start, so there is no material left
+        // to give it and the remedy says what there is instead.
+        assert!(
+            note.ends_with(
+                "the design is already solid, so lower target_safety_factor, enlarge the domain, \
+                 relieve the load, or choose a stiffer or stronger material"
+            ),
+            "{note}"
+        );
+        // A design with voids in it is told the other thing.
+        let porous = ReduceStage {
+            achieved_fraction: 0.4,
+            ..start
+        };
+        let note = reduce_summary_note(&ReduceSummary {
+            exported: porous,
+            stages: vec![porous],
+            ..held
+        });
+        assert!(
+            note.ends_with(
+                "lower target_safety_factor, or give the design more material or a stiffer \
+                 material to hold it with"
+            ),
+            "{note}"
+        );
+    }
+
+    /// The part in the file is measured after the finishing passes, and a target
+    /// they cost it is the run's own warning - naming both numbers and the
+    /// passes that stood between the stage and the file.
+    #[test]
+    fn the_finished_part_warns_when_the_passes_cost_it_the_target() {
+        let held = ReduceSummary {
+            method: crate::config::ReduceMethod::Continuation,
+            target_safety_factor: 5.0,
+            exported: sample_stage(),
+            stages: vec![sample_stage()],
+            finished_safety_factor: Some(6.0),
+        };
+        // The exported part holds the target, so there is nothing here the
+        // schedule's own summary has not already said.
+        assert_eq!(reduce_finished_note(&held, &["trim"]), None);
+
+        let lost = ReduceSummary {
+            finished_safety_factor: Some(4.2),
+            ..held.clone()
+        };
+        let note = reduce_finished_note(&lost, &["trim", "reinforce"]).expect("a warning");
+        assert!(
+            note.starts_with("warning: [optimization.reduce]: "),
+            "{note}"
+        );
+        // Both numbers: what the file carries, and what the schedule chose on.
+        assert!(
+            note.contains("safety factor of 4.20, below the target of 5.00"),
+            "{note}"
+        );
+        assert!(note.contains("stage 3, which measured 6.41"), "{note}");
+        assert!(
+            note.contains("[output] trim and reinforce passes ran"),
+            "{note}"
+        );
+        // One pass reads as one, and a run with none of them says what did stand
+        // between the stage and the file instead.
+        let single = reduce_finished_note(&lost, &["trim"]).expect("a warning");
+        assert!(single.contains("[output] trim pass ran"), "{single}");
+        let bare = reduce_finished_note(&lost, &[]).expect("a warning");
+        assert!(
+            bare.contains("nothing but the export's cavity pass ran"),
+            "{bare}"
+        );
+        // An unmeasured part holds nothing, and says so the way the table does.
+        let unmeasured = ReduceSummary {
+            finished_safety_factor: None,
+            ..held
+        };
+        let note = reduce_finished_note(&unmeasured, &["trim"]).expect("a warning");
+        assert!(note.contains("safety factor of n/a"), "{note}");
     }
 
     #[test]

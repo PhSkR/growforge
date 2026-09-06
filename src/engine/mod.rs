@@ -252,6 +252,15 @@ pub struct ReduceSummary {
     pub exported: ReduceStage,
     /// One record per stage the schedule ran, in the order it ran them.
     pub stages: Vec<ReduceStage>,
+    /// Safety factor of the part in the file: the same yield strength over peak
+    /// von Mises stress, measured on the field the `[output]` finishing passes
+    /// left rather than on the design the schedule chose.
+    ///
+    /// `None` when that analysis produced no factor, and `None` until
+    /// [`crate::complete`] has measured it - the schedule ends before the trim,
+    /// the flush and the reinforcement run, so it can never be the one to say
+    /// what shipped.
+    pub finished_safety_factor: Option<f64>,
 }
 
 impl ReduceSummary {
@@ -262,6 +271,19 @@ impl ReduceSummary {
     /// say so rather than let a lighter-is-better summary read as a pass.
     pub fn missed_the_target(&self) -> bool {
         !self.exported.passed
+    }
+
+    /// True when the part in the file still holds the target the schedule was
+    /// held to.
+    ///
+    /// Read of [`ReduceSummary::finished_safety_factor`] rather than of the
+    /// exported stage, because the finishing passes change the field after the
+    /// schedule has chosen it and the claim a run makes is about the part that
+    /// shipped. An unmeasured factor holds nothing, exactly as an unmeasured
+    /// stage failed.
+    pub fn finished_meets_target(&self) -> bool {
+        self.finished_safety_factor
+            .is_some_and(|factor| factor >= self.target_safety_factor)
     }
 }
 
@@ -429,8 +451,26 @@ mod tests {
             target_safety_factor: 5.0,
             exported: passing,
             stages: vec![stage(1, 1.0, 7.1, true), passing],
+            finished_safety_factor: Some(5.1),
         };
         assert!(!held.missed_the_target());
+        // What the file carries is measured after the finishing passes, and the
+        // verdict about the file reads that number rather than the stage's.
+        assert!(held.finished_meets_target());
+        assert!(
+            !ReduceSummary {
+                finished_safety_factor: Some(4.9),
+                ..held.clone()
+            }
+            .finished_meets_target()
+        );
+        assert!(
+            !ReduceSummary {
+                finished_safety_factor: None,
+                ..held.clone()
+            }
+            .finished_meets_target()
+        );
         // Nothing held, so the design in the file is the one the run started
         // from and the summary is the warning, whatever the stage list says.
         let start = stage(1, 1.0, 3.2, false);

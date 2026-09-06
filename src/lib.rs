@@ -395,7 +395,12 @@ pub struct Completed {
 /// `reduce` is the finished reduction schedule of the run that produced this
 /// field, when there was one: it is written into the JSON report beside the
 /// stress table, and it is the field's own record rather than anything this
-/// function derives.
+/// function derives - with the one exception this function is the only place
+/// that can make. The schedule chose its design before the three passes above
+/// ran, so what the part that *ships* measures is nobody else's to say:
+/// [`ReduceSummary::finished_safety_factor`] is set here, off the analysis that
+/// describes the exported field, and from there reaches the JSON and the console
+/// line that warns when those passes cost the part its target.
 ///
 /// `Ok(None)` is [`Stages::stopped`] answering yes at one of the boundaries:
 /// nothing was written, and the caller is expected to unwind rather than export.
@@ -403,7 +408,7 @@ pub fn complete(
     problem: &Problem,
     densities: &mut [f64],
     limits: StressLimits,
-    reduce: Option<&ReduceSummary>,
+    mut reduce: Option<&mut ReduceSummary>,
     stages: &dyn Stages,
 ) -> Result<Option<Completed>> {
     if stages.stopped() {
@@ -443,6 +448,15 @@ pub fn complete(
         };
         analysis = reanalysed;
     }
+    // What the part in the file measures, which is the only reading a finished
+    // schedule can be held to: it chose its design before the three passes above
+    // ran, and this analysis is the one that describes what they left.
+    if let Some(summary) = reduce.as_deref_mut() {
+        summary.finished_safety_factor = analysis
+            .stress
+            .report()
+            .and_then(|report| report.worst_safety_factor());
+    }
     // The last moment a stop can be honoured, and it has to come before the
     // JSON: that report is a file the run leaves behind exactly as the STL is,
     // and `Ok(None)` promises there is none. Written here rather than inside the
@@ -451,7 +465,7 @@ pub fn complete(
     if stages.stopped() {
         return Ok(None);
     }
-    write_stress_json(problem, &analysis, reduce)?;
+    write_stress_json(problem, &analysis, reduce.as_deref())?;
     let analysis_s = start.elapsed().as_secs_f64();
 
     stages.exporting();
@@ -508,7 +522,7 @@ pub fn optimize_and_export(problem: &Problem, reporter: &dyn Reporter) -> Result
         problem,
         &mut field.densities,
         StressLimits::default(),
-        field.reduce.as_ref(),
+        field.reduce.as_mut(),
         &Unwatched,
     )?
     .expect("an unwatched pipeline is never stopped");
@@ -1030,6 +1044,84 @@ vector = [0.0, 0.0, -40.0]
         assert_eq!(written.len(), trimmed.stats.triangles);
         std::fs::remove_file(&problem.output.stl_path).ok();
         std::fs::remove_file(&untrimmed_problem.output.stl_path).ok();
+    }
+
+    /// The claim a reduction schedule makes is about the part in the file, and
+    /// the finishing passes run after the schedule has chosen its design: what
+    /// they leave is measured again, recorded on the summary, written into the
+    /// JSON report and warned about when it no longer holds the target.
+    #[test]
+    fn the_finished_part_is_measured_against_the_reduction_target() {
+        let (mut problem, densities, _) = spurred("reduce_finished");
+        assert_eq!(problem.output.trim, crate::config::TrimPolicy::Stress);
+        let json = std::env::temp_dir().join("growforge_reduce_finished_stress.json");
+        std::fs::remove_file(&json).ok();
+        problem.output.stress_json = Some(json.clone());
+
+        let stage = engine::ReduceStage {
+            index: 2,
+            target_fraction: 0.5,
+            achieved_fraction: 0.5,
+            iterations: 40,
+            safety_factor: Some(12.0),
+            passed: true,
+            refine: false,
+        };
+        // A target no part of this fixture could hold, so what the passes leave
+        // is below it whatever the stresses of the trimmed field come out at.
+        let mut summary = ReduceSummary {
+            method: crate::config::ReduceMethod::Continuation,
+            target_safety_factor: 1e6,
+            exported: stage,
+            stages: vec![stage],
+            finished_safety_factor: None,
+        };
+        let mut field = densities;
+        let completed = complete(
+            &problem,
+            &mut field,
+            StressLimits::default(),
+            Some(&mut summary),
+            &Unwatched,
+        )
+        .expect("the pipeline")
+        .expect("nothing asked it to stop");
+
+        // The number on the summary is the table's own, off the analysis that
+        // describes the trimmed part rather than the field the schedule chose.
+        let table = completed.stress.report().expect("a stress table");
+        assert_eq!(summary.finished_safety_factor, table.worst_safety_factor());
+        assert!(summary.finished_safety_factor.is_some());
+        assert!(!summary.finished_meets_target());
+
+        let written = std::fs::read_to_string(&json).expect("the stress JSON");
+        assert!(
+            written.contains("\"finished_meets_target\": false"),
+            "{written}"
+        );
+        assert!(
+            written.contains(&format!(
+                "\"finished_safety_factor\": {}",
+                json::number(summary.finished_safety_factor.expect("a factor"))
+            )),
+            "{written}"
+        );
+        std::fs::remove_file(&json).ok();
+
+        // And the console says so, naming the pass that ran between the stage's
+        // verdict and the part.
+        let note = report::reduce_finished_note(&summary, &["trim"]).expect("a warning");
+        assert!(
+            note.starts_with("warning: [optimization.reduce]: ") && note.contains("[output] trim"),
+            "{note}"
+        );
+        report::print_reduce_finish(
+            Some(&summary),
+            completed.trim.as_ref(),
+            completed.flush.as_ref(),
+            completed.reinforce.as_ref(),
+        );
+        std::fs::remove_file(&problem.output.stl_path).ok();
     }
 
     /// The abort contract: a removal that would take the structure apart is

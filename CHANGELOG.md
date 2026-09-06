@@ -19,6 +19,23 @@
   summary lines the console says, and a `reduce` object in the stress report
   JSON. Nothing removes material yet, and a run without the table prints and
   writes exactly what it did before, to the byte.
+- **Material is now removed until the safety factor says stop.** Under
+  `[optimization.reduce]` with `method = "continuation"` the SIMP run becomes a
+  schedule of stages inside one solve: the design starts at `mass_fraction` -
+  solid unless the file says otherwise - and each stage re-converges it at
+  `ratio` of the volume target before it, for up to the run's own
+  `max_iterations` iterations, then answers for itself with the load path gate
+  and the stress report. The first stage that no longer holds
+  `target_safety_factor` closes a bracket, `refine_stages` bisections narrow it,
+  and the lightest design that held is the one exported; a start that misses the
+  target is exported too, under a warning that says so, and a stage that failed
+  on the iteration cap says the cap may be what it needs. The `[output]` trim,
+  flush and reinforcement passes run after the schedule has chosen, so the part
+  they leave is measured against the target once more: it carries
+  `finished_safety_factor` and `finished_meets_target` into the JSON report, and
+  a margin those passes cost it is a warning naming them and both numbers. A run
+  without the table takes the path it always took, iteration for iteration. `method = "beso"` is
+  refused by the engine until its update rule lands.
 - **Switching to the growth engine** in the editor now takes the four
   `[optimization]` tables that engine refuses with it (`overhang`, `wireframe`,
   `local_volume`, `reduce`), as the switch to `solid` already did.

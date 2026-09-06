@@ -18,6 +18,15 @@
 //! verdicts about a settling design is asked until the floor comes off: see
 //! [`crate::engine::wireframe`].
 //!
+//! With `[optimization.reduce]` set the loop above is one *stage* of a
+//! schedule: the design starts at `mass_fraction` - solid unless the file says
+//! otherwise - and each stage re-converges it at a lower volume target,
+//! `ratio` of the one before, until the design no longer holds
+//! `target_safety_factor`. Everything the schedule needs stays inside this one
+//! call - one solver, one workspace, one design carried from stage to stage as
+//! its warm start - and what comes out is the lightest stage that held the
+//! target. See [`SimpEngine::optimize`]'s stage section.
+//!
 //! The loop stops for one of three reasons, reported apart because they mean
 //! different things about the design that comes out: the convergence tolerance
 //! (an answer), the stall criterion of [`crate::engine::stall`] (an iterate the
@@ -28,8 +37,9 @@
 
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
+use crate::config::{ReduceMethod, ReduceMethodParams};
 use crate::constants;
 use crate::engine::chain::DensityChain;
 use crate::engine::local_volume::LocalVolume;
@@ -37,15 +47,42 @@ use crate::engine::objective::{Objective, Workspace};
 use crate::engine::stall::{Sample, StallWatch, stall_note};
 use crate::engine::update::{Buffers, Constraint, LocalConstraint, Updater, design_mean};
 use crate::engine::wireframe;
-use crate::engine::{DensityField, Engine, OverhangResidual, StopReason};
+use crate::engine::{
+    DensityField, Engine, OverhangResidual, ReduceStage, ReduceSummary, StopReason,
+};
 use crate::fea::{CancelProbe, LinearSolver};
 use crate::grid::CellKind;
 use crate::problem::Problem;
-use crate::report::{IterationStats, Reporter};
+use crate::report::{
+    IterationStats, ReduceProgress, Reporter, reduce_stage_note, reduce_summary_note,
+};
+use crate::stress::{self, StressLimits, StressOutcome};
 
 /// The SIMP engine.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SimpEngine;
+
+/// The design of a reduction stage that held the target safety factor, kept
+/// whole so that the schedule can export it after later stages have moved on.
+///
+/// Both ends of the density chain travel together: the printed field is the
+/// design, and the filtered one is what the overhang residual is measured
+/// against, so a design exported out of an earlier stage is described by that
+/// stage's numbers throughout.
+struct Kept {
+    /// Printed physical densities of the stage's design.
+    printed: Vec<f64>,
+    /// The chain's intermediate stage for the same design.
+    filtered: Vec<f64>,
+    /// Mean printed density over the design cells.
+    volume_fraction: f64,
+    /// Weighted compliance of the stage's last analysed design.
+    compliance: f64,
+    /// Largest design variable change of the stage's last iteration.
+    max_change: f64,
+    /// The record the summary reports this stage by.
+    stage: ReduceStage,
+}
 
 impl Engine for SimpEngine {
     fn name(&self) -> &'static str {
@@ -56,6 +93,21 @@ impl Engine for SimpEngine {
         let grid = &problem.grid;
         let n_cells = grid.n_cells();
         let params = problem.optimization;
+        let reduce = params.reduce;
+        // The evolutionary method shares the stage schedule below but not the
+        // update rule, and that rule is not in this build. Refused here rather
+        // than quietly run under the other one: a run that reported a method it
+        // did not use would be worse than no run.
+        if let Some(reduce) = reduce
+            && matches!(reduce.method, ReduceMethodParams::Beso { .. })
+        {
+            bail!(
+                "[optimization.reduce] method = \"{}\" is not implemented in this build; \
+                 method = \"{}\" is the one it has",
+                reduce.method.kind().label(),
+                ReduceMethod::Continuation.label()
+            );
+        }
 
         let design_cells: Vec<usize> = (0..n_cells)
             .filter(|&e| grid.cells[e] == CellKind::Design)
@@ -127,188 +179,422 @@ impl Engine for SimpEngine {
         let mut volume_fraction = 0.0;
         let mut max_change = f64::INFINITY;
         let mut iterations = 0;
-        // Nothing but running out of budget stops a loop that runs to its end,
-        // so that is what the reason is until something else happens.
-        let mut stop = StopReason::IterationCap;
         let mut shift_reported = false;
-        // A design variable change is read against how far the configured scheme
-        // was allowed to move one, so the watch is told which scheme is running.
-        let mut watch = StallWatch::new(params.update.move_limit());
+        // Why the stage below stopped. Assigned at the top of every stage, so a
+        // schedule reads the reason of the stage it is in rather than the one
+        // before it.
+        let mut stop;
 
-        for iteration in 1..=params.max_iterations {
-            // A stop inside the solve unwinds the whole iteration: it produced
-            // no compliance and no sensitivities, so it never happened. The
-            // design stays the one the last completed iteration left, which is
-            // what `work.printed` still holds.
-            let Some(value) = objective.evaluate(&x, &mut work, &mut dc, &mut solver, cancel)?
-            else {
-                stop = StopReason::Cancelled;
-                break;
+        // The reduction schedule of `[optimization.reduce]`. Without the table
+        // there is one stage, its volume target is `mass_fraction`, and
+        // everything below the stage bookkeeping is the loop this engine always
+        // ran - which is what keeps a plain run's trajectory the one it had.
+        // With the table, `mass_fraction` is where the schedule starts instead.
+        let mut stage_target = params.mass_fraction;
+        let mut stage_index = 0;
+        let mut stage_refine = false;
+        let mut stages: Vec<ReduceStage> = Vec::new();
+        // The lightest design that held the target safety factor, kept whole
+        // because the stages after it are free to be worse than it.
+        let mut kept: Option<Kept> = None;
+        // The bracket the refinement bisects: the lowest volume target that held
+        // the target safety factor, and the highest that did not. The schedule
+        // descends, so the failing one is the lower of the two.
+        let (mut passing_target, mut failing_target) = (None, None);
+        let mut refinements_left = reduce.map_or(0, |r| r.refine_stages);
+
+        loop {
+            stage_index += 1;
+            let stage_start = iterations;
+            let mut stage_iterations = 0;
+            let progress = reduce.map(|_| ReduceProgress {
+                stage: stage_index,
+                target_fraction: stage_target,
+                completed: stages.len(),
+            });
+            // Which stage a note belongs to, and nothing at all on a run without
+            // a schedule - whose notes are then the ones it always printed.
+            let stage_prefix = match reduce {
+                Some(_) => format!("reduce stage {stage_index}: "),
+                None => String::new(),
             };
-            iterations = iteration;
-            compliance = value.compliance;
+            // A design variable change is read against how far the configured
+            // scheme was allowed to move one, so the watch is told which scheme
+            // is running. It is built per stage: settling is a question about
+            // one volume target, and the window that answers it holds the
+            // iterations taken at that target alone.
+            let mut watch = StallWatch::new(params.update.move_limit());
+            // Nothing but running out of budget stops a loop that runs to its
+            // end, so that is what the reason is until something else happens.
+            stop = StopReason::IterationCap;
 
-            // The volume sensitivity is the chain transpose of a unit field. It
-            // only moves with the design when the chain is nonlinear, which is
-            // what the overhang filter makes it.
-            if iteration == 1 || !chain.is_linear() {
-                objective.volume_sensitivity(&mut work, &design_cells, &mut dv);
-            }
-            // The local cap's is recomputed every iteration unconditionally: the
-            // p-mean that aggregates it is nonlinear in the design itself, so it
-            // moves even where the chain above does not.
-            let mut worst_local_fraction = None;
-            let mut local_residual = None;
-            if let Some(cap) = local.as_mut() {
-                worst_local_fraction = Some(cap.measure(&work.printed, &design_cells).worst);
-                cap.sensitivity(
-                    &chain,
-                    &work.filtered,
-                    &work.printed,
-                    &design_cells,
-                    &mut dg,
-                );
-                local_residual = Some(cap.residual());
-            }
+            for iteration in 1..=params.max_iterations {
+                // A stop inside the solve unwinds the whole iteration: it produced
+                // no compliance and no sensitivities, so it never happened. The
+                // design stays the one the last completed iteration left, which is
+                // what `work.printed` still holds.
+                let Some(value) =
+                    objective.evaluate(&x, &mut work, &mut dc, &mut solver, cancel)?
+                else {
+                    stop = StopReason::Cancelled;
+                    break;
+                };
+                stage_iterations = iteration;
+                iterations = stage_start + iteration;
+                compliance = value.compliance;
 
-            let constraint = Constraint {
-                design_cells: &design_cells,
-                target_volume_fraction: params.mass_fraction,
-                chain: &chain,
-                local: local_residual.map(|value| LocalConstraint {
-                    value,
-                    gradient: &dg,
-                    current_volume_fraction: design_mean(&work.printed, &design_cells),
-                }),
-            };
+                // The volume sensitivity is the chain transpose of a unit field. It
+                // only moves with the design when the chain is nonlinear, which is
+                // what the overhang filter makes it.
+                if iteration == 1 || !chain.is_linear() {
+                    objective.volume_sensitivity(&mut work, &design_cells, &mut dv);
+                }
+                // The local cap's is recomputed every iteration unconditionally: the
+                // p-mean that aggregates it is nonlinear in the design itself, so it
+                // moves even where the chain above does not.
+                let mut worst_local_fraction = None;
+                let mut local_residual = None;
+                if let Some(cap) = local.as_mut() {
+                    worst_local_fraction = Some(cap.measure(&work.printed, &design_cells).worst);
+                    cap.sensitivity(
+                        &chain,
+                        &work.filtered,
+                        &work.printed,
+                        &design_cells,
+                        &mut dg,
+                    );
+                    local_residual = Some(cap.residual());
+                }
 
-            let mut step = updater.update(
-                &x,
-                &dc,
-                &dv,
-                &constraint,
-                Buffers {
-                    x_new: &mut x_new,
-                    filtered: &mut work.filtered,
-                    printed: &mut work.printed,
-                },
-            )?;
-            // The guide's floor goes on here, before anything reads the step: it
-            // is the design the next iteration will analyse, so it is the design
-            // the reporter, the live density field and the stall watch have to
-            // see. Outside the hold window this is the step exactly as it came.
-            if let Some(wire) = &wireframe {
-                step = wire.hold(
-                    iteration,
+                let constraint = Constraint {
+                    design_cells: &design_cells,
+                    target_volume_fraction: stage_target,
+                    chain: &chain,
+                    local: local_residual.map(|value| LocalConstraint {
+                        value,
+                        gradient: &dg,
+                        current_volume_fraction: design_mean(&work.printed, &design_cells),
+                    }),
+                };
+
+                let mut step = updater.update(
                     &x,
-                    step,
+                    &dc,
+                    &dv,
                     &constraint,
                     Buffers {
                         x_new: &mut x_new,
                         filtered: &mut work.filtered,
                         printed: &mut work.printed,
                     },
-                    reporter,
-                );
-            }
-            max_change = step.max_change;
-            volume_fraction = step.volume_fraction;
-            if iteration == 1 {
-                initial_compliance = compliance;
-            }
-            if step.shift > 0.0 && !shift_reported {
-                shift_reported = true;
-                reporter.note(&format!(
-                    "iteration {iteration}: a design dependent load made some sensitivities \
-                     positive; the optimality criteria step is running with the self-weight \
-                     sensitivity shift from here on"
-                ));
-            }
-
-            let stats = IterationStats {
-                iteration,
-                compliance,
-                volume_fraction,
-                worst_local_fraction,
-                max_change,
-                cg_iterations: value.cg_iterations,
-                elapsed_s: start.elapsed().as_secs_f64(),
-                growth: None,
-                reduce: None,
-            };
-            reporter.iteration(&stats);
-            // `work.printed` holds the physical densities of the trial design
-            // the update step just accepted, which is exactly what a live
-            // preview should show.
-            reporter.densities(&stats, &work.printed);
-
-            x.copy_from_slice(&x_new);
-            // Checked here rather than at the top of the loop so that a
-            // cancelled run always has at least one finished iteration behind
-            // it, and therefore a physical density field that means something.
-            if reporter.cancelled() {
-                stop = StopReason::Cancelled;
-                break;
-            }
-            // Both verdicts about a settling design wait for the guide's floor to
-            // come off. Under the floor the design is not free: the change an
-            // iteration reports is partly the floor pushing its cells back up, so
-            // a change below the tolerance is not the design arriving, and a
-            // window of held iterations would be a verdict about the guide rather
-            // than about the problem. The watch is not fed either, so its window
-            // holds free iterations alone and starts filling at the release -
-            // which keeps the window meaning what its constant says it means even
-            // when the hold is longer than one. Nothing but the iteration cap and
-            // a cancellation can therefore end a run while the wire is forced,
-            // and both of those say so below.
-            if wireframe.as_ref().is_none_or(|wire| !wire.holds(iteration)) {
-                if max_change < params.convergence_tol {
-                    stop = StopReason::Converged;
+                )?;
+                // The guide's floor goes on here, before anything reads the step: it
+                // is the design the next iteration will analyse, so it is the design
+                // the reporter, the live density field and the stall watch have to
+                // see. Outside the hold window this is the step exactly as it came.
+                if let Some(wire) = &wireframe {
+                    step = wire.hold(
+                        iteration,
+                        &x,
+                        step,
+                        &constraint,
+                        Buffers {
+                            x_new: &mut x_new,
+                            filtered: &mut work.filtered,
+                            printed: &mut work.printed,
+                        },
+                        reporter,
+                    );
+                }
+                max_change = step.max_change;
+                volume_fraction = step.volume_fraction;
+                // The first iteration of the run, not of the stage: what the
+                // compliance of the design the run was handed was.
+                if iterations == 1 {
+                    initial_compliance = compliance;
+                }
+                if step.shift > 0.0 && !shift_reported {
+                    shift_reported = true;
                     reporter.note(&format!(
-                        "converged after {iteration} iterations (max change {max_change:.5} < \
-                         {:.5})",
-                        params.convergence_tol
+                        "iteration {iteration}: a design dependent load made some sensitivities \
+                         positive; the optimality criteria step is running with the self-weight \
+                         sensitivity shift from here on"
                     ));
+                }
+
+                let stats = IterationStats {
+                    iteration,
+                    compliance,
+                    volume_fraction,
+                    worst_local_fraction,
+                    max_change,
+                    cg_iterations: value.cg_iterations,
+                    elapsed_s: start.elapsed().as_secs_f64(),
+                    growth: None,
+                    reduce: progress,
+                };
+                reporter.iteration(&stats);
+                // `work.printed` holds the physical densities of the trial design
+                // the update step just accepted, which is exactly what a live
+                // preview should show.
+                reporter.densities(&stats, &work.printed);
+
+                x.copy_from_slice(&x_new);
+                // Checked here rather than at the top of the loop so that a
+                // cancelled run always has at least one finished iteration behind
+                // it, and therefore a physical density field that means something.
+                if reporter.cancelled() {
+                    stop = StopReason::Cancelled;
                     break;
                 }
-                // Asked after the convergence test, never before it: settling is
-                // the good outcome and a run that has just settled is not
-                // stalled, whatever its window looks like.
-                if watch.observe(Sample {
-                    compliance,
-                    max_change,
-                }) {
-                    stop = StopReason::Stalled;
-                    reporter.note(&stall_note(
-                        iteration,
+                // Both verdicts about a settling design wait for the guide's floor to
+                // come off. Under the floor the design is not free: the change an
+                // iteration reports is partly the floor pushing its cells back up, so
+                // a change below the tolerance is not the design arriving, and a
+                // window of held iterations would be a verdict about the guide rather
+                // than about the problem. The watch is not fed either, so its window
+                // holds free iterations alone and starts filling at the release -
+                // which keeps the window meaning what its constant says it means even
+                // when the hold is longer than one. Nothing but the iteration cap and
+                // a cancellation can therefore end a run while the wire is forced,
+                // and both of those say so below.
+                if wireframe.as_ref().is_none_or(|wire| !wire.holds(iteration)) {
+                    if max_change < params.convergence_tol {
+                        stop = StopReason::Converged;
+                        reporter.note(&format!(
+                            "{stage_prefix}converged after {iteration} iterations (max change \
+                             {max_change:.5} < {:.5})",
+                            params.convergence_tol
+                        ));
+                        break;
+                    }
+                    // Asked after the convergence test, never before it: settling is
+                    // the good outcome and a run that has just settled is not
+                    // stalled, whatever its window looks like.
+                    if watch.observe(Sample {
+                        compliance,
                         max_change,
-                        params.convergence_tol,
-                        params.update,
-                        params.local_volume.is_some(),
-                    ));
+                    }) {
+                        stop = StopReason::Stalled;
+                        reporter.note(&format!(
+                            "{stage_prefix}{}",
+                            stall_note(
+                                iteration,
+                                max_change,
+                                params.convergence_tol,
+                                params.update,
+                                params.local_volume.is_some(),
+                            )
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            match stop {
+                StopReason::Cancelled => {
+                    // Zero completed iterations is reachable now that a stop is
+                    // honoured inside a solve: there is no max change to quote
+                    // for an iteration that never produced one.
+                    reporter.note(&match iterations {
+                        0 => {
+                            "cancelled inside the first iteration; nothing was computed".to_string()
+                        }
+                        n => format!("cancelled after {n} iterations (max change {max_change:.5})"),
+                    });
+                }
+                StopReason::IterationCap => reporter.note(&format!(
+                    "{stage_prefix}stopped at the iteration cap of {} (max change \
+                     {max_change:.5})",
+                    params.max_iterations
+                )),
+                // Both of these announced themselves where they happened, with
+                // the iteration they happened on, and a schedule that ran out of
+                // stages says what it exported in its own summary.
+                StopReason::Converged | StopReason::Stalled | StopReason::ReduceComplete => {}
+            }
+
+            // Everything below is the schedule's. A run without one is the run
+            // that just finished.
+            let Some(reduce) = reduce else { break };
+            if stop == StopReason::Cancelled {
+                break;
+            }
+
+            // The stage's verdict. The connectivity gate goes first: a design
+            // whose loads reach no support through material drives a system no
+            // conjugate gradient will resolve, and the flood fill answers that
+            // for the price of a pass over the grid rather than of a solve.
+            let broken = stress::broken_load_paths(problem, &work.printed);
+            let safety_factor = if broken.is_empty() {
+                match stress::analyse_with_solver(
+                    problem,
+                    &work.printed,
+                    StressLimits::default(),
+                    &mut solver,
+                    cancel,
+                )? {
+                    Some(StressOutcome::Available(report)) => {
+                        let factor = report.worst_safety_factor();
+                        // A report with no factor in it: this design has no peak
+                        // von Mises stress to divide the yield strength by. The
+                        // stage fails like any other unmeasured one, and says
+                        // which way it was unmeasurable rather than leaving an
+                        // `n/a` to be read as a solve that went wrong.
+                        if factor.is_none() {
+                            reporter.note(&format!(
+                                "{stage_prefix}no safety factor for this stage: {} of its \
+                                 elements reach the stress report's density threshold of {:.2}, \
+                                 so it has no peak stress to measure",
+                                report.evaluated_cells, report.density_threshold
+                            ));
+                        }
+                        factor
+                    }
+                    // A stage nobody could measure did not hold the target: the
+                    // schedule is a claim about the design it exports, and an
+                    // unmeasured design cannot carry one.
+                    Some(StressOutcome::Unavailable(reason)) => {
+                        reporter.note(&format!(
+                            "{stage_prefix}no safety factor for this stage: {reason}"
+                        ));
+                        None
+                    }
+                    // Called off inside one of the stage's load case solves.
+                    // Nothing is exported from a cancelled run, so there is no
+                    // schedule to finish either.
+                    None => {
+                        stop = StopReason::Cancelled;
+                        reporter.note(&format!(
+                            "{stage_prefix}cancelled inside the stress report of the stage"
+                        ));
+                        break;
+                    }
+                }
+            } else {
+                reporter.note(&format!("{stage_prefix}{}", broken.join("; ")));
+                None
+            };
+            let passed = safety_factor.is_some_and(|f| f >= reduce.target_safety_factor);
+
+            let record = ReduceStage {
+                index: stage_index,
+                target_fraction: stage_target,
+                achieved_fraction: volume_fraction,
+                iterations: stage_iterations,
+                safety_factor,
+                passed,
+                refine: stage_refine,
+            };
+            let mut note = reduce_stage_note(&record);
+            // A stage that failed while it was still moving may have run out of
+            // budget rather than out of material, and the two are worth telling
+            // apart before the schedule's verdict is believed.
+            if !passed && stop == StopReason::IterationCap {
+                note.push_str(
+                    "; the stage stopped at the iteration cap, so raising max_iterations may be \
+                     what it needs",
+                );
+            }
+            reporter.note(&note);
+            stages.push(record);
+
+            if passed {
+                // Every stage the schedule runs after this one is lighter, so
+                // this can only ever be an improvement; comparing anyway is what
+                // makes "the lightest design that held" a property of the code
+                // rather than of the schedule that fed it.
+                if kept
+                    .as_ref()
+                    .is_none_or(|held| volume_fraction < held.volume_fraction)
+                {
+                    kept = Some(Kept {
+                        printed: work.printed.clone(),
+                        filtered: work.filtered.clone(),
+                        volume_fraction,
+                        compliance,
+                        max_change,
+                        stage: record,
+                    });
+                }
+                passing_target = Some(stage_target);
+            } else {
+                failing_target = Some(stage_target);
+                // The first stage is the fraction the run started from, solid
+                // unless the file said otherwise. Nothing lighter can hold a
+                // target that one missed, so there is no bracket to bisect and
+                // nothing left to look for: the schedule stops, exports the
+                // design it started from, and warns in its summary that it did.
+                if passing_target.is_none() {
                     break;
+                }
+            }
+
+            match (passing_target, failing_target) {
+                // The bracket is closed, so every stage from here bisects it -
+                // as many of them as `refine_stages` asked for and no more,
+                // because each one is a whole re-converged design and a whole
+                // stress report.
+                (Some(pass), Some(fail)) => {
+                    if refinements_left == 0 {
+                        break;
+                    }
+                    refinements_left -= 1;
+                    stage_refine = true;
+                    stage_target = (pass + fail) / 2.0;
+                }
+                // Still descending. The floor is a stage of its own - it is
+                // asked for like any other - and a schedule that reaches it and
+                // still holds the target has nowhere left to go.
+                _ => {
+                    if stage_target <= reduce.min_mass_fraction {
+                        break;
+                    }
+                    stage_target = (stage_target * reduce.ratio).max(reduce.min_mass_fraction);
                 }
             }
         }
 
-        match stop {
-            StopReason::Cancelled => {
-                // Zero completed iterations is reachable now that a stop is
-                // honoured inside a solve: there is no max change to quote for
-                // an iteration that never produced one.
-                reporter.note(&match iterations {
-                    0 => "cancelled inside the first iteration; nothing was computed".to_string(),
-                    n => format!("cancelled after {n} iterations (max change {max_change:.5})"),
-                });
-            }
-            StopReason::IterationCap => reporter.note(&format!(
-                "stopped at the iteration cap of {} (max change {max_change:.5})",
-                params.max_iterations
-            )),
-            // Both of these announced themselves where they happened, with the
-            // iteration they happened on, and a schedule that ran out of stages
-            // says what it exported in its own summary.
-            StopReason::Converged | StopReason::Stalled | StopReason::ReduceComplete => {}
+        // What the schedule decided, and the design it decided on. A cancelled
+        // run has neither: nothing is exported from one, so there is no stage to
+        // report as the one that shipped.
+        let mut reduce_summary = None;
+        if let Some(reduce) = reduce
+            && stop != StopReason::Cancelled
+        {
+            let exported = match kept {
+                // The design in the file is the lightest stage that held the
+                // target, and the numbers that describe it are that stage's
+                // rather than those of the last stage the loop happened to run.
+                // The filtered field travels with the printed one so that the
+                // overhang residual below is measured on the design that
+                // shipped, not across two stages.
+                Some(held) => {
+                    work.printed = held.printed;
+                    work.filtered = held.filtered;
+                    volume_fraction = held.volume_fraction;
+                    compliance = held.compliance;
+                    max_change = held.max_change;
+                    held.stage
+                }
+                // No stage held the target, which can only be the first one: the
+                // run exports the design it started from, which is what the
+                // workspace still holds.
+                None => *stages.first().expect("a finished schedule ran a stage"),
+            };
+            stop = StopReason::ReduceComplete;
+            let summary = ReduceSummary {
+                method: reduce.method.kind(),
+                target_safety_factor: reduce.target_safety_factor,
+                exported,
+                stages,
+                // Measured by `crate::complete`, on the field the `[output]`
+                // passes leave: the schedule ends here, and those passes have
+                // not run yet.
+                finished_safety_factor: None,
+            };
+            reporter.note(&reduce_summary_note(&summary));
+            reduce_summary = Some(summary);
         }
 
         // A run that ended inside the hold window ended on a design the optimizer
@@ -356,7 +642,7 @@ impl Engine for SimpEngine {
             stop,
             overhang_residual,
             growth: None,
-            reduce: None,
+            reduce: reduce_summary,
         })
     }
 }
@@ -1676,5 +1962,252 @@ vector = [0.0, 0.0, -200.0]
             field.volume_fraction
         );
         assert!(field.compliance.is_finite() && field.compliance > 0.0);
+    }
+
+    /// The tiny cantilever under a reduction schedule. `mass_fraction` is gone
+    /// from it, so the run starts solid and the schedule alone decides what
+    /// fraction comes out.
+    fn reducing(keys: &str) -> String {
+        tiny(&format!("[optimization.reduce]\n{keys}")).replace("mass_fraction = 0.4\n", "")
+    }
+
+    /// A reporter that keeps the notes and which stage every progress line said
+    /// it belonged to.
+    #[derive(Default)]
+    struct Staged {
+        stages: std::sync::Mutex<Vec<Option<ReduceProgress>>>,
+        notes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Reporter for Staged {
+        fn iteration(&self, stats: &IterationStats) {
+            self.stages.lock().expect("trace").push(stats.reduce);
+        }
+        fn note(&self, message: &str) {
+            self.notes.lock().expect("trace").push(message.to_string());
+        }
+    }
+
+    /// Run a reduction schedule and take back the field it exported, the stage
+    /// every progress line belonged to, and the notes it said.
+    fn reduce_run(keys: &str) -> (DensityField, Vec<Option<ReduceProgress>>, Vec<String>) {
+        let config = Config::parse(&reducing(keys)).expect("parse");
+        let problem = Problem::build(&config, &PathBuf::from(".")).expect("build");
+        let reporter = Staged::default();
+        let field = SimpEngine.optimize(&problem, &reporter).expect("optimize");
+        (
+            field,
+            reporter.stages.into_inner().expect("trace"),
+            reporter.notes.into_inner().expect("trace"),
+        )
+    }
+
+    /// The schedule a table asks for: the fraction the run starts from, then
+    /// `ratio` of the stage before, clamped at the floor - and a stage that
+    /// reaches the floor still holding the target is the last one, because there
+    /// is nowhere below it to go.
+    #[test]
+    fn a_reduction_descends_by_the_ratio_and_stops_at_the_floor() {
+        let (field, lines, notes) = reduce_run(
+            "target_safety_factor = 1.01\nratio = 0.8\nmin_mass_fraction = 0.6\n\
+             refine_stages = 0\n",
+        );
+        assert_eq!(field.stop, StopReason::ReduceComplete);
+        let summary = field.reduce.expect("a schedule");
+        let targets: Vec<f64> = summary.stages.iter().map(|s| s.target_fraction).collect();
+        // 1.0, then 0.8 of each in turn, and 0.512 clamped up to the floor.
+        let expected = [1.0, 0.8, 0.64, 0.6];
+        assert_eq!(targets.len(), expected.len(), "{targets:?}");
+        for (got, want) in targets.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-9, "{targets:?}");
+        }
+        assert!(
+            summary.stages.iter().all(|s| s.passed && !s.refine),
+            "nothing here should fail or refine: {:?}",
+            summary.stages
+        );
+        assert_eq!(summary.exported.index, summary.stages.len());
+        assert!(!summary.missed_the_target());
+        // Every progress line says which stage it belongs to and what that stage
+        // is driving to.
+        let seen: Vec<ReduceProgress> = lines
+            .iter()
+            .map(|line| line.expect("a stage on every line"))
+            .collect();
+        for line in &seen {
+            let record = summary.stages[line.stage - 1];
+            assert_eq!(record.index, line.stage);
+            assert!((line.target_fraction - record.target_fraction).abs() < 1e-12);
+            assert_eq!(line.completed, line.stage - 1);
+        }
+        assert_eq!(seen.first().expect("a line").stage, 1);
+        assert_eq!(seen.last().expect("a line").stage, summary.stages.len());
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("reduce stage 4: target")),
+            "{notes:?}"
+        );
+    }
+
+    /// A target no design of this domain can hold fails the fraction the run
+    /// started from - solid here - and that is what it exports, under a warning
+    /// that does not tell a solid design to find more material.
+    #[test]
+    fn an_unreachable_target_exports_the_solid_start_with_a_warning() {
+        let (field, _, notes) = reduce_run("target_safety_factor = 1e6\n");
+        assert_eq!(field.stop, StopReason::ReduceComplete);
+        assert_eq!(field.volume_fraction, 1.0);
+        assert!(field.densities.iter().all(|d| *d == 1.0), "not solid");
+        let summary = field.reduce.expect("a schedule");
+        assert_eq!(summary.stages.len(), 1, "{:?}", summary.stages);
+        assert_eq!(summary.exported.index, 1);
+        assert!(!summary.exported.passed && summary.missed_the_target());
+        assert_eq!(summary.exported.achieved_fraction, 1.0);
+        // The stage was measured, so the schedule failed it on the number rather
+        // than on the geometry.
+        assert!(summary.exported.safety_factor.is_some());
+        let warning = notes
+            .iter()
+            .find(|n| n.starts_with("warning: [optimization.reduce]"))
+            .expect("a warning");
+        assert!(warning.contains("no stage held the target"), "{warning}");
+        assert!(warning.contains("the design is already solid"), "{warning}");
+    }
+
+    /// The ordinary outcome: a stage holds the target, a lighter one does not,
+    /// the bracket between them is bisected, and what comes out is the lightest
+    /// design that held - lighter than the fraction the run started from.
+    #[test]
+    fn a_reachable_target_exports_a_design_lighter_than_the_start() {
+        let (field, _, notes) = reduce_run(
+            "target_safety_factor = 3.0\nratio = 0.5\nmin_mass_fraction = 0.1\n\
+             refine_stages = 1\n",
+        );
+        assert_eq!(field.stop, StopReason::ReduceComplete);
+        let summary = field.reduce.expect("a schedule");
+        let exported = summary.exported;
+        assert!(exported.passed && !summary.missed_the_target());
+        assert!(
+            exported.achieved_fraction < 1.0,
+            "the schedule exported the start: {exported:?}"
+        );
+        assert!(exported.safety_factor.expect("a factor") >= summary.target_safety_factor);
+        // The field is the exported stage's, not the last stage the loop ran.
+        assert!((field.volume_fraction - exported.achieved_fraction).abs() < 1e-12);
+        assert!(
+            field.iterations
+                == summary
+                    .stages
+                    .iter()
+                    .map(|stage| stage.iterations)
+                    .sum::<usize>(),
+            "the run's iterations are the schedule's: {:?}",
+            summary.stages
+        );
+        // The stage after the first failure is a bisection of the bracket around
+        // it, and it is recorded as one.
+        let first_fail = summary
+            .stages
+            .iter()
+            .position(|stage| !stage.passed)
+            .expect("a stage that failed");
+        let refined = summary.stages[first_fail + 1];
+        assert!(refined.refine, "{refined:?}");
+        let bracket = (
+            summary.stages[first_fail - 1].target_fraction,
+            summary.stages[first_fail].target_fraction,
+        );
+        assert!(
+            (refined.target_fraction - (bracket.0 + bracket.1) / 2.0).abs() < 1e-12,
+            "{refined:?} does not bisect {bracket:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("(refinement)")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("reduce: exported stage") && n.contains(">=")),
+            "{notes:?}"
+        );
+    }
+
+    /// A stage that failed on the budget rather than on the material says which
+    /// it was, and every verdict a stage reaches names the stage it belongs to.
+    #[test]
+    fn a_capped_failing_stage_names_the_cap_and_every_verdict_names_its_stage() {
+        let (_, _, notes) = reduce_run(
+            "target_safety_factor = 3.0\nratio = 0.5\nmin_mass_fraction = 0.1\n\
+             refine_stages = 0\n",
+        );
+        // No verdict of a stage is said without the stage it belongs to.
+        for note in &notes {
+            if note.contains("converged after") || note.contains("stopped at the iteration cap of")
+            {
+                assert!(note.starts_with("reduce stage "), "{note}");
+            }
+        }
+        const CAP: &str = "the stage stopped at the iteration cap, so raising max_iterations may \
+                           be what it needs";
+        let capped: Vec<&String> = notes.iter().filter(|note| note.contains(CAP)).collect();
+        assert!(!capped.is_empty(), "no capped stage failed: {notes:?}");
+        // Only a stage that failed carries it: a stage that held the target was
+        // asked for nothing more, whatever stopped it.
+        for note in capped {
+            assert!(note.contains(", fail"), "{note}");
+        }
+        assert!(
+            notes
+                .iter()
+                .filter(|note| note.contains(", pass"))
+                .all(|note| !note.contains(CAP)),
+            "{notes:?}"
+        );
+    }
+
+    /// The stage records reach the report the run writes beside the part.
+    #[test]
+    fn the_schedule_reaches_the_stress_report_json() {
+        let config = Config::parse(&reducing(
+            "target_safety_factor = 3.0\nratio = 0.5\nrefine_stages = 0\n",
+        ))
+        .expect("parse");
+        let problem = Problem::build(&config, &PathBuf::from(".")).expect("build");
+        let field = SimpEngine
+            .optimize(&problem, &SilentReporter)
+            .expect("optimize");
+        let summary = field.reduce.expect("a schedule");
+        let report = crate::stress::analyse(&problem, &field.densities).expect("a stress report");
+        let json = crate::stress::to_json(&problem, &report, Some(&summary));
+        assert!(json.contains("\"reduce\": {"), "{json}");
+        assert!(
+            json.contains(&format!("\"exported_stage\": {}", summary.exported.index)),
+            "{json}"
+        );
+        assert_eq!(
+            json.matches("\"target_fraction\"").count(),
+            summary.stages.len()
+        );
+        assert!(json.contains("\"method\": \"continuation\""), "{json}");
+    }
+
+    /// The evolutionary method shares the schedule but not the update rule, and
+    /// that rule is not in this build: the run refuses rather than reporting a
+    /// method it did not use.
+    #[test]
+    fn the_evolutionary_method_is_refused_by_the_engine() {
+        let config = Config::parse(&reducing("target_safety_factor = 2.0\nmethod = \"beso\"\n"))
+            .expect("parse");
+        let problem = Problem::build(&config, &PathBuf::from(".")).expect("build");
+        let error = SimpEngine
+            .optimize(&problem, &SilentReporter)
+            .expect_err("the evolutionary method is not built");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("beso") && text.contains("not implemented in this build"),
+            "{text}"
+        );
     }
 }
