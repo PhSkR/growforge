@@ -688,6 +688,18 @@ impl Engine for SimpEngine {
             ));
         }
 
+        // What the run's changes of hands added up to. The notes as they
+        // happened say when the CPU took over and when the device came back;
+        // this says how much of the run the CPU carried, once, at the end.
+        let on_the_cpu = solver.cpu_fallbacks();
+        if on_the_cpu > 0 {
+            reporter.note(&format!(
+                "{on_the_cpu} linear solve{} of this run ran on the CPU rather than on the \
+                 compute device",
+                if on_the_cpu == 1 { "" } else { "s" }
+            ));
+        }
+
         // The printed densities of the final design variables are already in
         // the workspace, because every update step pushes its own trial point
         // through the chain.

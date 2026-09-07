@@ -1303,6 +1303,29 @@ pub const ELEMENT_COLORS: usize = 8;
 /// do, and 32 is the middle of that range.
 pub const CG_CANCEL_CHECK_INTERVAL: usize = 32;
 
+/// Solves the CPU takes before a compute device that refused one is asked
+/// again.
+///
+/// What a device refuses a solve for is transient by nature - another program
+/// holding its memory, a reset it is coming back from - so the first wait is
+/// the shortest one that is still a wait: the device gets its next chance one
+/// solve later, and a momentary refusal costs the run that one solve rather
+/// than the rest of the run. What stops this from being a device tried and
+/// failed on every solve of an hour is that the wait doubles, up to
+/// [`DEVICE_RETRY_MAX_SOLVES`].
+pub const DEVICE_RETRY_INITIAL_SOLVES: usize = 1;
+
+/// Longest that wait grows to, doubling on every refusal that repeats.
+///
+/// An attempt at a device that is still refusing costs the upload before it and
+/// the failed allocation that ends it, so a card taken for the rest of the run
+/// has to stop being asked. Sixty-four solves is about thirty optimization
+/// iterations of a two load case problem - minutes on the runs a device is worth
+/// having at all - so a card that is given back at any point in a run of
+/// hundreds of iterations is picked up again within a few of them, and one that
+/// is never given back is asked a handful of times rather than thousands.
+pub const DEVICE_RETRY_MAX_SOLVES: usize = 64;
+
 // ---------------------------------------------------------------------------
 // GPU conjugate gradient
 // ---------------------------------------------------------------------------

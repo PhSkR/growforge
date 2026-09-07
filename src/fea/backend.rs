@@ -15,6 +15,8 @@
 use anyhow::Result;
 
 use crate::config::SolverBackend;
+#[cfg(feature = "gpu")]
+use crate::constants::{DEVICE_RETRY_INITIAL_SOLVES, DEVICE_RETRY_MAX_SOLVES};
 use crate::fea::{Solve, SolveLimits, StiffnessOperator, solver};
 use crate::problem::Problem;
 
@@ -32,6 +34,10 @@ pub struct LinearSolver {
     /// through a run is the same machine that could have failed to open, and
     /// the answer to it is the same one.
     may_fall_back: bool,
+    /// Whether the device is taking work, and when to ask it again if it is
+    /// not.
+    #[cfg(feature = "gpu")]
+    standby: DeviceStandby,
 }
 
 #[derive(Debug)]
@@ -51,6 +57,8 @@ impl LinearSolver {
             backend: Backend::Cpu,
             fallbacks: 0,
             may_fall_back: false,
+            #[cfg(feature = "gpu")]
+            standby: DeviceStandby::serving(),
         }
     }
 
@@ -109,6 +117,8 @@ impl LinearSolver {
             backend,
             fallbacks: 0,
             may_fall_back: false,
+            #[cfg(feature = "gpu")]
+            standby: DeviceStandby::serving(),
         })
     }
 
@@ -131,8 +141,8 @@ impl LinearSolver {
     }
 
     /// How many solves this solver has had to finish on the CPU: the ones
-    /// single precision could not resolve, and the ones the device itself would
-    /// not do.
+    /// single precision could not resolve, the ones the device itself would not
+    /// do, and the ones it was not asked to do while it waited out a refusal.
     ///
     /// Zero for a CPU backend, and zero for a GPU backend on every design the
     /// device can actually solve. A non-zero count is the machine-readable half
@@ -142,12 +152,29 @@ impl LinearSolver {
         self.fallbacks
     }
 
+    /// Whether the device is waiting out a refusal, in which case this solve is
+    /// the CPU's without the device being asked at all.
+    #[cfg(feature = "gpu")]
+    fn device_is_resting(&self) -> bool {
+        !self.standby.asks_the_device()
+    }
+
+    /// A build with no compute backend has no device to rest.
+    #[cfg(not(feature = "gpu"))]
+    fn device_is_resting(&self) -> bool {
+        false
+    }
+
     /// Bind the operator of one design, ready for its load cases.
     ///
     /// A device that will not take the design is the same event as one that
     /// fails a solve of it, and answered the same way: the load cases of this
     /// design run on the CPU when nobody named the device, and the error is the
     /// caller's when somebody did.
+    ///
+    /// A device that is waiting out an earlier refusal is not offered the
+    /// design at all, which is the same wait a solve keeps: see
+    /// [`DeviceStandby`].
     pub fn bind<'a>(
         &'a mut self,
         operator: &'a StiffnessOperator<'a>,
@@ -157,17 +184,30 @@ impl LinearSolver {
         let refused = match &mut self.backend {
             Backend::Cpu => false,
             #[cfg(feature = "gpu")]
-            Backend::Gpu(gpu) => match gpu.bind(operator, diagonal, fixed) {
-                Ok(()) => false,
-                Err(error) => {
-                    if !self.may_fall_back {
-                        report_device_failure(&error);
-                        return Err(error);
-                    }
-                    report_device_fallback(&error);
+            Backend::Gpu(gpu) => {
+                if !self.standby.asks_the_device() {
+                    // Waiting out a refusal: the design is not offered, and its
+                    // load cases are the CPU's exactly as a refused design's
+                    // are.
                     true
+                } else {
+                    match gpu.bind(operator, diagonal, fixed) {
+                        // A bind the device takes is not yet proof that it is
+                        // back: a design crossing the bus costs it a fraction
+                        // of what a solve does. The probe is the solve.
+                        Ok(()) => false,
+                        Err(error) => {
+                            if !self.may_fall_back {
+                                report_device_failure(&error);
+                                return Err(error);
+                            }
+                            let wait = self.standby.refused(self.fallbacks);
+                            report_device_fallback(&error, RefusedWork::Design, wait);
+                            true
+                        }
+                    }
                 }
-            },
+            }
         };
         Ok(BoundSolver {
             solver: self,
@@ -186,8 +226,9 @@ pub struct BoundSolver<'a> {
     operator: &'a StiffnessOperator<'a>,
     diagonal: &'a [f64],
     fixed: &'a [bool],
-    /// Set when the device would not take this design: what is on it is another
-    /// design's, so every load case of this one runs on the CPU.
+    /// Set when the device would not take this design, or was not asked for it
+    /// because it is waiting out an earlier refusal: what is on it is another
+    /// design's either way, so every load case of this one runs on the CPU.
     refused: bool,
 }
 
@@ -203,10 +244,14 @@ impl BoundSolver<'_> {
     /// passes [`SolveLimits::new`] - which is every command line path - is
     /// running the arithmetic it always ran.
     pub fn solve(&mut self, b: &[f64], x: &mut [f64], limits: SolveLimits<'_>) -> Result<Solve> {
-        if self.refused {
-            // The bind already said so, once. Every load case of this design is
-            // one more solve the CPU is doing.
+        if self.refused || self.solver.device_is_resting() {
+            // The bind already said so, once, or the device is waiting out a
+            // refusal and is not asked at all until the wait is over. Either
+            // way this load case is one more solve the CPU is doing, and one
+            // less of the wait.
             self.solver.fallbacks += 1;
+            #[cfg(feature = "gpu")]
+            self.solver.standby.waited();
             return self.on_the_cpu(b, x, limits);
         }
         match &mut self.solver.backend {
@@ -230,9 +275,12 @@ impl BoundSolver<'_> {
                     // a preference, and the answer is the one a machine with no
                     // adapter at all gets: the CPU does the work and the run
                     // goes on. Said in the device's own words, never the
-                    // arithmetic's - see [`report_device_fallback`].
+                    // arithmetic's - see [`report_device_fallback`] - and the
+                    // device is then left alone for a while rather than tried
+                    // again next solve: see [`DeviceStandby`].
                     Unfinished::Device => {
-                        report_device_fallback(&error);
+                        let wait = self.solver.standby.refused(self.solver.fallbacks);
+                        report_device_fallback(&error, RefusedWork::Solve, wait);
                         self.solver.fallbacks += 1;
                     }
                     // Named, and therefore an instruction: a run told to solve
@@ -243,7 +291,18 @@ impl BoundSolver<'_> {
                         return Err(error);
                     }
                 },
-                other => return other,
+                other => {
+                    // Work the device did is the only thing that ends a wait,
+                    // and an answer it handed back is not by itself work: see
+                    // [`device_did_the_work`]. A probe that did none leaves the
+                    // wait where it was, still due.
+                    if device_did_the_work(&other)
+                        && let Some(on_the_cpu) = self.solver.standby.served(self.solver.fallbacks)
+                    {
+                        report_device_return(on_the_cpu);
+                    }
+                    return other;
+                }
             },
         }
         self.on_the_cpu(b, x, limits)
@@ -296,6 +355,127 @@ fn unfinished(error: &anyhow::Error, may_fall_back: bool) -> Unfinished {
     }
 }
 
+/// Whether an answer from the device is proof that the device did arithmetic.
+///
+/// Three of [`crate::fea::gpu::GpuSolver`]'s returns never reach the card: a
+/// right hand side of zero, a warm start already inside the tolerance, and a
+/// stop taken before the first refinement pass. None of them says anything
+/// about a device that refused before, so none of them may end a wait - a
+/// cancelled run would otherwise announce that the device was back on its way
+/// out, and a design with nothing pulling on it would hand the next refusal the
+/// short first wait all over again. Only iterations the device ran count.
+#[cfg(feature = "gpu")]
+fn device_did_the_work(outcome: &Result<Solve>) -> bool {
+    matches!(outcome, Ok(Solve::Converged(solution)) if solution.iterations > 0)
+}
+
+/// Whether the compute device is taking work, and when to ask it again if it is
+/// not.
+///
+/// A device that refuses one solve is usually about to refuse the next: what
+/// takes its memory - another program's job, a reset it is coming back from -
+/// outlasts one solve of a run. Asking it every solve therefore buys nothing and
+/// costs an upload and a failed allocation each time, while never asking it
+/// again hands an hours-long run to the CPU over a few seconds of pressure. So
+/// it is left alone for a while, and the while doubles every time it refuses
+/// again: [`DEVICE_RETRY_INITIAL_SOLVES`] solves, then twice that, up to
+/// [`DEVICE_RETRY_MAX_SOLVES`].
+///
+/// The wait is counted in solves rather than in seconds because a solve is what
+/// the state is about: it is the unit the run spends, it is what a wasted
+/// attempt costs, and it is countable in a test without a clock.
+#[cfg(feature = "gpu")]
+#[derive(Debug)]
+struct DeviceStandby {
+    state: DeviceState,
+    /// The run's count of solves the CPU has taken ([`LinearSolver::fallbacks`])
+    /// at the moment the device stopped serving, so what a wait cost is read off
+    /// the one counter that holds it rather than tallied a second time here.
+    since: usize,
+}
+
+/// The two states a device is in.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceState {
+    /// Every solve is offered to the device.
+    Serving,
+    /// The device refused, and is not asked again until `solves_left` more
+    /// solves have run on the CPU. At zero the next solve is the probe: the
+    /// device is asked, and either it serves again or it rests for `next_wait`.
+    Resting {
+        solves_left: usize,
+        next_wait: usize,
+    },
+}
+
+#[cfg(feature = "gpu")]
+impl DeviceStandby {
+    /// A device nothing is known against.
+    fn serving() -> DeviceStandby {
+        DeviceStandby {
+            state: DeviceState::Serving,
+            since: 0,
+        }
+    }
+
+    /// Whether this piece of work is offered to the device: always while it is
+    /// serving, and once a wait is out as the probe that ends it.
+    fn asks_the_device(&self) -> bool {
+        matches!(
+            self.state,
+            DeviceState::Serving | DeviceState::Resting { solves_left: 0, .. }
+        )
+    }
+
+    /// One solve the CPU took while the device rests, which is one less of the
+    /// wait. Nothing while the device is serving: there is no wait to shorten.
+    fn waited(&mut self) {
+        if let DeviceState::Resting { solves_left, .. } = &mut self.state {
+            *solves_left = solves_left.saturating_sub(1);
+        }
+    }
+
+    /// The device refused what it was offered. Returns how many solves run on
+    /// the CPU before it is asked again, which is what the notice quotes.
+    ///
+    /// `cpu_solves` is the run's count before the refused piece of work reaches
+    /// the CPU, and is kept only on the refusal that starts a wait: a probe the
+    /// device refuses in turn lengthens the wait it is already in rather than
+    /// starting a new one.
+    fn refused(&mut self, cpu_solves: usize) -> usize {
+        let wait = match self.state {
+            DeviceState::Serving => {
+                self.since = cpu_solves;
+                DEVICE_RETRY_INITIAL_SOLVES
+            }
+            DeviceState::Resting { next_wait, .. } => next_wait,
+        };
+        self.state = DeviceState::Resting {
+            solves_left: wait,
+            next_wait: (wait * 2).min(DEVICE_RETRY_MAX_SOLVES),
+        };
+        wait
+    }
+
+    /// The device did the work. Returns the solves the CPU took in the meantime
+    /// when this ended a wait, and nothing when the device was serving anyway.
+    ///
+    /// A wait that ends leaves nothing behind it: a device that is working again
+    /// gets the short first wait if it ever stops again, because what refused
+    /// before was the state the machine was in rather than the card itself.
+    fn served(&mut self, cpu_solves: usize) -> Option<usize> {
+        match self.state {
+            DeviceState::Serving => None,
+            DeviceState::Resting { .. } => {
+                let waited = cpu_solves.saturating_sub(self.since);
+                *self = DeviceStandby::serving();
+                Some(waited)
+            }
+        }
+    }
+}
+
 /// Say that a solve the compute device could not finish was finished on the
 /// CPU, and why.
 ///
@@ -326,22 +506,69 @@ fn report_single_precision_fallback(error: &anyhow::Error) {
 /// device; this one says the device was in no state to do arithmetic at all -
 /// something else on the machine has its memory, or it has gone away. What a
 /// user does about the two could not be less alike, so they are never said in
-/// the same words. Once per process with the advice and one line each after it,
-/// exactly as the notice above: a card with nothing left answers every later
-/// solve the same way, and a wall of identical lines would bury the first.
+/// the same words.
+///
+/// Once per refusal *event* rather than once per solve or once per process: the
+/// run's whereabouts change here, [`DeviceStandby`] keeps them changed for the
+/// whole of a wait that doubles, and a line per CPU solve would bury that under
+/// a wall of identical ones. The advice goes with the first event only, because
+/// it does not change.
+///
+/// What the CPU takes on differs with what was refused, so the two are said
+/// apart: see [`RefusedWork`].
 #[cfg(feature = "gpu")]
-fn report_device_fallback(error: &anyhow::Error) {
+fn report_device_fallback(error: &anyhow::Error, refused: RefusedWork, wait: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SAID: AtomicBool = AtomicBool::new(false);
-    if SAID.swap(true, Ordering::Relaxed) {
-        println!("solver         again on the CPU ({})", device_note(error));
-        return;
+    let advice = if SAID.swap(true, Ordering::Relaxed) {
+        ""
+    } else {
+        " The answers meet the same tolerance the GPU ones would have, at CPU speed; set [solver] \
+          backend = \"cpu\" to stop the device being asked at all."
+    };
+    let solves = if wait == 1 { "solve" } else { "solves" };
+    let have = if wait == 1 { "has" } else { "have" };
+    match refused {
+        RefusedWork::Solve => println!(
+            "solver         this one was finished on the CPU: {} ({error:#}); it and the next \
+             {wait} {solves} run there before the device is asked again.{advice}",
+            device_note(error),
+        ),
+        RefusedWork::Design => println!(
+            "solver         the device would not take this design: {} ({error:#}); its load \
+             cases run on the CPU, and the device is asked again once {wait} {solves} {have} \
+             run there.{advice}",
+            device_note(error),
+        ),
     }
+}
+
+/// What the device turned down, which is what the CPU picks up.
+///
+/// A refused solve is one load case; a refused design is all of the ones behind
+/// it, and they run on the CPU before the wait's own solves are even counted -
+/// so a design's notice may not promise that the device is back after the next
+/// `wait` solves the way a solve's may.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusedWork {
+    /// One load case, whose own solve the CPU finishes.
+    Solve,
+    /// A design, and with it every load case still to be solved on it.
+    Design,
+}
+
+/// Say that the device has taken work again, and what its rest cost.
+///
+/// The other half of the notice above, and the reason that one may promise the
+/// device will be asked again: a run that said it had moved to the CPU says when
+/// it moves back, so the whereabouts in the log are never stale. Once per return,
+/// which is once per wait that ended.
+#[cfg(feature = "gpu")]
+fn report_device_return(on_the_cpu: usize) {
     println!(
-        "solver         this solve was finished on the CPU: {} ({error:#}). The answer meets the \
-         same tolerance the GPU one would have, at CPU speed; set [solver] backend = \"cpu\" to \
-         stop the device trying.",
-        device_note(error)
+        "solver         the compute device took this solve, after {on_the_cpu} of them on the \
+         CPU; it is doing the run again."
     );
 }
 
@@ -733,6 +960,283 @@ mod tests {
             solver.kind(),
             SolverBackend::Gpu,
             "one design the device refused is not the run giving up on it"
+        );
+    }
+
+    /// A device that refused is left alone for a while, and the while doubles
+    /// every time it refuses the probe that ends one.
+    ///
+    /// The wait is counted in solves, so the whole of the policy is testable
+    /// without a device: what a run does with the answer belongs to
+    /// [`BoundSolver::solve`], and what the answer is belongs here.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_refused_device_is_asked_again_after_one_solve_then_two_then_four() {
+        let mut standby = DeviceStandby::serving();
+        assert!(
+            standby.asks_the_device(),
+            "a device nothing is known against takes every solve"
+        );
+        assert_eq!(
+            standby.served(0),
+            None,
+            "a device that never stopped serving is not coming back from anywhere"
+        );
+
+        // Ten refusals in a row, each one waited out to the probe that ends it.
+        let mut waits = Vec::new();
+        for _ in 0..10 {
+            let wait = standby.refused(0);
+            for solve in 0..wait {
+                assert!(
+                    !standby.asks_the_device(),
+                    "the device was asked {} solves before its wait of {wait} was out",
+                    wait - solve
+                );
+                standby.waited();
+            }
+            assert!(
+                standby.asks_the_device(),
+                "a wait of {wait} solves ran out and the device was not asked again"
+            );
+            waits.push(wait);
+        }
+
+        let doubling: Vec<usize> = (0..waits.len())
+            .map(|n| (DEVICE_RETRY_INITIAL_SOLVES << n).min(DEVICE_RETRY_MAX_SOLVES))
+            .collect();
+        assert_eq!(
+            waits, doubling,
+            "the wait has to start at {DEVICE_RETRY_INITIAL_SOLVES} solves and double"
+        );
+        assert_eq!(
+            *waits.last().expect("a wait"),
+            DEVICE_RETRY_MAX_SOLVES,
+            "a device that never comes back has to stop being asked more and more rarely"
+        );
+    }
+
+    /// A probe the device takes puts it back in service, says what the wait
+    /// cost, and leaves nothing behind it.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_device_that_takes_the_probe_serves_again_and_the_wait_starts_over() {
+        let mut standby = DeviceStandby::serving();
+
+        // The run's own count of solves the CPU has taken, which is what the
+        // return is reported against. It starts part way up: the solves single
+        // precision sent to the CPU before any of this are in it too, and are
+        // not what this wait cost.
+        let before = 7;
+        let mut on_the_cpu = before;
+
+        // A refusal, its wait, and a probe refused in turn with its own longer
+        // wait: every one of those solves is one the CPU took.
+        for _ in 0..2 {
+            let wait = standby.refused(on_the_cpu);
+            on_the_cpu += 1;
+            for _ in 0..wait {
+                standby.waited();
+                on_the_cpu += 1;
+            }
+        }
+        assert!(standby.asks_the_device(), "the second wait is out");
+        assert_eq!(
+            standby.served(on_the_cpu),
+            Some(on_the_cpu - before),
+            "the count the return is reported with is every solve the CPU took while the device \
+             was not doing them, and no other"
+        );
+        assert!(
+            standby.asks_the_device(),
+            "a device that came back takes solves"
+        );
+        assert_eq!(
+            standby.served(on_the_cpu),
+            None,
+            "a device that is already serving does not come back twice"
+        );
+        assert_eq!(
+            standby.refused(on_the_cpu),
+            DEVICE_RETRY_INITIAL_SOLVES,
+            "a device that came back and stopped again is a new refusal, not the old one"
+        );
+    }
+
+    /// Which of the answers a device hands back count as the device working,
+    /// which is the whole of what ends a wait.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn only_iterations_the_device_ran_are_proof_that_it_is_back() {
+        let converged = |iterations| {
+            Ok(Solve::Converged(CgSolution {
+                iterations,
+                relative_residual: 1e-9,
+            }))
+        };
+        assert!(
+            device_did_the_work(&converged(1)),
+            "a solve the device iterated is the device working"
+        );
+        assert!(
+            !device_did_the_work(&converged(0)),
+            "an answer reached without an iteration - an empty right hand side, a warm start \
+             already inside the tolerance - never reached the card"
+        );
+        assert!(
+            !device_did_the_work(&Ok(Solve::Cancelled)),
+            "a run called off is not a device coming back"
+        );
+        assert!(
+            !device_did_the_work(&Err(anyhow::anyhow!("the device has no memory left"))),
+            "a refusal is the opposite of proof"
+        );
+    }
+
+    /// The whole of the backoff on a real device: work it refuses, the wait it
+    /// is left alone for, the probe that ends the wait, and the run going back
+    /// to it.
+    ///
+    /// The refusal is the one a healthy card gives without another program
+    /// taking its memory - a design of a grid it was not built for - and the
+    /// probe is the fixture it *was* built for, which the parity tests above
+    /// solve on this same device. What the wait is worth is measured on that
+    /// second design: a design the device would take runs on the CPU anyway
+    /// while the device is resting. The probes the device answers without doing
+    /// arithmetic are driven on the card too, between the wait and its end.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_refused_device_is_left_alone_and_then_taken_up_again() {
+        let what = "a_refused_device_is_left_alone_and_then_taken_up_again";
+        let fixture = fixture();
+        let Some(mut solver) = gpu_or_skip(what, &fixture.grid, &fixture.fixed) else {
+            return;
+        };
+        // What a configuration with no backend named in it opens.
+        solver.may_fall_back = true;
+
+        let moduli = vec![2300.0; fixture.grid.n_cells()];
+        let operator = StiffnessOperator::new(&fixture.grid, &fixture.ke0, &moduli);
+        let diagonal = operator.diagonal();
+        let solve_on_the_device = |solver: &mut LinearSolver| {
+            let mut x = vec![0.0; fixture.grid.n_dof()];
+            solver
+                .bind(&operator, &diagonal, &fixture.fixed)
+                .expect("bind")
+                .solve(&fixture.forces, &mut x, limits())
+                .expect("solve")
+                .converged()
+                .expect("converged");
+        };
+
+        // A design of another grid, which is the one bind a healthy device
+        // refuses.
+        let other = cantilever(2.0, [8.0, 4.0, 4.0]);
+        let other_moduli = vec![2300.0; other.grid.n_cells()];
+        let other_operator = StiffnessOperator::new(&other.grid, &other.ke0, &other_moduli);
+        let other_diagonal = other_operator.diagonal();
+        let solve_the_device_refuses = |solver: &mut LinearSolver| {
+            let mut x = vec![0.0; other.grid.n_dof()];
+            solver
+                .bind(&other_operator, &other_diagonal, &other.fixed)
+                .expect("a backend nobody named must bind to the CPU rather than fail")
+                .solve(&other.forces, &mut x, limits())
+                .expect("the CPU must finish the solve the device would not take");
+        };
+
+        // The first refusal: one solve on the CPU, and the device is asked
+        // again as soon as it is over.
+        solve_the_device_refuses(&mut solver);
+        assert_eq!(solver.cpu_fallbacks(), 1);
+        assert!(
+            solver.standby.asks_the_device(),
+            "the first wait is {DEVICE_RETRY_INITIAL_SOLVES} solve and it has been taken"
+        );
+
+        // The probe is refused in turn, so the wait doubles.
+        solve_the_device_refuses(&mut solver);
+        assert_eq!(solver.cpu_fallbacks(), 2);
+        assert!(
+            !solver.standby.asks_the_device(),
+            "a refused probe has to buy a longer wait than the one before it"
+        );
+
+        // And now the measurement: a design this device *would* take runs on
+        // the CPU regardless, because the device is not being asked.
+        solve_on_the_device(&mut solver);
+        assert_eq!(
+            solver.cpu_fallbacks(),
+            3,
+            "a resting device was asked for a design instead of being left alone"
+        );
+        assert!(solver.standby.asks_the_device(), "the second wait is out");
+
+        // Two answers the device gives without doing any arithmetic: a stop
+        // taken before the first refinement pass, and a right hand side of
+        // zero. Neither is proof of anything about the device, so the wait keeps
+        // the length it had reached and the probe stays due.
+        let waiting = DeviceState::Resting {
+            solves_left: 0,
+            next_wait: (DEVICE_RETRY_INITIAL_SOLVES * 4).min(DEVICE_RETRY_MAX_SOLVES),
+        };
+        let stop = || true;
+        let mut x = vec![0.0; fixture.grid.n_dof()];
+        let cancelled = solver
+            .bind(&operator, &diagonal, &fixture.fixed)
+            .expect("bind")
+            .solve(&fixture.forces, &mut x, limits().watching(&stop))
+            .expect("a stop is not an error");
+        assert_eq!(cancelled, Solve::Cancelled);
+        assert_eq!(
+            solver.standby.state, waiting,
+            "a probe the caller called off says nothing about the device"
+        );
+
+        let mut x = vec![0.0; fixture.grid.n_dof()];
+        let nothing_to_do = solver
+            .bind(&operator, &diagonal, &fixture.fixed)
+            .expect("bind")
+            .solve(&vec![0.0; fixture.grid.n_dof()], &mut x, limits())
+            .expect("solve")
+            .converged()
+            .expect("converged");
+        assert_eq!(nothing_to_do.iterations, 0);
+        assert_eq!(
+            solver.standby.state, waiting,
+            "a probe with no work in it says nothing about the device either"
+        );
+        assert_eq!(
+            solver.cpu_fallbacks(),
+            3,
+            "a probe the device answered is not a solve the CPU did"
+        );
+
+        // The probe the device takes: the run goes back to it, and nothing of
+        // the wait is left over.
+        solve_on_the_device(&mut solver);
+        assert_eq!(
+            solver.cpu_fallbacks(),
+            3,
+            "the probe the device took was counted as a solve the CPU did"
+        );
+        assert_eq!(
+            solver.standby.state,
+            DeviceState::Serving,
+            "a device that took the probe is doing the run again"
+        );
+
+        // A backend the configuration named never waits: it fails.
+        solver.may_fall_back = false;
+        assert!(
+            solver
+                .bind(&other_operator, &other_diagonal, &other.fixed)
+                .is_err(),
+            "a named backend that will not take the design is the caller's error"
+        );
+        assert_eq!(
+            solver.standby.state,
+            DeviceState::Serving,
+            "a run that ends on a device failure has no wait to keep"
         );
     }
 

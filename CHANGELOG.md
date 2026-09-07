@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-09-06 - 0.43.2 - The run goes back to the device when it can
+
+0.43.1 gave a solve the device refused to the CPU and carried on - but it
+asked the device again on the very next solve, and said nothing after the
+first refusal. A run under sustained memory pressure therefore spent an
+upload and a failed allocation on every solve of it, and never said where it
+was running. The fallback is now a wait, and the run comes back from it.
+
+- **A refused device is left alone, and then asked again.** The solves inside
+  the wait run straight on the CPU without the device being asked at all, and
+  the first one after it is a probe. A probe the device takes puts the run
+  back on it; a probe it refuses doubles the wait -
+  `DEVICE_RETRY_INITIAL_SOLVES` = 1 solve, then two, four, up to
+  `DEVICE_RETRY_MAX_SOLVES` = 64. A card given back mid-run is picked up
+  within a few iterations of it; one that is gone for good is asked a handful
+  of times over a run rather than once per solve. Binding follows the same
+  state: a resting device is not offered the design, and a probe binds before
+  it solves. Only a solve the device ran iterations for ends a wait - an
+  answer it reached without touching the arithmetic, or a run called off,
+  leaves the probe due.
+- **Every change of hands is said, and only the changes are.** The fallback
+  notice is one per refusal event rather than one per process, and says how
+  many solves run on the CPU before the device is asked again; a device that
+  takes the probe says so, with what the wait cost. A run whose solves went to
+  the CPU ends with one note saying how many.
+- `backend = "gpu"` is unchanged - a run that named the device still ends when
+  the device fails, with no wait and no probe - and so is the arithmetic: a
+  CPU solve is the same CPU solve, a device solve the same device solve.
+- Tests: the wait doubles from one solve to the cap and no further, a probe
+  the device takes puts it back in service and starts the wait over, and on
+  this machine's own card a refused design is left alone for its wait - a
+  design the device would have taken runs on the CPU meanwhile - then taken
+  up again by the probe, while a named backend fails without waiting for
+  anything.
+- Version 0.43.2.
+
 ## 2026-09-06 - 0.43.1 - A card with no memory left does not end the session
 
 An editing session died mid-run - 28 minutes of a reduction gone, no file, no

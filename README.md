@@ -2253,16 +2253,39 @@ finishes one single precision could not resolve, and the notice says which of
 the two happened rather than blaming the arithmetic:
 
 ```text
-solver         this solve was finished on the CPU: the compute device had no memory
-               left for it (the GPU refused to run a solve on the compute device: the
-               device is out of memory ...). The answer meets the same tolerance the
-               GPU one would have, at CPU speed; set [solver] backend = "cpu" to stop
-               the device trying.
+solver         this one was finished on the CPU: the compute device had no memory
+               left for it (the GPU refused to run a solve on the compute device:
+               the device is out of memory ...); it and the next 1 solve run there
+               before the device is asked again. The answers meet the same tolerance
+               the GPU ones would have, at CPU speed; set [solver] backend = "cpu"
+               to stop the device being asked at all.
 ```
 
 A design the device will not take is the same: the load cases of that design run
-on the CPU. `backend = "gpu"` remains an instruction - a run that named the
-device ends when the device fails.
+on the CPU.
+
+**The fallback is a wait, not a verdict.** What takes a card's memory usually
+gives it back, so the run comes back to the device. The solves inside the wait
+run straight on the CPU without the device being asked at all, and the first one
+after it is a probe: a probe the device takes puts the run back on it, and a
+probe it refuses doubles the wait - one solve, then two, four, up to sixty-four.
+So a card that is gone for good is asked a handful of times over a run rather
+than once per solve, and one that is given back is picked up within a few
+iterations of it:
+
+```text
+solver         the compute device took this solve, after 3 of them on the CPU; it
+               is doing the run again.
+```
+
+Every change of hands is said and only the changes are, because a line per CPU
+solve would bury them. What the optimization's own solves cost is one note at the
+end of the run - `4 linear solves of this run ran on the CPU rather than on the
+compute device`; the stress report's solver and the growth and solid engines keep
+no such tally. `LinearSolver::cpu_fallbacks` is that number for a caller.
+
+`backend = "gpu"` remains an instruction - a run that named the device ends when
+the device fails, with no wait and no probe.
 
 Measured against the CPU reference (the parity tests in `fea::backend`,
 `engine::simp` and `stress`):
